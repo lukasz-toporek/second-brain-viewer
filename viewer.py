@@ -821,6 +821,25 @@ body {
 .c-example { --co: #b07ad0; }
 .c-quote, .c-cite { --co: #888; }
 
+/* dataview inline fields */
+.dv {
+  display: inline-block; font-size: 11px; line-height: 1.5; padding: 0 7px; margin: 0 2px;
+  border-radius: 9px; background: var(--sa); color: var(--tx2); border: 1px solid var(--bd);
+  white-space: nowrap; vertical-align: baseline; text-decoration: none;
+}
+.dv .k { opacity: .65; margin-right: 4px; }
+a.dv-link { color: var(--ac); }
+a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
+.dv-state { font-weight: 500; }
+.s-not-started { color: #9a9a9a; }
+.s-in-progress { color: #5b9bd5; background: rgba(91,155,213,.14); border-color: rgba(91,155,213,.35); }
+.s-to-verify   { color: #c8980a; background: rgba(200,152,10,.14); border-color: rgba(200,152,10,.35); }
+.s-done        { color: #68b068; background: rgba(104,176,104,.14); border-color: rgba(104,176,104,.35); }
+.s-waived      { color: #9b8bdb; background: rgba(155,139,219,.14); border-color: rgba(155,139,219,.35); }
+.s-missed      { color: #d05050; background: rgba(208,80,80,.14); border-color: rgba(208,80,80,.35); }
+.md li.overdue { border-left: 2px solid #d05050; padding-left: 8px; margin-left: -10px; }
+.md li.overdue .dv-due { color: #d05050; background: rgba(208,80,80,.14); border-color: rgba(208,80,80,.35); }
+
 /* backlinks */
 .backlinks { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--bd); }
 .backlinks h4 { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--tx2); margin-bottom: 8px; }
@@ -1114,6 +1133,10 @@ const FLAGS = __FLAGS__;   // {chat, watch, export}
 const FM = __FM__;
 const TC = __TC__;
 const tcol = t => TC[t] || "#888";
+const DONE_STATES = new Set(["done", "waived", "missed"]);
+const todayStr = () => { const d = new Date(), p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; };
+
 // Only http(s), mailto, #fragment and scheme-less (relative) URLs are allowed.
 function safeUrl(u) {
   u = String(u ?? "").trim();
@@ -1207,6 +1230,48 @@ document.addEventListener("click", e => {
     .find(x => slug(x.textContent) === want);
   if (h) h.scrollIntoView();
 });
+
+// ── Dataview inline fields: [key:: value] ──
+if (typeof marked !== "undefined") {
+  marked.use({
+    extensions: [{
+      name: "dvfield", level: "inline",
+      start(src) { const i = src.search(/\[[A-Za-z][\w -]*::/); return i < 0 ? undefined : i; },
+      tokenizer(src) {
+        const m = /^\[([A-Za-z][\w -]*?)::[ \t]*([^\]\n]*?)\]/.exec(src);
+        if (!m) return;
+        return { type: "dvfield", raw: m[0], key: m[1].trim(), value: m[2].trim() };
+      },
+      renderer(tok) {
+        const key = tok.key.toLowerCase(), v = tok.value;
+        if (key === "state") {
+          const st = v.toLowerCase();
+          return `<span class="dv dv-state s-${esc(st.replace(/[^a-z0-9]+/g, "-"))}" data-state="${esc(st)}">${esc(v)}</span>`;
+        }
+        if (key === "due") {
+          const iso = /^\d{4}-\d{2}-\d{2}$/.test(v) ? ` data-due="${esc(v)}"` : "";
+          return `<span class="dv dv-due"${iso}>due ${esc(v)}</span>`;
+        }
+        if (key === "link" && /^https?:\/\//i.test(v) && safeUrl(v) !== null)
+          return `<a class="dv dv-link" href="${esc(v)}" target="_blank" rel="noopener noreferrer">Open ↗</a>`;
+        return `<span class="dv"><span class="k">${esc(tok.key)}</span>${esc(v)}</span>`;
+      },
+    }],
+    renderer: {
+      // open task with a past due date and a still-open state → "overdue"
+      listitem(text, task, checked) {
+        let cls = "";
+        if (task && !checked) {
+          const own = text.split(/<[uo]l[\s>]/)[0];            // ignore nested lists
+          const due = /data-due="(\d{4}-\d{2}-\d{2})"/.exec(own);
+          const st = /data-state="([^"]*)"/.exec(own);
+          if (due && due[1] < todayStr() && !(st && DONE_STATES.has(st[1]))) cls = ' class="overdue"';
+        }
+        return `<li${cls}>${text}</li>\n`;
+      },
+    },
+  });
+}
 
 // delegated click handler for wikilinks (content, backlinks, chat bubbles)
 document.addEventListener("click", e => {
