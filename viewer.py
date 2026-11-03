@@ -9,6 +9,7 @@ Usage:
     python3 viewer.py --serve --port 8080
     python3 viewer.py --init                 # scaffold .viewer.json + .gitignore
     python3 viewer.py --vault PATH --init    # same for a specific vault
+    python3 viewer.py --serve --offline      # vendored libs, no chat, strict CSP
 """
 
 import json
@@ -34,6 +35,7 @@ SKIP_NAMES: set = {"README.md", "_index.md"}
 SKIP_DIRS: set = {".obsidian"}
 FOLDER_ORDER: list = []
 CONFIG: dict = {}
+OFFLINE: bool = False
 
 
 def load_config(vault_path: Path) -> dict:
@@ -341,7 +343,7 @@ VIEWER_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Vault</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap">
+__HEAD__
 <style>
 :root {
   --bg:      #131313;
@@ -366,7 +368,7 @@ body {
   display: flex;
   background: var(--bg);
   color: var(--tx);
-  font-family: 'Inter', system-ui, sans-serif;
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   font-size: 13px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
@@ -668,7 +670,7 @@ body {
   font-size: 28px;
   opacity: .2;
   margin-bottom: 4px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 .welcome h3 { font-size: 14px; font-weight: 500; color: var(--tx2); }
 .welcome p { font-size: 12px; color: var(--tx2); opacity: .7; }
@@ -722,7 +724,7 @@ body {
   color: var(--tx2);
 }
 .md code {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   background: var(--sh);
   padding: 2px 5px;
@@ -1050,9 +1052,10 @@ body {
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/force-graph@1.43.5/dist/force-graph.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+__LIBS__
+__DATA__
 <script>
+const FLAGS = __FLAGS__;   // {chat, watch, export}
 const FM = __FM__;
 const TC = __TC__;
 const tcol = t => TC[t] || "#888";
@@ -1339,7 +1342,7 @@ document.addEventListener("keydown", e => {
   if (e.key === "/") { e.preventDefault(); document.getElementById("srch").focus(); }
   if (e.key === "Escape") {
     if (graphMode) closeGraph();
-    else if (chatOpen) closeChat();
+    else if (FLAGS.chat && chatOpen) closeChat();
     else document.getElementById("srch").blur();
   }
 });
@@ -1580,25 +1583,32 @@ async function chatSend() {
   input.focus();
 }
 
-document.getElementById("chat-toggle-btn").addEventListener("click", () => {
-  chatOpen ? closeChat() : openChat();
-});
-document.getElementById("chat-close").addEventListener("click", closeChat);
-document.getElementById("chat-send").addEventListener("click", chatSend);
-
-document.getElementById("chat-input").addEventListener("keydown", e => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); chatSend(); }
-  setTimeout(() => {
-    const el = e.target;
-    el.style.height = "36px";
-    el.style.height = Math.min(el.scrollHeight, 120) + "px";
-  }, 0);
-});
+if (!FLAGS.chat) {
+  document.getElementById("chat-toggle-btn").remove();
+  document.getElementById("chat-panel").remove();
+} else {
+  document.getElementById("chat-toggle-btn").addEventListener("click", () => {
+    chatOpen ? closeChat() : openChat();
+  });
+}
+if (FLAGS.chat) {
+  document.getElementById("chat-close").addEventListener("click", closeChat);
+  document.getElementById("chat-send").addEventListener("click", chatSend);
+  document.getElementById("chat-input").addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); chatSend(); }
+    setTimeout(() => {
+      const el = e.target;
+      el.style.height = "36px";
+      el.style.height = Math.min(el.scrollHeight, 120) + "px";
+    }, 0);
+  });
+}
 
 load();
 
 // ── File watcher ──────────────────────────────────────────────────────────
 (function startWatcher() {
+  if (!FLAGS.watch) return;
   const es = new EventSource("/api/watch");
   es.onmessage = () => {
     load();
@@ -1618,6 +1628,59 @@ load();
 
 
 # ── HTTP server ──────────────────────────────────────────────────────────────
+
+CSP_OFFLINE = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
+               "style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'")
+
+VENDOR_DIR: Path = Path(__file__).resolve().parent / "vendor"
+VENDOR_FILES = ("marked.min.js", "force-graph.min.js")
+CDN_LIBS = (
+    '<script src="https://cdn.jsdelivr.net/npm/force-graph@1.43.5/dist/force-graph.min.js"></script>\n'
+    '<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>'
+)
+CDN_FONTS = ('<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600'
+             '&family=JetBrains+Mono:wght@400&display=swap">')
+
+
+def check_vendor() -> None:
+    """Exit with a clear message if offline mode lacks its vendored libraries."""
+    missing = [f for f in VENDOR_FILES if not (VENDOR_DIR / f).is_file()]
+    if missing:
+        sys.exit(f"error: missing vendored file(s) in {VENDOR_DIR}: {', '.join(missing)}\n"
+                 f"       run: python3 {Path(__file__).resolve().parent / 'tools' / 'fetch-vendor.py'}")
+
+
+def js_json(obj) -> str:
+    """JSON safe to inline inside a <script> element."""
+    return json.dumps(obj, ensure_ascii=False).replace("</", "<\\/").replace("<!--", "<\\u0021--")
+
+
+def render_page(mode: str = "online", data: dict = None) -> str:
+    """mode: 'online' (CDN libs, chat) | 'offline' (vendored, no chat) | 'export' (single file)."""
+    flags = {"chat": mode == "online", "watch": mode != "export", "export": mode == "export"}
+    head, libs, data_tag = "", "", ""
+    if mode == "online":
+        head, libs = CDN_FONTS, CDN_LIBS
+    elif mode == "offline":
+        libs = "\n".join(f'<script src="/vendor/{f}"></script>' for f in VENDOR_FILES)
+    else:
+        check_vendor()
+        head = ('<meta http-equiv="Content-Security-Policy" content="' +
+                CSP_OFFLINE.replace("connect-src 'self'", "connect-src 'none'") + '">')
+        libs = "\n".join(
+            "<script>" + (VENDOR_DIR / f).read_text(encoding="utf-8").replace("</script", "<\\/script") + "</script>"
+            for f in VENDOR_FILES)
+        data_tag = "<script>window.__EXPORT__ = " + js_json(data) + ";</script>"
+    repl = {
+        "FM": js_json(CONFIG.get("folders", {})),
+        "TC": js_json(CONFIG.get("types", {})),
+        "TITLE": html_escape(CONFIG.get("title", VAULT.name)),
+        "FLAGS": js_json(flags),
+        "HEAD": head, "LIBS": libs, "DATA": data_tag,
+    }
+    # single pass, so substituted content is never re-scanned for placeholders
+    return re.sub(r"__(FM|TC|TITLE|FLAGS|HEAD|LIBS|DATA)__", lambda m: repl[m.group(1)], VIEWER_HTML)
+
 
 BIND_HOST = "127.0.0.1"
 MAX_BODY = 1_000_000  # bytes accepted by POST /api/chat
@@ -1662,15 +1725,15 @@ class VaultHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path in ("/", "/index.html"):
-            fm_json = json.dumps(CONFIG.get("folders", {}), ensure_ascii=False)
-            tc_json = json.dumps(CONFIG.get("types", {}), ensure_ascii=False)
-            title = CONFIG.get("title", VAULT.name)
-            html = (VIEWER_HTML
-                    .replace("__FM__", fm_json)
-                    .replace("__TC__", tc_json)
-                    .replace("__TITLE__", html_escape(title)))
-            body = html.encode("utf-8")
+            body = render_page("offline" if OFFLINE else "online").encode("utf-8")
             self._respond(200, "text/html; charset=utf-8", body)
+
+        elif parsed.path.startswith("/vendor/"):
+            name = parsed.path[len("/vendor/"):]
+            if not OFFLINE or name not in VENDOR_FILES or not (VENDOR_DIR / name).is_file():
+                self._respond(404, "text/plain", b"Not found")
+                return
+            self._respond(200, "application/javascript; charset=utf-8", (VENDOR_DIR / name).read_bytes())
 
         elif parsed.path == "/api/vault":
             body = json.dumps(scan_vault(), ensure_ascii=False).encode("utf-8")
@@ -1703,6 +1766,8 @@ class VaultHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
+            if OFFLINE:
+                self.send_header("Content-Security-Policy", CSP_OFFLINE)
             self.end_headers()
             last = vault_snapshot()
             ticks = 0
@@ -1722,6 +1787,9 @@ class VaultHandler(BaseHTTPRequestHandler):
                 pass
 
         elif parsed.path == "/api/config":
+            if OFFLINE:
+                self._respond(403, "text/plain", b"Chat is disabled in offline mode")
+                return
             anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
             kb_key   = os.environ.get("KB_API_KEY", "")
             kb_base  = os.environ.get("KB_API_BASE", "")
@@ -1749,6 +1817,9 @@ class VaultHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path != "/api/chat":
             self._respond(404, "text/plain", b"Not found")
+            return
+        if OFFLINE:
+            self._respond(403, "text/plain", b"Chat is disabled in offline mode")
             return
 
         # CSRF / cross-origin protection: browsers cannot send a custom header or
@@ -1928,6 +1999,8 @@ class VaultHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", len(body))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        if OFFLINE:
+            self.send_header("Content-Security-Policy", CSP_OFFLINE)
         if not cache:
             self.send_header("Cache-Control", "no-cache")
         self.end_headers()
@@ -1968,6 +2041,11 @@ def main() -> None:
     if "--init" in args:
         init_vault(vault_path)
         return
+
+    global OFFLINE
+    OFFLINE = "--offline" in args or CONFIG.get("offline") is True
+    if OFFLINE and "--serve" in args:
+        check_vendor()
 
     if "--serve" in args:
         port = 5001
