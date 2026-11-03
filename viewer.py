@@ -1278,7 +1278,7 @@ document.addEventListener("click", e => {
   const a = e.target.closest && e.target.closest("a.wl[data-path]");
   if (!a) return;
   e.preventDefault();
-  const n = vault?.folders.flatMap(s => s.notes).find(x => x.path === a.dataset.path);
+  const n = findNote(a.dataset.path);
   if (n) openNote({ path: n.path, name: n.name, type: n.type, folder: n.path.split("/")[0] });
 });
 
@@ -1353,12 +1353,7 @@ function renderTabs() {
   });
 }
 
-function switchTo(t) {
-  activeTab = t.path;
-  renderTabs();
-  loadContent(t);
-  highlight();
-}
+const switchTo = t => openNote(t);
 
 function highlight() {
   document.querySelectorAll(".ni").forEach(el =>
@@ -1366,7 +1361,13 @@ function highlight() {
 }
 
 // ── Open note ─────────────────────────────────────────────────
+const findNote = path => vault?.folders.flatMap(s => s.notes).find(n => n.path === path);
+const hashFor = path => "#" + encodeURIComponent(path);
+
+// Opens (or switches to) a note tab. activeTab is set *before* the hash is written, so the
+// resulting hashchange sees "already active" and does nothing: no double load, no loop.
 function openNote(note) {
+  if (graphMode) closeGraph();
   if (!tabs.find(t => t.path === note.path)) {
     tabs.push(note);
     if (tabs.length > 8) tabs.shift();
@@ -1375,7 +1376,26 @@ function openNote(note) {
   renderTabs();
   loadContent(note);
   highlight();
+  if (location.hash !== hashFor(note.path)) location.hash = hashFor(note.path);
 }
+
+const welcomeHTML = document.getElementById("content").innerHTML;
+function routeFromHash() {
+  if (!vault) return;                         // initial route happens after the first load()
+  let p = "";
+  try { p = decodeURIComponent(location.hash.replace(/^#/, "")); } catch (_) { return; }
+  if (!p) {                                   // back to the empty hash → welcome screen
+    if (activeTab === null) return;
+    activeTab = null;
+    renderTabs(); highlight();
+    document.getElementById("content").innerHTML = welcomeHTML;
+    return;
+  }
+  if (p === activeTab) return;
+  const n = findNote(p);
+  if (n) openNote({ path: n.path, name: n.name, type: n.type, folder: n.path.split("/")[0] });
+}
+window.addEventListener("hashchange", routeFromHash);
 
 async function loadContent(note) {
   const area = document.getElementById("content");
@@ -1446,9 +1466,11 @@ async function load() {
   const btn = document.getElementById("rbtn");
   btn.classList.add("spinning");
   try {
+    const first = !vault;
     vault = await fetch("/api/vault").then(r => r.json());
     noteIdx = null;
     renderTree();
+    if (first) routeFromHash();
   } catch(e) {
     document.getElementById("tree").innerHTML = `<div class="err">${esc(e.message)}</div>`;
   } finally {
