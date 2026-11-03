@@ -1642,6 +1642,7 @@ function closeChat() {
 }
 
 function setChatContext(noteTitle, noteContent) {
+  if (!FLAGS.chat) return;            // chat panel is removed in offline/export mode
   chatNoteTitle = noteTitle || "";
   chatNoteContext = noteContent || "";
   const ctx = document.getElementById("chat-ctx");
