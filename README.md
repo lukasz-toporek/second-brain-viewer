@@ -89,6 +89,8 @@ python3 -m unittest discover tests     # uses the fake vault in tests/fixtures/v
 # Lint frontmatter and wikilinks
 cd ~/Projects/second-brain
 python3 ~/Projects/second-brain-viewer/tools/vault-lint.py
+# (accepts --vault PATH; valid types / required fields come from the optional
+#  "lint" key in viewer.json — see the template — defaults match the old built-in schema)
 
 # Create today's daily note from template (90-meta/Szablony/Daily.md)
 python3 ~/Projects/second-brain-viewer/tools/daily-note.py
