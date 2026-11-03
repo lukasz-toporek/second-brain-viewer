@@ -7,6 +7,8 @@ Usage:
     python3 viewer.py --serve                # local viewer at http://localhost:5001
     python3 viewer.py --vault PATH --serve   # point at a specific vault
     python3 viewer.py --serve --port 8080
+    python3 viewer.py --init                 # scaffold .viewer.json + .gitignore
+    python3 viewer.py --vault PATH --init    # same for a specific vault
 """
 
 import json
@@ -44,7 +46,7 @@ def load_config(vault_path: Path) -> dict:
         "system_prompt": "You are a knowledge base assistant. Answer concisely.",
     }
     for d in [vault_path] + list(vault_path.parents)[:4]:
-        for cfg_name in ("viewer.json", "vault-viewer.json"):
+        for cfg_name in (".viewer.json", "viewer.json", "vault-viewer.json"):
             cfg_path = d / cfg_name
             if cfg_path.exists():
                 loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -61,6 +63,107 @@ def init_config(vault_path: Path) -> None:
     SKIP_NAMES = set(CONFIG.get("skip_files", ["README.md", "_index.md"]))
     SKIP_DIRS = set(CONFIG.get("skip_dirs", [".obsidian"]))
     FOLDER_ORDER = CONFIG.get("folder_order", [])
+
+# ── Init / scaffold ─────────────────────────────────────────────────────────
+
+KNOWN_TYPE_COLORS: dict[str, str] = {
+    "home":    "#e07050",
+    "index":   "#888888",
+    "meta":    "#888888",
+    "daily":   "#5b9bd5",
+    "wiedza":  "#4ecdc4",
+    "projekt": "#e07050",
+    "kurs":    "#c8980a",
+    "rozmowa": "#9b8bdb",
+}
+
+_FOLDER_PALETTE = [
+    {"bg": "#1e1e1e", "fg": "#777777"},
+    {"bg": "#102030", "fg": "#5b9bd5"},
+    {"bg": "#0a2020", "fg": "#4ecdc4"},
+    {"bg": "#201008", "fg": "#e07050"},
+    {"bg": "#1c1608", "fg": "#c8980a"},
+    {"bg": "#1a1a2a", "fg": "#9b8bdb"},
+    {"bg": "#1a2a1a", "fg": "#68b068"},
+    {"bg": "#181818", "fg": "#555555"},
+]
+
+_EXTRA_TYPE_COLORS = ["#5b9bd5", "#4ecdc4", "#c8980a", "#9b8bdb", "#68b068", "#e07050"]
+
+_INIT_SKIP_DIRS = {".obsidian", ".git", ".claude", "schemas", "decisions", "exports", "__pycache__"}
+
+
+def _parse_yaml_types(schema_path: Path) -> list[str]:
+    """Extract type names from note-types.yaml without external dependencies."""
+    types: list[str] = []
+    in_types = False
+    for line in schema_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.rstrip()
+        if stripped == "types:":
+            in_types = True
+            continue
+        if in_types:
+            if stripped and not stripped[0].isspace():
+                break
+            m = re.match(r"^  ([a-zA-Z_][a-zA-Z0-9_]*):\s*$", stripped)
+            if m:
+                types.append(m.group(1))
+    return types
+
+
+def generate_viewer_config(vault_path: Path) -> dict:
+    """Build a .viewer.json dict for vault_path, using schema when available."""
+    vault = vault_path.resolve()
+    folders = sorted(
+        d.name for d in vault.iterdir()
+        if d.is_dir() and d.name not in _INIT_SKIP_DIRS and not d.name.startswith(".")
+    )
+
+    folder_cfg: dict[str, dict] = {}
+    for i, name in enumerate(folders):
+        pal = _FOLDER_PALETTE[i % len(_FOLDER_PALETTE)]
+        letter = next((c.upper() for c in name if c.isalpha()), name[0].upper())
+        folder_cfg[name] = {"bg": pal["bg"], "fg": pal["fg"], "letter": letter}
+    folder_cfg["(vault root)"] = {"bg": "#201008", "fg": "#e07050", "letter": "~"}
+
+    schema = vault / "schemas" / "notes" / "note-types.yaml"
+    schema_types = _parse_yaml_types(schema) if schema.exists() else list(KNOWN_TYPE_COLORS)
+
+    type_cfg: dict[str, str] = {}
+    extra_idx = 0
+    for t in schema_types:
+        if t in KNOWN_TYPE_COLORS:
+            type_cfg[t] = KNOWN_TYPE_COLORS[t]
+        else:
+            type_cfg[t] = _EXTRA_TYPE_COLORS[extra_idx % len(_EXTRA_TYPE_COLORS)]
+            extra_idx += 1
+
+    return {
+        "title": vault.name,
+        "skip_dirs": [".obsidian", ".git"],
+        "skip_files": ["README.md", "_index.md"],
+        "folder_order": folders,
+        "folders": folder_cfg,
+        "types": type_cfg,
+        "system_prompt": "You are a knowledge base assistant. Answer concisely.",
+    }
+
+
+def init_vault(vault_path: Path) -> None:
+    """Write .viewer.json and, if missing, .gitignore to vault_path."""
+    vault = vault_path.resolve()
+    cfg_path = vault / ".viewer.json"
+    cfg = generate_viewer_config(vault)
+    cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"✓ Wrote {cfg_path}")
+
+    gitignore = vault / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text(".viewer.json\n", encoding="utf-8")
+        print(f"✓ Created {gitignore}")
+    else:
+        print(f"  .gitignore already exists — not modified")
+
 
 # ── Parsing ────────────────────────────────────────────────────────────────
 
@@ -1656,6 +1759,10 @@ def main() -> None:
         vault_path = Path(args[args.index("--vault") + 1])
 
     init_config(vault_path)
+
+    if "--init" in args:
+        init_vault(vault_path)
+        return
 
     if "--serve" in args:
         port = 5001
