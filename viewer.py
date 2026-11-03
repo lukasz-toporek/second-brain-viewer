@@ -20,9 +20,10 @@ import sys
 import time
 import webbrowser
 from datetime import date
+from html import escape as html_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
@@ -1055,6 +1056,15 @@ body {
 const FM = __FM__;
 const TC = __TC__;
 const tcol = t => TC[t] || "#888";
+// Only http(s), mailto, #fragment and scheme-less (relative) URLs are allowed.
+function safeUrl(u) {
+  u = String(u ?? "").trim();
+  const probe = u.replace(/[\u0000-\u0020\u00ad\u200b-\u200f\u2028\u2029\ufeff]/g, "");
+  const m = /^([a-z][a-z0-9+.-]*):/i.exec(probe);
+  if (m && !/^(https?|mailto)$/i.test(m[1])) return null;
+  if (!m && /^[\\/]{2}/.test(probe)) return null;
+  return u;
+}
 const esc = s => String(s ?? "").replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
@@ -1101,6 +1111,21 @@ if (typeof marked !== "undefined") {
       },
     }],
     renderer: {
+      // raw HTML in Markdown is shown as text, never injected
+      html(html) { return esc(typeof html === "string" ? html : html.text); },
+      link(href, title, text) {
+        const u = safeUrl(href);
+        if (u === null) return text;
+        const t = title ? ` title="${esc(title)}"` : "";
+        if (u.startsWith("#")) return `<a href="#" data-anchor="${esc(u.slice(1))}"${t}>${text}</a>`;
+        const ext = /^(https?:|mailto:)/i.test(u) ? ` target="_blank" rel="noopener noreferrer"` : "";
+        return `<a href="${esc(u)}"${t}${ext}>${text}</a>`;
+      },
+      image(href, title, text) {
+        const u = safeUrl(href);
+        if (u === null) return esc(text);
+        return `<img src="${esc(u)}" alt="${esc(text)}"${title ? ` title="${esc(title)}"` : ""}>`;
+      },
       blockquote(quote) {
         const m = /^\s*<p>\[!([A-Za-z][\w-]*)\][+-]?[ \t]*([^\n]*?)(?:\n([\s\S]*?))?<\/p>([\s\S]*)$/.exec(quote);
         if (!m) return false;
@@ -1113,6 +1138,17 @@ if (typeof marked !== "undefined") {
     },
   });
 }
+
+document.addEventListener("click", e => {
+  const a = e.target.closest && e.target.closest("a[data-anchor]");
+  if (!a) return;
+  e.preventDefault();
+  const slug = h => h.toLowerCase().trim().replace(/[^\p{L}\p{N}\s-]/gu, "").replace(/\s+/g, "-");
+  const want = a.dataset.anchor.toLowerCase();
+  const h = [...document.querySelectorAll(".md h1,.md h2,.md h3,.md h4,.md h5,.md h6")]
+    .find(x => slug(x.textContent) === want);
+  if (h) h.scrollIntoView();
+});
 
 // delegated click handler for wikilinks (content, backlinks, chat bubbles)
 document.addEventListener("click", e => {
@@ -1147,8 +1183,8 @@ function renderTree() {
     hd.className = "fhd" + (open ? " open" : "");
     hd.innerHTML =
       `<svg class="ch" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 4 10 8 6 12"/></svg>` +
-      `<span class="fi" style="background:${fm.bg};color:${fm.fg}">${fm.letter}</span>` +
-      `<span class="fn">${label}</span>` +
+      `<span class="fi" style="background:${esc(fm.bg)};color:${esc(fm.fg)}">${esc(fm.letter)}</span>` +
+      `<span class="fn">${esc(label)}</span>` +
       `<span class="fc">${notes.length}</span>`;
 
     const fnotes = document.createElement("div");
@@ -1160,8 +1196,8 @@ function renderTree() {
       ni.className = "ni" + (activeTab === n.path ? " active" : "");
       ni.dataset.path = n.path;
       ni.innerHTML =
-        `<span class="nd" style="background:${tcol(n.type)}"></span>` +
-        `<span class="nn">${n.name}</span>`;
+        `<span class="nd" style="background:${esc(tcol(n.type))}"></span>` +
+        `<span class="nn">${esc(n.name)}</span>`;
       ni.addEventListener("click", () => openNote({
         path: n.path, name: n.name, type: n.type, folder: sec.folder
       }));
@@ -1188,7 +1224,7 @@ function renderTabs() {
   tabs.forEach(t => {
     const el = document.createElement("div");
     el.className = "tab" + (activeTab === t.path ? " active" : "");
-    el.innerHTML = `<span class="ti" style="background:${tcol(t.type)}"></span>${t.name}`;
+    el.innerHTML = `<span class="ti" style="background:${esc(tcol(t.type))}"></span>${esc(t.name)}`;
     el.addEventListener("click", () => switchTo(t));
     bar.appendChild(el);
   });
@@ -1226,7 +1262,7 @@ async function loadContent(note) {
     if (!r.ok) throw new Error(r.statusText);
     showNote(await r.json());
   } catch(e) {
-    area.innerHTML = `<div class="err">Error: ${e.message}</div>`;
+    area.innerHTML = `<div class="err">Error: ${esc(e.message)}</div>`;
   }
 }
 
@@ -1237,30 +1273,36 @@ function showNote(data) {
   const fmMatch = raw.match(/^---\n([\s\S]*?)\n---\n?/);
   if (fmMatch) {
     raw = raw.slice(fmMatch[0].length);
-    chips = fmMatch[1].split("\n")
-      .filter(l => l.includes(":") && !l.trimStart().startsWith("title:"))
-      .map(l => {
-        const [k, ...rest] = l.split(":");
-        const v = rest.join(":").trim();
-        if (!v) return "";
-        const key = k.trim();
-        const c = key === "type"   ? (tcol(v)) :
-                  key === "status" ? "#68b068" : "#888";
-        return `<span class="chip" style="background:${c}20;color:${c}">${key}: ${v}</span>`;
-      }).filter(Boolean).join("");
+    const lines = fmMatch[1].split("\n"), kv = [];
+    for (let i = 0; i < lines.length; i++) {
+      const m = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(lines[i]);
+      if (!m) continue;
+      let v = m[2].trim();
+      if (!v) {                       // YAML block list: "key:" followed by "- item" lines
+        const items = [];
+        while (i + 1 < lines.length && /^\s*-\s+/.test(lines[i + 1]))
+          items.push(lines[++i].replace(/^\s*-\s+/, "").trim().replace(/^["']|["']$/g, ""));
+        v = items.join(", ");
+      }
+      if (v && m[1] !== "title") kv.push([m[1], v]);
+    }
+    chips = kv.map(([key, v]) => {
+      const c = key === "type" ? tcol(v) : key === "status" ? "#68b068" : "#888";
+      return `<span class="chip" style="background:${esc(c)}20;color:${esc(c)}">${esc(key)}: ${esc(v)}</span>`;
+    }).join("");
     if (chips) chips = `<div class="chips">${chips}</div>`;
   }
 
   const parts = data.path.split("/");
   const bc = parts.length > 1
-    ? `<div class="bc"><span>${parts[0].replace(/^\d+[-\s]+/,"")}</span><span class="sep">/</span><span>${data.name}</span></div>`
-    : `<div class="bc"><span>${data.name}</span></div>`;
+    ? `<div class="bc"><span>${esc(parts[0].replace(/^\d+[-\s]+/,""))}</span><span class="sep">/</span><span>${esc(data.name)}</span></div>`
+    : `<div class="bc"><span>${esc(data.name)}</span></div>`;
 
   let html = "";
   if (typeof marked !== "undefined") {
     html = marked.parse(raw);
   } else {
-    html = `<pre style="white-space:pre-wrap;font-family:inherit">${raw.replace(/</g,"&lt;")}</pre>`;
+    html = `<pre style="white-space:pre-wrap;font-family:inherit">${esc(raw)}</pre>`;
   }
 
   document.getElementById("content").innerHTML =
@@ -1278,7 +1320,7 @@ async function load() {
     noteIdx = null;
     renderTree();
   } catch(e) {
-    document.getElementById("tree").innerHTML = `<div class="err">${e.message}</div>`;
+    document.getElementById("tree").innerHTML = `<div class="err">${esc(e.message)}</div>`;
   } finally {
     btn.classList.remove("spinning");
   }
@@ -1318,7 +1360,7 @@ async function openGraph() {
     try {
       graphData = await fetch("/api/graph").then(r => r.json());
     } catch(e) {
-      wrap.querySelector("#fg-mount").innerHTML = `<div style="padding:40px;color:#c05858">Graph: ${e.message}</div>`;
+      wrap.querySelector("#fg-mount").innerHTML = `<div style="padding:40px;color:#c05858">Graph: ${esc(e.message)}</div>`;
       return;
     }
   }
@@ -1436,7 +1478,7 @@ function setChatContext(noteTitle, noteContent) {
   chatNoteContext = noteContent || "";
   const ctx = document.getElementById("chat-ctx");
   ctx.innerHTML = noteTitle
-    ? `Context: <span>${noteTitle}</span>`
+    ? `Context: <span>${esc(noteTitle)}</span>`
     : "No note open";
 }
 
@@ -1474,7 +1516,7 @@ async function chatSend() {
   try {
     const resp = await fetch("/api/chat", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Vault-Viewer": "1" },
       body: JSON.stringify({ messages: chatHistory, context: chatNoteContext }),
     });
 
@@ -1577,11 +1619,46 @@ load();
 
 # ── HTTP server ──────────────────────────────────────────────────────────────
 
+BIND_HOST = "127.0.0.1"
+MAX_BODY = 1_000_000  # bytes accepted by POST /api/chat
+
+
+def safe_note_path(rel: str):
+    """Resolve a vault-relative note path; None if it escapes the vault, is skipped or not .md."""
+    if not rel or "\0" in rel:
+        return None
+    try:
+        root = VAULT.resolve()
+        full = (root / rel).resolve()
+        if not full.is_relative_to(root):
+            return None
+        relp = full.relative_to(root)
+    except (ValueError, OSError):
+        return None
+    if full.suffix != ".md" or skip(relp):
+        return None
+    return full
+
+
 class VaultHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    # ── request guards ──
+    def _host_ok(self) -> bool:
+        """Reject DNS-rebinding: Host must be localhost:<port> or 127.0.0.1:<port>."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        return host in getattr(self.server, "allowed_hosts", set())
+
+    def _guard(self) -> bool:
+        if not self._host_ok():
+            self._respond(403, "text/plain", b"Forbidden: bad Host header")
+            return False
+        return True
+
     def do_GET(self):
+        if not self._guard():
+            return
         parsed = urlparse(self.path)
 
         if parsed.path in ("/", "/index.html"):
@@ -1591,7 +1668,7 @@ class VaultHandler(BaseHTTPRequestHandler):
             html = (VIEWER_HTML
                     .replace("__FM__", fm_json)
                     .replace("__TC__", tc_json)
-                    .replace("__TITLE__", title))
+                    .replace("__TITLE__", html_escape(title)))
             body = html.encode("utf-8")
             self._respond(200, "text/html; charset=utf-8", body)
 
@@ -1605,13 +1682,12 @@ class VaultHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/api/note":
             params = parse_qs(parsed.query)
-            rel = unquote(params.get("path", [""])[0])
-            note_path = (VAULT / rel).resolve()
-            vault_root = VAULT.resolve()
-            if not str(note_path).startswith(str(vault_root)):
+            rel = params.get("path", [""])[0]
+            note_path = safe_note_path(rel)
+            if note_path is None:
                 self._respond(403, "text/plain", b"Forbidden")
                 return
-            if not note_path.exists() or note_path.suffix != ".md":
+            if not note_path.is_file():
                 self._respond(404, "text/plain", b"Not found")
                 return
             text = note_path.read_text(encoding="utf-8")
@@ -1668,12 +1744,33 @@ class VaultHandler(BaseHTTPRequestHandler):
             self._respond(404, "text/plain", b"Not found")
 
     def do_POST(self):
+        if not self._guard():
+            return
         parsed = urlparse(self.path)
         if parsed.path != "/api/chat":
             self._respond(404, "text/plain", b"Not found")
             return
 
-        length = int(self.headers.get("Content-Length", 0))
+        # CSRF / cross-origin protection: browsers cannot send a custom header or
+        # application/json cross-origin without a CORS preflight, which we never grant.
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            self._respond(415, "text/plain", b"Content-Type must be application/json")
+            return
+        if self.headers.get("X-Vault-Viewer") != "1":
+            self._respond(403, "text/plain", b"Missing X-Vault-Viewer header")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._respond(411, "text/plain", b"Content-Length required")
+            return
+        if length < 0:
+            self._respond(400, "text/plain", b"Bad Content-Length")
+            return
+        if length > MAX_BODY:
+            self._respond(413, "text/plain", b"Request body too large")
+            return
         raw = self.rfile.read(length)
         try:
             req_body = json.loads(raw)
@@ -1681,8 +1778,13 @@ class VaultHandler(BaseHTTPRequestHandler):
             self._respond(400, "text/plain", b"Bad JSON")
             return
 
+        if not isinstance(req_body, dict) or not isinstance(req_body.get("messages", []), list):
+            self._respond(400, "text/plain", b"Bad request")
+            return
         messages = req_body.get("messages", [])
         context  = req_body.get("context", "")
+        if not isinstance(context, str):
+            context = ""
         base_prompt = CONFIG.get("system_prompt", "You are a knowledge base assistant. Answer concisely.")
         system_prompt = (
             f"{base_prompt}\n\nCurrent note:\n\n{context}"
@@ -1824,15 +1926,25 @@ class VaultHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ct)
         self.send_header("Content-Length", len(body))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         if not cache:
             self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
 
+def make_server(port: int = 5001) -> ThreadingHTTPServer:
+    """Bind to loopback only and remember which Host headers are acceptable."""
+    server = ThreadingHTTPServer((BIND_HOST, port), VaultHandler)
+    real = server.server_address[1]
+    server.allowed_hosts = {f"localhost:{real}", f"127.0.0.1:{real}"}
+    return server
+
+
 def serve(port: int = 5001) -> None:
-    url = f"http://localhost:{port}"
-    server = ThreadingHTTPServer(("localhost", port), VaultHandler)
+    server = make_server(port)
+    url = f"http://localhost:{server.server_address[1]}"
     print(f"✓ Vault viewer → {url}  (Ctrl+C to stop)")
     webbrowser.open(url)
     try:
