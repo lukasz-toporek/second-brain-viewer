@@ -9,6 +9,8 @@ Usage:
     python3 viewer.py --serve --port 8080
     python3 viewer.py --init                 # scaffold .viewer.json + .gitignore
     python3 viewer.py --vault PATH --init    # same for a specific vault
+    python3 viewer.py --serve --offline      # vendored libs, no chat, strict CSP
+    python3 viewer.py --export OUT.html      # one self-contained file (contains all notes!)
 """
 
 import json
@@ -20,9 +22,10 @@ import sys
 import time
 import webbrowser
 from datetime import date
+from html import escape as html_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
@@ -33,6 +36,7 @@ SKIP_NAMES: set = {"README.md", "_index.md"}
 SKIP_DIRS: set = {".obsidian"}
 FOLDER_ORDER: list = []
 CONFIG: dict = {}
+OFFLINE: bool = False
 
 
 def load_config(vault_path: Path) -> dict:
@@ -239,7 +243,7 @@ def scan_vault() -> dict:
         fm = parse_frontmatter(text)
         by_folder.setdefault(folder, []).append({
             "name":    path.stem,
-            "path":    str(rel),
+            "path":    rel.as_posix(),
             "type":    fm.get("type", ""),
             "status":  fm.get("status", ""),
             "date":    fm.get("date", ""),
@@ -255,43 +259,91 @@ def scan_vault() -> dict:
 
 # ── Wikilink graph ──────────────────────────────────────────────────────────
 
+_WIKILINK_RE = re.compile(r'!?\[\[([^\]\n]+?)\]\]')
+
+
 def extract_wikilinks(text: str) -> list[str]:
-    return re.findall(r'\[\[([^\]|#\n]+)', text)
+    """Targets of [[target#heading|label]] (also ![[embeds]] and [[a\\|b]] inside tables)."""
+    out = []
+    for m in _WIKILINK_RE.finditer(text):
+        target = re.split(r'\\?\||#', m.group(1), maxsplit=1)[0].strip()
+        if target:
+            out.append(target)
+    return out
+
+
+class VaultIndex:
+    """All notes plus link resolution shared by the graph, backlinks and the export.
+
+    A link target resolves (case-insensitively) to a vault-relative path with or without
+    ``.md``, or to a bare note name. The browser's ``resolveNote()`` mirrors this logic.
+    """
+
+    def __init__(self) -> None:
+        self.notes: list[dict] = []          # {path, name, type, folder, text}
+        self.by_path: dict[str, str] = {}
+        self.by_stem: dict[str, str] = {}
+        for path in sorted(VAULT.rglob("*.md")):
+            if skip(path):
+                continue
+            rel = path.relative_to(VAULT).as_posix()
+            text = path.read_text(encoding="utf-8")
+            fm = parse_frontmatter(text)
+            self.notes.append({
+                "path": rel, "name": path.stem, "type": fm.get("type", ""),
+                "folder": rel.split("/")[0] if "/" in rel else "(vault root)", "text": text,
+            })
+            low = rel.lower()
+            self.by_path[low] = rel
+            self.by_path[low[:-3]] = rel
+            self.by_stem.setdefault(path.stem.lower(), rel)
+        self.out_links: dict[str, set] = {}
+        self.backlinks: dict[str, list] = {n["path"]: [] for n in self.notes}
+        for n in self.notes:
+            targets = set()
+            for link in extract_wikilinks(n["text"]):      # body and frontmatter alike
+                t = self.resolve(link)
+                if t and t != n["path"]:
+                    targets.add(t)
+            self.out_links[n["path"]] = targets
+            for t in targets:
+                self.backlinks[t].append(n)
+
+    def resolve(self, target: str):
+        t = target.strip().replace("\\", "/").lstrip("/").lower()
+        if t.endswith(".md"):
+            t = t[:-3]
+        return self.by_path.get(t) or self.by_stem.get(t)
+
+    def backlinks_for(self, rel: str) -> list[dict]:
+        return sorted(({"path": n["path"], "name": n["name"]} for n in self.backlinks.get(rel, [])),
+                      key=lambda d: (d["name"].lower(), d["path"]))
+
+
+_INDEX_CACHE: tuple = (None, None)
+
+
+def get_index() -> VaultIndex:
+    """VaultIndex, rebuilt only when a note's mtime/set of notes changed."""
+    global _INDEX_CACHE
+    snap = vault_snapshot()
+    if _INDEX_CACHE[0] != snap or _INDEX_CACHE[1] is None:
+        _INDEX_CACHE = (snap, VaultIndex())
+    return _INDEX_CACHE[1]
 
 
 def build_graph() -> dict:
-    stem_to_path: dict[str, str] = {}
-    raw_notes: list[tuple] = []
-
-    for path in sorted(VAULT.rglob("*.md")):
-        if skip(path):
-            continue
-        rel = path.relative_to(VAULT)
-        folder = rel.parts[0] if len(rel.parts) > 1 else "(vault root)"
-        text = path.read_text(encoding="utf-8")
-        fm = parse_frontmatter(text)
-        node = {
-            "id":     str(rel),
-            "name":   path.stem,
-            "type":   fm.get("type", ""),
-            "folder": folder,
-        }
-        raw_notes.append((path.stem, str(rel), text, node))
-        stem_to_path[path.stem.lower()] = str(rel)
-
-    nodes = [n for _, _, _, n in raw_notes]
+    idx = get_index()
+    nodes = [{"id": n["path"], "name": n["name"], "type": n["type"], "folder": n["folder"]}
+             for n in idx.notes]
     edges: list[dict] = []
     seen: set[tuple] = set()
-
-    for stem, rel_path, text, node in raw_notes:
-        for link in extract_wikilinks(text):
-            target = stem_to_path.get(link.strip().lower())
-            if target and target != rel_path:
-                key = tuple(sorted([rel_path, target]))
-                if key not in seen:
-                    edges.append({"source": rel_path, "target": target})
-                    seen.add(key)
-
+    for n in idx.notes:
+        for target in sorted(idx.out_links[n["path"]]):
+            key = tuple(sorted([n["path"], target]))
+            if key not in seen:
+                edges.append({"source": n["path"], "target": target})
+                seen.add(key)
     return {"nodes": nodes, "edges": edges}
 
 
@@ -302,7 +354,7 @@ def vault_snapshot() -> dict:
     snap = {}
     for p in VAULT.rglob("*.md"):
         if not skip(p):
-            snap[str(p.relative_to(VAULT))] = p.stat().st_mtime
+            snap[p.relative_to(VAULT).as_posix()] = p.stat().st_mtime
     return snap
 
 
@@ -340,7 +392,7 @@ VIEWER_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Vault</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap">
+__HEAD__
 <style>
 :root {
   --bg:      #131313;
@@ -365,7 +417,7 @@ body {
   display: flex;
   background: var(--bg);
   color: var(--tx);
-  font-family: 'Inter', system-ui, sans-serif;
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   font-size: 13px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
@@ -667,7 +719,7 @@ body {
   font-size: 28px;
   opacity: .2;
   margin-bottom: 4px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 .welcome h3 { font-size: 14px; font-weight: 500; color: var(--tx2); }
 .welcome p { font-size: 12px; color: var(--tx2); opacity: .7; }
@@ -721,7 +773,7 @@ body {
   color: var(--tx2);
 }
 .md code {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   background: var(--sh);
   padding: 2px 5px;
@@ -742,6 +794,59 @@ body {
 .md th { text-align: left; padding: 7px 12px; border-bottom: 1px solid var(--bd); color: var(--tx2); font-weight: 500; white-space: nowrap; }
 .md td { padding: 7px 12px; border-bottom: 1px solid var(--bd); }
 .md strong { font-weight: 600; color: var(--tx); }
+
+/* wikilinks */
+.md a.wl { color: var(--ac); border-bottom: 1px dotted rgba(224,112,80,.5); }
+.md a.wl:hover { text-decoration: none; border-bottom-style: solid; }
+.md .wl.missing { color: var(--tx2); border-bottom: 1px dashed var(--tx2); cursor: help; }
+
+/* callouts */
+.callout {
+  --co: #5b9bd5;
+  border-left: 3px solid var(--co);
+  background: var(--sh);
+  background: color-mix(in srgb, var(--co) 10%, transparent);
+  border-radius: 0 6px 6px 0;
+  padding: 8px 14px;
+  margin: 0 0 14px;
+}
+.callout-title { font-weight: 600; color: var(--co); margin-bottom: 2px; }
+.callout-body { color: var(--tx); }
+.callout-body > :last-child { margin-bottom: 0; }
+.c-info, .c-note, .c-todo { --co: #5b9bd5; }
+.c-tip, .c-hint, .c-success, .c-check, .c-done { --co: #4ecdc4; }
+.c-abstract, .c-summary, .c-tldr { --co: #68b068; }
+.c-warning, .c-caution, .c-attention { --co: #c8980a; }
+.c-danger, .c-error, .c-bug, .c-failure, .c-fail, .c-missing { --co: #d05050; }
+.c-question, .c-help, .c-faq { --co: #9b8bdb; }
+.c-example { --co: #b07ad0; }
+.c-quote, .c-cite { --co: #888; }
+
+/* dataview inline fields */
+.dv {
+  display: inline-block; font-size: 11px; line-height: 1.5; padding: 0 7px; margin: 0 2px;
+  border-radius: 9px; background: var(--sa); color: var(--tx2); border: 1px solid var(--bd);
+  white-space: nowrap; vertical-align: baseline; text-decoration: none;
+}
+.dv .k { opacity: .65; margin-right: 4px; }
+a.dv-link { color: var(--ac); }
+a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
+.dv-state { font-weight: 500; }
+.s-not-started { color: #9a9a9a; }
+.s-in-progress { color: #5b9bd5; background: rgba(91,155,213,.14); border-color: rgba(91,155,213,.35); }
+.s-to-verify   { color: #c8980a; background: rgba(200,152,10,.14); border-color: rgba(200,152,10,.35); }
+.s-done        { color: #68b068; background: rgba(104,176,104,.14); border-color: rgba(104,176,104,.35); }
+.s-waived      { color: #9b8bdb; background: rgba(155,139,219,.14); border-color: rgba(155,139,219,.35); }
+.s-missed      { color: #d05050; background: rgba(208,80,80,.14); border-color: rgba(208,80,80,.35); }
+.md li.overdue { border-left: 2px solid #d05050; padding-left: 8px; margin-left: -10px; }
+.md li.overdue .dv-due { color: #d05050; background: rgba(208,80,80,.14); border-color: rgba(208,80,80,.35); }
+
+/* backlinks */
+.backlinks { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--bd); }
+.backlinks h4 { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--tx2); margin-bottom: 8px; }
+.backlinks ul { list-style: none; padding: 0; }
+.backlinks li { margin-bottom: 3px; }
+.backlinks a.wl { color: var(--ac); text-decoration: none; }
 
 .loading { padding: 40px 56px; color: var(--tx2); font-size: 13px; }
 .err     { padding: 40px 56px; color: #c05050; font-size: 13px; }
@@ -1022,14 +1127,178 @@ body {
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/force-graph@1.43.5/dist/force-graph.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+__LIBS__
+__DATA__
 <script>
+const FLAGS = __FLAGS__;   // {chat, watch, export}
 const FM = __FM__;
 const TC = __TC__;
 const tcol = t => TC[t] || "#888";
+const DONE_STATES = new Set(["done", "waived", "missed"]);
+const todayStr = () => { const d = new Date(), p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; };
+
+// Only http(s), mailto, #fragment and scheme-less (relative) URLs are allowed.
+function safeUrl(u) {
+  u = String(u ?? "").trim();
+  const probe = u.replace(/[\u0000-\u0020\u00ad\u200b-\u200f\u2028\u2029\ufeff]/g, "");
+  const m = /^([a-z][a-z0-9+.-]*):/i.exec(probe);
+  if (m && !/^(https?|mailto)$/i.test(m[1])) return null;
+  if (!m && /^[\\/]{2}/.test(probe)) return null;
+  return u;
+}
+const esc = s => String(s ?? "").replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+// All data access goes through api(): live server (fetch) or the data embedded by --export.
+const EXPORT = window.__EXPORT__ || null;
+async function api(kind, arg) {
+  if (EXPORT) {
+    if (kind === "vault") return EXPORT.vault;
+    if (kind === "graph") return EXPORT.graph;
+    const n = EXPORT.notes[arg];
+    if (!n) throw new Error("Note not found");
+    return n;
+  }
+  const url = kind === "vault" ? "/api/vault" : kind === "graph" ? "/api/graph"
+    : "/api/note?path=" + encodeURIComponent(arg);
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(r.statusText || ("HTTP " + r.status));
+  return r.json();
+}
 
 let vault = null, tabs = [], activeTab = null, expanded = new Set(), searchQ = "";
+
+// ── Note resolution (mirrors VaultIndex.resolve in viewer.py) ──
+let noteIdx = null;
+function resolveNote(target) {
+  if (!vault) return null;
+  if (!noteIdx) {
+    noteIdx = { byPath: new Map(), byStem: new Map() };
+    vault.folders.forEach(s => s.notes.forEach(n => {
+      const p = n.path.toLowerCase();
+      noteIdx.byPath.set(p, n);
+      noteIdx.byPath.set(p.replace(/\.md$/, ""), n);
+      const st = n.name.toLowerCase();
+      if (!noteIdx.byStem.has(st)) noteIdx.byStem.set(st, n);
+    }));
+  }
+  const t = String(target || "").trim().replace(/\\/g, "/").replace(/^\/+/, "")
+    .replace(/\.md$/i, "").toLowerCase();
+  return noteIdx.byPath.get(t) || noteIdx.byStem.get(t) || null;
+}
+
+// ── Markdown extensions: wikilinks + callouts ──
+if (typeof marked !== "undefined") {
+  marked.use({
+    extensions: [{
+      name: "wikilink", level: "inline",
+      start(src) { const i = src.search(/!?\[\[/); return i < 0 ? undefined : i; },
+      tokenizer(src) {
+        const m = /^(!?)\[\[([^\]\n|#]+?)(?:#([^\]\n|]*?))?(?:\\?\|([^\]\n]*?))?\]\]/.exec(src);
+        if (!m) return;
+        return { type: "wikilink", raw: m[0], embed: !!m[1],
+          target: m[2].replace(/\\$/, "").trim(),
+          heading: (m[3] || "").replace(/\\$/, "").trim(),
+          label: (m[4] || "").trim() };
+      },
+      renderer(tok) {
+        const label = tok.label || (tok.heading ? `${tok.target} › ${tok.heading}` : tok.target);
+        const n = resolveNote(tok.target);
+        if (!n) return `<span class="wl missing" title="Note not found">${esc(label)}</span>`;
+        return `<a class="wl" href="#" data-path="${esc(n.path)}">${esc(label)}</a>`;
+      },
+    }],
+    renderer: {
+      // raw HTML in Markdown is shown as text, never injected
+      html(html) { return esc(typeof html === "string" ? html : html.text); },
+      link(href, title, text) {
+        const u = safeUrl(href);
+        if (u === null) return text;
+        const t = title ? ` title="${esc(title)}"` : "";
+        if (u.startsWith("#")) return `<a href="#" data-anchor="${esc(u.slice(1))}"${t}>${text}</a>`;
+        const ext = /^(https?:|mailto:)/i.test(u) ? ` target="_blank" rel="noopener noreferrer"` : "";
+        return `<a href="${esc(u)}"${t}${ext}>${text}</a>`;
+      },
+      image(href, title, text) {
+        const u = safeUrl(href);
+        if (u === null) return esc(text);
+        return `<img src="${esc(u)}" alt="${esc(text)}"${title ? ` title="${esc(title)}"` : ""}>`;
+      },
+      blockquote(quote) {
+        const m = /^\s*<p>\[!([A-Za-z][\w-]*)\][+-]?[ \t]*([^\n]*?)(?:\n([\s\S]*?))?<\/p>([\s\S]*)$/.exec(quote);
+        if (!m) return false;
+        const type = m[1].toLowerCase();
+        const title = m[2].trim() || type.charAt(0).toUpperCase() + type.slice(1);
+        const body = (m[3] ? `<p>${m[3]}</p>` : "") + m[4];
+        return `<div class="callout c-${type}"><div class="callout-title">${title}</div>` +
+          (body.trim() ? `<div class="callout-body">${body}</div>` : "") + `</div>\n`;
+      },
+    },
+  });
+}
+
+document.addEventListener("click", e => {
+  const a = e.target.closest && e.target.closest("a[data-anchor]");
+  if (!a) return;
+  e.preventDefault();
+  const slug = h => h.toLowerCase().trim().replace(/[^\p{L}\p{N}\s-]/gu, "").replace(/\s+/g, "-");
+  const want = a.dataset.anchor.toLowerCase();
+  const h = [...document.querySelectorAll(".md h1,.md h2,.md h3,.md h4,.md h5,.md h6")]
+    .find(x => slug(x.textContent) === want);
+  if (h) h.scrollIntoView();
+});
+
+// ── Dataview inline fields: [key:: value] ──
+if (typeof marked !== "undefined") {
+  marked.use({
+    extensions: [{
+      name: "dvfield", level: "inline",
+      start(src) { const i = src.search(/\[[A-Za-z][\w -]*::/); return i < 0 ? undefined : i; },
+      tokenizer(src) {
+        const m = /^\[([A-Za-z][\w -]*?)::[ \t]*([^\]\n]*?)\]/.exec(src);
+        if (!m) return;
+        return { type: "dvfield", raw: m[0], key: m[1].trim(), value: m[2].trim() };
+      },
+      renderer(tok) {
+        const key = tok.key.toLowerCase(), v = tok.value;
+        if (key === "state") {
+          const st = v.toLowerCase();
+          return `<span class="dv dv-state s-${esc(st.replace(/[^a-z0-9]+/g, "-"))}" data-state="${esc(st)}">${esc(v)}</span>`;
+        }
+        if (key === "due") {
+          const iso = /^\d{4}-\d{2}-\d{2}$/.test(v) ? ` data-due="${esc(v)}"` : "";
+          return `<span class="dv dv-due"${iso}>due ${esc(v)}</span>`;
+        }
+        if (key === "link" && /^https?:\/\//i.test(v) && safeUrl(v) !== null)
+          return `<a class="dv dv-link" href="${esc(v)}" target="_blank" rel="noopener noreferrer">Open ↗</a>`;
+        return `<span class="dv"><span class="k">${esc(tok.key)}</span>${esc(v)}</span>`;
+      },
+    }],
+    renderer: {
+      // open task with a past due date and a still-open state → "overdue"
+      listitem(text, task, checked) {
+        let cls = "";
+        if (task && !checked) {
+          const own = text.split(/<[uo]l[\s>]/)[0];            // ignore nested lists
+          const due = /data-due="(\d{4}-\d{2}-\d{2})"/.exec(own);
+          const st = /data-state="([^"]*)"/.exec(own);
+          if (due && due[1] < todayStr() && !(st && DONE_STATES.has(st[1]))) cls = ' class="overdue"';
+        }
+        return `<li${cls}>${text}</li>\n`;
+      },
+    },
+  });
+}
+
+// delegated click handler for wikilinks (content, backlinks, chat bubbles)
+document.addEventListener("click", e => {
+  const a = e.target.closest && e.target.closest("a.wl[data-path]");
+  if (!a) return;
+  e.preventDefault();
+  const n = findNote(a.dataset.path);
+  if (n) openNote({ path: n.path, name: n.name, type: n.type, folder: n.path.split("/")[0] });
+});
 
 // ── Tree ──────────────────────────────────────────────────────
 function renderTree() {
@@ -1055,8 +1324,8 @@ function renderTree() {
     hd.className = "fhd" + (open ? " open" : "");
     hd.innerHTML =
       `<svg class="ch" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 4 10 8 6 12"/></svg>` +
-      `<span class="fi" style="background:${fm.bg};color:${fm.fg}">${fm.letter}</span>` +
-      `<span class="fn">${label}</span>` +
+      `<span class="fi" style="background:${esc(fm.bg)};color:${esc(fm.fg)}">${esc(fm.letter)}</span>` +
+      `<span class="fn">${esc(label)}</span>` +
       `<span class="fc">${notes.length}</span>`;
 
     const fnotes = document.createElement("div");
@@ -1068,8 +1337,8 @@ function renderTree() {
       ni.className = "ni" + (activeTab === n.path ? " active" : "");
       ni.dataset.path = n.path;
       ni.innerHTML =
-        `<span class="nd" style="background:${tcol(n.type)}"></span>` +
-        `<span class="nn">${n.name}</span>`;
+        `<span class="nd" style="background:${esc(tcol(n.type))}"></span>` +
+        `<span class="nn">${esc(n.name)}</span>`;
       ni.addEventListener("click", () => openNote({
         path: n.path, name: n.name, type: n.type, folder: sec.folder
       }));
@@ -1096,18 +1365,13 @@ function renderTabs() {
   tabs.forEach(t => {
     const el = document.createElement("div");
     el.className = "tab" + (activeTab === t.path ? " active" : "");
-    el.innerHTML = `<span class="ti" style="background:${tcol(t.type)}"></span>${t.name}`;
+    el.innerHTML = `<span class="ti" style="background:${esc(tcol(t.type))}"></span>${esc(t.name)}`;
     el.addEventListener("click", () => switchTo(t));
     bar.appendChild(el);
   });
 }
 
-function switchTo(t) {
-  activeTab = t.path;
-  renderTabs();
-  loadContent(t);
-  highlight();
-}
+const switchTo = t => openNote(t);
 
 function highlight() {
   document.querySelectorAll(".ni").forEach(el =>
@@ -1115,7 +1379,13 @@ function highlight() {
 }
 
 // ── Open note ─────────────────────────────────────────────────
+const findNote = path => vault?.folders.flatMap(s => s.notes).find(n => n.path === path);
+const hashFor = path => "#" + encodeURIComponent(path);
+
+// Opens (or switches to) a note tab. activeTab is set *before* the hash is written, so the
+// resulting hashchange sees "already active" and does nothing: no double load, no loop.
 function openNote(note) {
+  if (graphMode) closeGraph();
   if (!tabs.find(t => t.path === note.path)) {
     tabs.push(note);
     if (tabs.length > 8) tabs.shift();
@@ -1124,18 +1394,42 @@ function openNote(note) {
   renderTabs();
   loadContent(note);
   highlight();
+  if (location.hash !== hashFor(note.path)) location.hash = hashFor(note.path);
 }
+
+const welcomeHTML = document.getElementById("content").innerHTML;
+function routeFromHash() {
+  if (!vault) return;                         // initial route happens after the first load()
+  let p = "";
+  try { p = decodeURIComponent(location.hash.replace(/^#/, "")); } catch (_) { return; }
+  if (!p) {                                   // back to the empty hash → welcome screen
+    if (activeTab === null) return;
+    activeTab = null;
+    renderTabs(); highlight();
+    document.getElementById("content").innerHTML = welcomeHTML;
+    return;
+  }
+  if (p === activeTab) return;
+  const n = findNote(p);
+  if (n) openNote({ path: n.path, name: n.name, type: n.type, folder: n.path.split("/")[0] });
+}
+window.addEventListener("hashchange", routeFromHash);
 
 async function loadContent(note) {
   const area = document.getElementById("content");
   area.innerHTML = `<div class="loading">Loading…</div>`;
   try {
-    const r = await fetch("/api/note?path=" + encodeURIComponent(note.path));
-    if (!r.ok) throw new Error(r.statusText);
-    showNote(await r.json());
+    showNote(await api("note", note.path));
   } catch(e) {
-    area.innerHTML = `<div class="err">Error: ${e.message}</div>`;
+    area.innerHTML = `<div class="err">Error: ${esc(e.message)}</div>`;
   }
+}
+
+function backlinksHtml(list) {
+  if (!list || !list.length) return "";
+  return `<div class="backlinks"><h4>Linked from (${list.length})</h4><ul>` +
+    list.map(b => `<li><a class="wl" href="#" data-path="${esc(b.path)}">${esc(b.name)}</a></li>`).join("") +
+    `</ul></div>`;
 }
 
 function showNote(data) {
@@ -1145,34 +1439,40 @@ function showNote(data) {
   const fmMatch = raw.match(/^---\n([\s\S]*?)\n---\n?/);
   if (fmMatch) {
     raw = raw.slice(fmMatch[0].length);
-    chips = fmMatch[1].split("\n")
-      .filter(l => l.includes(":") && !l.trimStart().startsWith("title:"))
-      .map(l => {
-        const [k, ...rest] = l.split(":");
-        const v = rest.join(":").trim();
-        if (!v) return "";
-        const key = k.trim();
-        const c = key === "type"   ? (tcol(v)) :
-                  key === "status" ? "#68b068" : "#888";
-        return `<span class="chip" style="background:${c}20;color:${c}">${key}: ${v}</span>`;
-      }).filter(Boolean).join("");
+    const lines = fmMatch[1].split("\n"), kv = [];
+    for (let i = 0; i < lines.length; i++) {
+      const m = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(lines[i]);
+      if (!m) continue;
+      let v = m[2].trim();
+      if (!v) {                       // YAML block list: "key:" followed by "- item" lines
+        const items = [];
+        while (i + 1 < lines.length && /^\s*-\s+/.test(lines[i + 1]))
+          items.push(lines[++i].replace(/^\s*-\s+/, "").trim().replace(/^["']|["']$/g, ""));
+        v = items.join(", ");
+      }
+      if (v && m[1] !== "title") kv.push([m[1], v]);
+    }
+    chips = kv.map(([key, v]) => {
+      const c = key === "type" ? tcol(v) : key === "status" ? "#68b068" : "#888";
+      return `<span class="chip" style="background:${esc(c)}20;color:${esc(c)}">${esc(key)}: ${esc(v)}</span>`;
+    }).join("");
     if (chips) chips = `<div class="chips">${chips}</div>`;
   }
 
   const parts = data.path.split("/");
   const bc = parts.length > 1
-    ? `<div class="bc"><span>${parts[0].replace(/^\d+[-\s]+/,"")}</span><span class="sep">/</span><span>${data.name}</span></div>`
-    : `<div class="bc"><span>${data.name}</span></div>`;
+    ? `<div class="bc"><span>${esc(parts[0].replace(/^\d+[-\s]+/,""))}</span><span class="sep">/</span><span>${esc(data.name)}</span></div>`
+    : `<div class="bc"><span>${esc(data.name)}</span></div>`;
 
   let html = "";
   if (typeof marked !== "undefined") {
     html = marked.parse(raw);
   } else {
-    html = `<pre style="white-space:pre-wrap;font-family:inherit">${raw.replace(/</g,"&lt;")}</pre>`;
+    html = `<pre style="white-space:pre-wrap;font-family:inherit">${esc(raw)}</pre>`;
   }
 
   document.getElementById("content").innerHTML =
-    `<div class="note-body">${bc}${chips}<div class="md">${html}</div></div>`;
+    `<div class="note-body">${bc}${chips}<div class="md">${html}</div>${backlinksHtml(data.backlinks)}</div>`;
 
   setChatContext(data.name, data.content);
 }
@@ -1182,10 +1482,13 @@ async function load() {
   const btn = document.getElementById("rbtn");
   btn.classList.add("spinning");
   try {
-    vault = await fetch("/api/vault").then(r => r.json());
+    const first = !vault;
+    vault = await api("vault");
+    noteIdx = null;
     renderTree();
+    if (first) routeFromHash();
   } catch(e) {
-    document.getElementById("tree").innerHTML = `<div class="err">${e.message}</div>`;
+    document.getElementById("tree").innerHTML = `<div class="err">${esc(e.message)}</div>`;
   } finally {
     btn.classList.remove("spinning");
   }
@@ -1204,7 +1507,7 @@ document.addEventListener("keydown", e => {
   if (e.key === "/") { e.preventDefault(); document.getElementById("srch").focus(); }
   if (e.key === "Escape") {
     if (graphMode) closeGraph();
-    else if (chatOpen) closeChat();
+    else if (FLAGS.chat && chatOpen) closeChat();
     else document.getElementById("srch").blur();
   }
 });
@@ -1223,9 +1526,9 @@ async function openGraph() {
   wrap.hidden = false;
   if (!graphData) {
     try {
-      graphData = await fetch("/api/graph").then(r => r.json());
+      graphData = await api("graph");
     } catch(e) {
-      wrap.querySelector("#fg-mount").innerHTML = `<div style="padding:40px;color:#c05858">Graph: ${e.message}</div>`;
+      wrap.querySelector("#fg-mount").innerHTML = `<div style="padding:40px;color:#c05858">Graph: ${esc(e.message)}</div>`;
       return;
     }
   }
@@ -1339,11 +1642,12 @@ function closeChat() {
 }
 
 function setChatContext(noteTitle, noteContent) {
+  if (!FLAGS.chat) return;            // chat panel is removed in offline/export mode
   chatNoteTitle = noteTitle || "";
   chatNoteContext = noteContent || "";
   const ctx = document.getElementById("chat-ctx");
   ctx.innerHTML = noteTitle
-    ? `Context: <span>${noteTitle}</span>`
+    ? `Context: <span>${esc(noteTitle)}</span>`
     : "No note open";
 }
 
@@ -1381,7 +1685,7 @@ async function chatSend() {
   try {
     const resp = await fetch("/api/chat", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Vault-Viewer": "1" },
       body: JSON.stringify({ messages: chatHistory, context: chatNoteContext }),
     });
 
@@ -1445,25 +1749,32 @@ async function chatSend() {
   input.focus();
 }
 
-document.getElementById("chat-toggle-btn").addEventListener("click", () => {
-  chatOpen ? closeChat() : openChat();
-});
-document.getElementById("chat-close").addEventListener("click", closeChat);
-document.getElementById("chat-send").addEventListener("click", chatSend);
-
-document.getElementById("chat-input").addEventListener("keydown", e => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); chatSend(); }
-  setTimeout(() => {
-    const el = e.target;
-    el.style.height = "36px";
-    el.style.height = Math.min(el.scrollHeight, 120) + "px";
-  }, 0);
-});
+if (!FLAGS.chat) {
+  document.getElementById("chat-toggle-btn").remove();
+  document.getElementById("chat-panel").remove();
+} else {
+  document.getElementById("chat-toggle-btn").addEventListener("click", () => {
+    chatOpen ? closeChat() : openChat();
+  });
+}
+if (FLAGS.chat) {
+  document.getElementById("chat-close").addEventListener("click", closeChat);
+  document.getElementById("chat-send").addEventListener("click", chatSend);
+  document.getElementById("chat-input").addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); chatSend(); }
+    setTimeout(() => {
+      const el = e.target;
+      el.style.height = "36px";
+      el.style.height = Math.min(el.scrollHeight, 120) + "px";
+    }, 0);
+  });
+}
 
 load();
 
 // ── File watcher ──────────────────────────────────────────────────────────
 (function startWatcher() {
+  if (!FLAGS.watch) return;
   const es = new EventSource("/api/watch");
   es.onmessage = () => {
     load();
@@ -1484,23 +1795,111 @@ load();
 
 # ── HTTP server ──────────────────────────────────────────────────────────────
 
+CSP_OFFLINE = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
+               "style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'")
+
+VENDOR_DIR: Path = Path(__file__).resolve().parent / "vendor"
+VENDOR_FILES = ("marked.min.js", "force-graph.min.js")
+CDN_LIBS = (
+    '<script src="https://cdn.jsdelivr.net/npm/force-graph@1.43.5/dist/force-graph.min.js"></script>\n'
+    '<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>'
+)
+CDN_FONTS = ('<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600'
+             '&family=JetBrains+Mono:wght@400&display=swap">')
+
+
+def check_vendor() -> None:
+    """Exit with a clear message if offline mode lacks its vendored libraries."""
+    missing = [f for f in VENDOR_FILES if not (VENDOR_DIR / f).is_file()]
+    if missing:
+        sys.exit(f"error: missing vendored file(s) in {VENDOR_DIR}: {', '.join(missing)}\n"
+                 f"       run: python3 {Path(__file__).resolve().parent / 'tools' / 'fetch-vendor.py'}")
+
+
+def js_json(obj) -> str:
+    """JSON safe to inline inside a <script> element."""
+    return json.dumps(obj, ensure_ascii=False).replace("</", "<\\/").replace("<!--", "<\\u0021--")
+
+
+def render_page(mode: str = "online", data: dict = None) -> str:
+    """mode: 'online' (CDN libs, chat) | 'offline' (vendored, no chat) | 'export' (single file)."""
+    flags = {"chat": mode == "online", "watch": mode != "export", "export": mode == "export"}
+    head, libs, data_tag = "", "", ""
+    if mode == "online":
+        head, libs = CDN_FONTS, CDN_LIBS
+    elif mode == "offline":
+        libs = "\n".join(f'<script src="/vendor/{f}"></script>' for f in VENDOR_FILES)
+    else:
+        check_vendor()
+        head = ('<meta http-equiv="Content-Security-Policy" content="' +
+                CSP_OFFLINE.replace("connect-src 'self'", "connect-src 'none'") + '">')
+        libs = "\n".join(
+            "<script>" + (VENDOR_DIR / f).read_text(encoding="utf-8").replace("</script", "<\\/script") + "</script>"
+            for f in VENDOR_FILES)
+        data_tag = "<script>window.__EXPORT__ = " + js_json(data) + ";</script>"
+    repl = {
+        "FM": js_json(CONFIG.get("folders", {})),
+        "TC": js_json(CONFIG.get("types", {})),
+        "TITLE": html_escape(CONFIG.get("title", VAULT.name)),
+        "FLAGS": js_json(flags),
+        "HEAD": head, "LIBS": libs, "DATA": data_tag,
+    }
+    # single pass, so substituted content is never re-scanned for placeholders
+    return re.sub(r"__(FM|TC|TITLE|FLAGS|HEAD|LIBS|DATA)__", lambda m: repl[m.group(1)], VIEWER_HTML)
+
+
+BIND_HOST = "127.0.0.1"
+MAX_BODY = 1_000_000  # bytes accepted by POST /api/chat
+
+
+def safe_note_path(rel: str):
+    """Resolve a vault-relative note path; None if it escapes the vault, is skipped or not .md."""
+    if not rel or "\0" in rel:
+        return None
+    try:
+        root = VAULT.resolve()
+        full = (root / rel).resolve()
+        if not full.is_relative_to(root):
+            return None
+        relp = full.relative_to(root)
+    except (ValueError, OSError):
+        return None
+    if full.suffix != ".md" or skip(relp):
+        return None
+    return full
+
+
 class VaultHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    # ── request guards ──
+    def _host_ok(self) -> bool:
+        """Reject DNS-rebinding: Host must be localhost:<port> or 127.0.0.1:<port>."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        return host in getattr(self.server, "allowed_hosts", set())
+
+    def _guard(self) -> bool:
+        if not self._host_ok():
+            self._respond(403, "text/plain", b"Forbidden: bad Host header")
+            return False
+        return True
+
     def do_GET(self):
+        if not self._guard():
+            return
         parsed = urlparse(self.path)
 
         if parsed.path in ("/", "/index.html"):
-            fm_json = json.dumps(CONFIG.get("folders", {}), ensure_ascii=False)
-            tc_json = json.dumps(CONFIG.get("types", {}), ensure_ascii=False)
-            title = CONFIG.get("title", VAULT.name)
-            html = (VIEWER_HTML
-                    .replace("__FM__", fm_json)
-                    .replace("__TC__", tc_json)
-                    .replace("__TITLE__", title))
-            body = html.encode("utf-8")
+            body = render_page("offline" if OFFLINE else "online").encode("utf-8")
             self._respond(200, "text/html; charset=utf-8", body)
+
+        elif parsed.path.startswith("/vendor/"):
+            name = parsed.path[len("/vendor/"):]
+            if not OFFLINE or name not in VENDOR_FILES or not (VENDOR_DIR / name).is_file():
+                self._respond(404, "text/plain", b"Not found")
+                return
+            self._respond(200, "application/javascript; charset=utf-8", (VENDOR_DIR / name).read_bytes())
 
         elif parsed.path == "/api/vault":
             body = json.dumps(scan_vault(), ensure_ascii=False).encode("utf-8")
@@ -1512,20 +1911,21 @@ class VaultHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/api/note":
             params = parse_qs(parsed.query)
-            rel = unquote(params.get("path", [""])[0])
-            note_path = (VAULT / rel).resolve()
-            vault_root = VAULT.resolve()
-            if not str(note_path).startswith(str(vault_root)):
+            rel = params.get("path", [""])[0]
+            note_path = safe_note_path(rel)
+            if note_path is None:
                 self._respond(403, "text/plain", b"Forbidden")
                 return
-            if not note_path.exists() or note_path.suffix != ".md":
+            if not note_path.is_file():
                 self._respond(404, "text/plain", b"Not found")
                 return
             text = note_path.read_text(encoding="utf-8")
             fm = parse_frontmatter(text)
+            rel_posix = note_path.relative_to(VAULT.resolve()).as_posix()
             payload = {
-                "path": rel, "name": note_path.stem, "content": text,
+                "path": rel_posix, "name": note_path.stem, "content": text,
                 "type": fm.get("type", ""), "status": fm.get("status", ""),
+                "backlinks": get_index().backlinks_for(rel_posix),
             }
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self._respond(200, "application/json; charset=utf-8", body, cache=False)
@@ -1534,6 +1934,8 @@ class VaultHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
+            if OFFLINE:
+                self.send_header("Content-Security-Policy", CSP_OFFLINE)
             self.end_headers()
             last = vault_snapshot()
             ticks = 0
@@ -1553,6 +1955,9 @@ class VaultHandler(BaseHTTPRequestHandler):
                 pass
 
         elif parsed.path == "/api/config":
+            if OFFLINE:
+                self._respond(403, "text/plain", b"Chat is disabled in offline mode")
+                return
             anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
             kb_key   = os.environ.get("KB_API_KEY", "")
             kb_base  = os.environ.get("KB_API_BASE", "")
@@ -1575,12 +1980,36 @@ class VaultHandler(BaseHTTPRequestHandler):
             self._respond(404, "text/plain", b"Not found")
 
     def do_POST(self):
+        if not self._guard():
+            return
         parsed = urlparse(self.path)
         if parsed.path != "/api/chat":
             self._respond(404, "text/plain", b"Not found")
             return
+        if OFFLINE:
+            self._respond(403, "text/plain", b"Chat is disabled in offline mode")
+            return
 
-        length = int(self.headers.get("Content-Length", 0))
+        # CSRF / cross-origin protection: browsers cannot send a custom header or
+        # application/json cross-origin without a CORS preflight, which we never grant.
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            self._respond(415, "text/plain", b"Content-Type must be application/json")
+            return
+        if self.headers.get("X-Vault-Viewer") != "1":
+            self._respond(403, "text/plain", b"Missing X-Vault-Viewer header")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._respond(411, "text/plain", b"Content-Length required")
+            return
+        if length < 0:
+            self._respond(400, "text/plain", b"Bad Content-Length")
+            return
+        if length > MAX_BODY:
+            self._respond(413, "text/plain", b"Request body too large")
+            return
         raw = self.rfile.read(length)
         try:
             req_body = json.loads(raw)
@@ -1588,8 +2017,13 @@ class VaultHandler(BaseHTTPRequestHandler):
             self._respond(400, "text/plain", b"Bad JSON")
             return
 
+        if not isinstance(req_body, dict) or not isinstance(req_body.get("messages", []), list):
+            self._respond(400, "text/plain", b"Bad request")
+            return
         messages = req_body.get("messages", [])
         context  = req_body.get("context", "")
+        if not isinstance(context, str):
+            context = ""
         base_prompt = CONFIG.get("system_prompt", "You are a knowledge base assistant. Answer concisely.")
         system_prompt = (
             f"{base_prompt}\n\nCurrent note:\n\n{context}"
@@ -1731,15 +2165,45 @@ class VaultHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ct)
         self.send_header("Content-Length", len(body))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if OFFLINE:
+            self.send_header("Content-Security-Policy", CSP_OFFLINE)
         if not cache:
             self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
 
+def export_html(out_path: Path) -> None:
+    """Write one self-contained HTML file: UI, libraries and every note (no network needed)."""
+    idx = get_index()
+    notes = {}
+    for n in idx.notes:
+        fm = parse_frontmatter(n["text"])
+        notes[n["path"]] = {
+            "path": n["path"], "name": n["name"], "content": n["text"],
+            "type": fm.get("type", ""), "status": fm.get("status", ""),
+            "backlinks": idx.backlinks_for(n["path"]),
+        }
+    html = render_page("export", {"vault": scan_vault(), "graph": build_graph(), "notes": notes})
+    out_path.write_text(html, encoding="utf-8")
+    print(f"✓ Exported {len(notes)} notes → {out_path} ({out_path.stat().st_size // 1024} KiB)")
+    print("⚠ WARNING: this file contains the full content of every note in the vault. "
+          "Share it only with people who may read all of it.", file=sys.stderr)
+
+
+def make_server(port: int = 5001) -> ThreadingHTTPServer:
+    """Bind to loopback only and remember which Host headers are acceptable."""
+    server = ThreadingHTTPServer((BIND_HOST, port), VaultHandler)
+    real = server.server_address[1]
+    server.allowed_hosts = {f"localhost:{real}", f"127.0.0.1:{real}"}
+    return server
+
+
 def serve(port: int = 5001) -> None:
-    url = f"http://localhost:{port}"
-    server = ThreadingHTTPServer(("localhost", port), VaultHandler)
+    server = make_server(port)
+    url = f"http://localhost:{server.server_address[1]}"
     print(f"✓ Vault viewer → {url}  (Ctrl+C to stop)")
     webbrowser.open(url)
     try:
@@ -1763,6 +2227,19 @@ def main() -> None:
     if "--init" in args:
         init_vault(vault_path)
         return
+
+    if "--export" in args:
+        i = args.index("--export")
+        if i + 1 >= len(args) or args[i + 1].startswith("--"):
+            sys.exit("error: --export needs an output file, e.g. --export vault.html")
+        check_vendor()
+        export_html(Path(args[i + 1]))
+        return
+
+    global OFFLINE
+    OFFLINE = "--offline" in args or CONFIG.get("offline") is True
+    if OFFLINE and "--serve" in args:
+        check_vendor()
 
     if "--serve" in args:
         port = 5001

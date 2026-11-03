@@ -20,5 +20,16 @@
     "index":   "#888",
     "home":    "#e07050"
   },
-  "system_prompt": "You are a knowledge base assistant. Answer concisely."
+  "system_prompt": "You are a knowledge base assistant. Answer concisely.",
+  "lint": {
+    "valid_types": ["home", "index", "wiedza", "projekt", "daily", "kurs", "rozmowa", "meta"],
+    "required_fields": {
+      "projekt": ["status"],
+      "daily": ["date"],
+      "kurs": ["status"],
+      "rozmowa": ["firma", "stanowisko", "data"]
+    },
+    "excluded_files": ["README.md"],
+    "excluded_dirs": [".obsidian", "Szablony"]
+  }
 }
