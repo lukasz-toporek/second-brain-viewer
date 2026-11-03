@@ -10,6 +10,7 @@ Usage:
     python3 viewer.py --init                 # scaffold .viewer.json + .gitignore
     python3 viewer.py --vault PATH --init    # same for a specific vault
     python3 viewer.py --serve --offline      # vendored libs, no chat, strict CSP
+    python3 viewer.py --export OUT.html      # one self-contained file (contains all notes!)
 """
 
 import json
@@ -1149,6 +1150,23 @@ function safeUrl(u) {
 const esc = s => String(s ?? "").replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
+// All data access goes through api(): live server (fetch) or the data embedded by --export.
+const EXPORT = window.__EXPORT__ || null;
+async function api(kind, arg) {
+  if (EXPORT) {
+    if (kind === "vault") return EXPORT.vault;
+    if (kind === "graph") return EXPORT.graph;
+    const n = EXPORT.notes[arg];
+    if (!n) throw new Error("Note not found");
+    return n;
+  }
+  const url = kind === "vault" ? "/api/vault" : kind === "graph" ? "/api/graph"
+    : "/api/note?path=" + encodeURIComponent(arg);
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(r.statusText || ("HTTP " + r.status));
+  return r.json();
+}
+
 let vault = null, tabs = [], activeTab = null, expanded = new Set(), searchQ = "";
 
 // ── Note resolution (mirrors VaultIndex.resolve in viewer.py) ──
@@ -1401,9 +1419,7 @@ async function loadContent(note) {
   const area = document.getElementById("content");
   area.innerHTML = `<div class="loading">Loading…</div>`;
   try {
-    const r = await fetch("/api/note?path=" + encodeURIComponent(note.path));
-    if (!r.ok) throw new Error(r.statusText);
-    showNote(await r.json());
+    showNote(await api("note", note.path));
   } catch(e) {
     area.innerHTML = `<div class="err">Error: ${esc(e.message)}</div>`;
   }
@@ -1467,7 +1483,7 @@ async function load() {
   btn.classList.add("spinning");
   try {
     const first = !vault;
-    vault = await fetch("/api/vault").then(r => r.json());
+    vault = await api("vault");
     noteIdx = null;
     renderTree();
     if (first) routeFromHash();
@@ -1510,7 +1526,7 @@ async function openGraph() {
   wrap.hidden = false;
   if (!graphData) {
     try {
-      graphData = await fetch("/api/graph").then(r => r.json());
+      graphData = await api("graph");
     } catch(e) {
       wrap.querySelector("#fg-mount").innerHTML = `<div style="padding:40px;color:#c05858">Graph: ${esc(e.message)}</div>`;
       return;
@@ -2158,6 +2174,24 @@ class VaultHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def export_html(out_path: Path) -> None:
+    """Write one self-contained HTML file: UI, libraries and every note (no network needed)."""
+    idx = get_index()
+    notes = {}
+    for n in idx.notes:
+        fm = parse_frontmatter(n["text"])
+        notes[n["path"]] = {
+            "path": n["path"], "name": n["name"], "content": n["text"],
+            "type": fm.get("type", ""), "status": fm.get("status", ""),
+            "backlinks": idx.backlinks_for(n["path"]),
+        }
+    html = render_page("export", {"vault": scan_vault(), "graph": build_graph(), "notes": notes})
+    out_path.write_text(html, encoding="utf-8")
+    print(f"✓ Exported {len(notes)} notes → {out_path} ({out_path.stat().st_size // 1024} KiB)")
+    print("⚠ WARNING: this file contains the full content of every note in the vault. "
+          "Share it only with people who may read all of it.", file=sys.stderr)
+
+
 def make_server(port: int = 5001) -> ThreadingHTTPServer:
     """Bind to loopback only and remember which Host headers are acceptable."""
     server = ThreadingHTTPServer((BIND_HOST, port), VaultHandler)
@@ -2191,6 +2225,14 @@ def main() -> None:
 
     if "--init" in args:
         init_vault(vault_path)
+        return
+
+    if "--export" in args:
+        i = args.index("--export")
+        if i + 1 >= len(args) or args[i + 1].startswith("--"):
+            sys.exit("error: --export needs an output file, e.g. --export vault.html")
+        check_vendor()
+        export_html(Path(args[i + 1]))
         return
 
     global OFFLINE
