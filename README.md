@@ -9,6 +9,10 @@ A lightweight local viewer for Markdown knowledge bases. Zero dependencies — P
 - **Wikilink graph** (force-directed, powered by [force-graph](https://github.com/vasturiano/force-graph))
 - **Chat** with your vault via Claude, Anthropic API, or any OpenAI-compatible backend (Ollama etc.)
 - **Live reload** — file watcher auto-refreshes the browser on vault changes
+- **Obsidian syntax** — `[[wikilinks]]` (`[[A|alias]]`, `[[dir/A]]`, `[[A#Heading|x]]`), `> [!note]` callouts, a "Linked from" backlinks section
+- **Dataview inline fields** — `[state:: …] [due:: …] [link:: …]` render as chips; open tasks past their `due` date are marked overdue
+- **Deep links** — `#<note path>` in the URL; Back/Forward work
+- **Offline mode** and **single-file export** (see below)
 
 ## Usage
 
@@ -36,6 +40,47 @@ python3 viewer.py --vault PATH --dry-run
 
 # Custom port
 python3 viewer.py --vault PATH --serve --port 8080
+
+# Offline: vendored libraries, no chat, strict CSP (needs vendor/, see below)
+python3 viewer.py --vault PATH --serve --offline
+
+# Export everything to one self-contained HTML file
+python3 viewer.py --vault PATH --export vault.html
+```
+
+### Offline mode
+
+`--offline` (or `"offline": true` in `viewer.json`) serves `marked` and `force-graph` from `vendor/`,
+uses a system font stack, hides chat (`/api/chat` and `/api/config` return 403) and sends
+`Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'`.
+The pinned libraries are committed in `vendor/` (see `vendor/README.md`). To re-download and verify them
+(SHA-256 pinned, mismatches are refused):
+
+```bash
+python3 tools/fetch-vendor.py                 # download + verify
+python3 tools/fetch-vendor.py --print-hashes  # print hashes when bumping versions
+```
+
+If `vendor/` is missing, `--offline` and `--export` stop with an error pointing to this script.
+
+### Static export
+
+`--export OUT.html` writes one file containing the UI, both libraries, every note, backlinks and graph data.
+It needs no server or network and opens from `file://` (CSP `connect-src 'none'`, no chat, no live reload).
+**The file contains the full text of every note** — share it only with people who may read the whole vault.
+
+### Security notes
+
+- The server binds to `127.0.0.1` only and rejects any `Host` other than `localhost:<port>` / `127.0.0.1:<port>` (DNS-rebinding protection).
+- `POST /api/chat` requires `Content-Type: application/json` and the `X-Vault-Viewer: 1` header (sent by the page), and bodies over 1 MB are refused.
+- `/api/note` resolves paths and refuses anything outside the vault, skipped files/folders and non-`.md` files.
+- Note content is never trusted: raw HTML in Markdown is shown as text, and links/images only allow `http(s)`, `mailto`, `#` and relative URLs. Everything inserted via `innerHTML` is escaped.
+- Chat still sends the current note to your configured backend; use `--offline` if that is not acceptable.
+
+### Tests
+
+```bash
+python3 -m unittest discover tests     # uses the fake vault in tests/fixtures/vault
 ```
 
 ### Tools
@@ -88,7 +133,7 @@ The viewer auto-detects the available backend in this order:
 | 3 | `claude` CLI | (must be on PATH) |
 | 4 | Ollama (fallback) | `http://localhost:11434` |
 
-Override the model with `KB_MODEL=claude-opus-5`.
+Override the model with `KB_MODEL=claude-opus-5`. Chat is unavailable in `--offline` mode.
 
 ## Vault structure
 
