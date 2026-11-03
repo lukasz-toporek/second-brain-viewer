@@ -1,5 +1,7 @@
 ---
 type: wiedza
+related:
+  - "[[Tasks]]"
 ---
 # Gamma
 

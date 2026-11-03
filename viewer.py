@@ -242,7 +242,7 @@ def scan_vault() -> dict:
         fm = parse_frontmatter(text)
         by_folder.setdefault(folder, []).append({
             "name":    path.stem,
-            "path":    str(rel),
+            "path":    rel.as_posix(),
             "type":    fm.get("type", ""),
             "status":  fm.get("status", ""),
             "date":    fm.get("date", ""),
@@ -258,43 +258,91 @@ def scan_vault() -> dict:
 
 # ── Wikilink graph ──────────────────────────────────────────────────────────
 
+_WIKILINK_RE = re.compile(r'!?\[\[([^\]\n]+?)\]\]')
+
+
 def extract_wikilinks(text: str) -> list[str]:
-    return re.findall(r'\[\[([^\]|#\n]+)', text)
+    """Targets of [[target#heading|label]] (also ![[embeds]] and [[a\\|b]] inside tables)."""
+    out = []
+    for m in _WIKILINK_RE.finditer(text):
+        target = re.split(r'\\?\||#', m.group(1), maxsplit=1)[0].strip()
+        if target:
+            out.append(target)
+    return out
+
+
+class VaultIndex:
+    """All notes plus link resolution shared by the graph, backlinks and the export.
+
+    A link target resolves (case-insensitively) to a vault-relative path with or without
+    ``.md``, or to a bare note name. The browser's ``resolveNote()`` mirrors this logic.
+    """
+
+    def __init__(self) -> None:
+        self.notes: list[dict] = []          # {path, name, type, folder, text}
+        self.by_path: dict[str, str] = {}
+        self.by_stem: dict[str, str] = {}
+        for path in sorted(VAULT.rglob("*.md")):
+            if skip(path):
+                continue
+            rel = path.relative_to(VAULT).as_posix()
+            text = path.read_text(encoding="utf-8")
+            fm = parse_frontmatter(text)
+            self.notes.append({
+                "path": rel, "name": path.stem, "type": fm.get("type", ""),
+                "folder": rel.split("/")[0] if "/" in rel else "(vault root)", "text": text,
+            })
+            low = rel.lower()
+            self.by_path[low] = rel
+            self.by_path[low[:-3]] = rel
+            self.by_stem.setdefault(path.stem.lower(), rel)
+        self.out_links: dict[str, set] = {}
+        self.backlinks: dict[str, list] = {n["path"]: [] for n in self.notes}
+        for n in self.notes:
+            targets = set()
+            for link in extract_wikilinks(n["text"]):      # body and frontmatter alike
+                t = self.resolve(link)
+                if t and t != n["path"]:
+                    targets.add(t)
+            self.out_links[n["path"]] = targets
+            for t in targets:
+                self.backlinks[t].append(n)
+
+    def resolve(self, target: str):
+        t = target.strip().replace("\\", "/").lstrip("/").lower()
+        if t.endswith(".md"):
+            t = t[:-3]
+        return self.by_path.get(t) or self.by_stem.get(t)
+
+    def backlinks_for(self, rel: str) -> list[dict]:
+        return sorted(({"path": n["path"], "name": n["name"]} for n in self.backlinks.get(rel, [])),
+                      key=lambda d: (d["name"].lower(), d["path"]))
+
+
+_INDEX_CACHE: tuple = (None, None)
+
+
+def get_index() -> VaultIndex:
+    """VaultIndex, rebuilt only when a note's mtime/set of notes changed."""
+    global _INDEX_CACHE
+    snap = vault_snapshot()
+    if _INDEX_CACHE[0] != snap or _INDEX_CACHE[1] is None:
+        _INDEX_CACHE = (snap, VaultIndex())
+    return _INDEX_CACHE[1]
 
 
 def build_graph() -> dict:
-    stem_to_path: dict[str, str] = {}
-    raw_notes: list[tuple] = []
-
-    for path in sorted(VAULT.rglob("*.md")):
-        if skip(path):
-            continue
-        rel = path.relative_to(VAULT)
-        folder = rel.parts[0] if len(rel.parts) > 1 else "(vault root)"
-        text = path.read_text(encoding="utf-8")
-        fm = parse_frontmatter(text)
-        node = {
-            "id":     str(rel),
-            "name":   path.stem,
-            "type":   fm.get("type", ""),
-            "folder": folder,
-        }
-        raw_notes.append((path.stem, str(rel), text, node))
-        stem_to_path[path.stem.lower()] = str(rel)
-
-    nodes = [n for _, _, _, n in raw_notes]
+    idx = get_index()
+    nodes = [{"id": n["path"], "name": n["name"], "type": n["type"], "folder": n["folder"]}
+             for n in idx.notes]
     edges: list[dict] = []
     seen: set[tuple] = set()
-
-    for stem, rel_path, text, node in raw_notes:
-        for link in extract_wikilinks(text):
-            target = stem_to_path.get(link.strip().lower())
-            if target and target != rel_path:
-                key = tuple(sorted([rel_path, target]))
-                if key not in seen:
-                    edges.append({"source": rel_path, "target": target})
-                    seen.add(key)
-
+    for n in idx.notes:
+        for target in sorted(idx.out_links[n["path"]]):
+            key = tuple(sorted([n["path"], target]))
+            if key not in seen:
+                edges.append({"source": n["path"], "target": target})
+                seen.add(key)
     return {"nodes": nodes, "edges": edges}
 
 
@@ -305,7 +353,7 @@ def vault_snapshot() -> dict:
     snap = {}
     for p in VAULT.rglob("*.md"):
         if not skip(p):
-            snap[str(p.relative_to(VAULT))] = p.stat().st_mtime
+            snap[p.relative_to(VAULT).as_posix()] = p.stat().st_mtime
     return snap
 
 
@@ -772,6 +820,13 @@ body {
 .c-question, .c-help, .c-faq { --co: #9b8bdb; }
 .c-example { --co: #b07ad0; }
 .c-quote, .c-cite { --co: #888; }
+
+/* backlinks */
+.backlinks { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--bd); }
+.backlinks h4 { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--tx2); margin-bottom: 8px; }
+.backlinks ul { list-style: none; padding: 0; }
+.backlinks li { margin-bottom: 3px; }
+.backlinks a.wl { color: var(--ac); text-decoration: none; }
 
 .loading { padding: 40px 56px; color: var(--tx2); font-size: 13px; }
 .err     { padding: 40px 56px; color: #c05050; font-size: 13px; }
@@ -1269,6 +1324,13 @@ async function loadContent(note) {
   }
 }
 
+function backlinksHtml(list) {
+  if (!list || !list.length) return "";
+  return `<div class="backlinks"><h4>Linked from (${list.length})</h4><ul>` +
+    list.map(b => `<li><a class="wl" href="#" data-path="${esc(b.path)}">${esc(b.name)}</a></li>`).join("") +
+    `</ul></div>`;
+}
+
 function showNote(data) {
   let raw = data.content;
   let chips = "";
@@ -1309,7 +1371,7 @@ function showNote(data) {
   }
 
   document.getElementById("content").innerHTML =
-    `<div class="note-body">${bc}${chips}<div class="md">${html}</div></div>`;
+    `<div class="note-body">${bc}${chips}<div class="md">${html}</div>${backlinksHtml(data.backlinks)}</div>`;
 
   setChatContext(data.name, data.content);
 }
@@ -1755,9 +1817,11 @@ class VaultHandler(BaseHTTPRequestHandler):
                 return
             text = note_path.read_text(encoding="utf-8")
             fm = parse_frontmatter(text)
+            rel_posix = note_path.relative_to(VAULT.resolve()).as_posix()
             payload = {
-                "path": rel, "name": note_path.stem, "content": text,
+                "path": rel_posix, "name": note_path.stem, "content": text,
                 "type": fm.get("type", ""), "status": fm.get("status", ""),
+                "backlinks": get_index().backlinks_for(rel_posix),
             }
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self._respond(200, "application/json; charset=utf-8", body, cache=False)
