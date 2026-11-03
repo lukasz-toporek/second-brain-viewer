@@ -743,6 +743,33 @@ body {
 .md td { padding: 7px 12px; border-bottom: 1px solid var(--bd); }
 .md strong { font-weight: 600; color: var(--tx); }
 
+/* wikilinks */
+.md a.wl { color: var(--ac); border-bottom: 1px dotted rgba(224,112,80,.5); }
+.md a.wl:hover { text-decoration: none; border-bottom-style: solid; }
+.md .wl.missing { color: var(--tx2); border-bottom: 1px dashed var(--tx2); cursor: help; }
+
+/* callouts */
+.callout {
+  --co: #5b9bd5;
+  border-left: 3px solid var(--co);
+  background: var(--sh);
+  background: color-mix(in srgb, var(--co) 10%, transparent);
+  border-radius: 0 6px 6px 0;
+  padding: 8px 14px;
+  margin: 0 0 14px;
+}
+.callout-title { font-weight: 600; color: var(--co); margin-bottom: 2px; }
+.callout-body { color: var(--tx); }
+.callout-body > :last-child { margin-bottom: 0; }
+.c-info, .c-note, .c-todo { --co: #5b9bd5; }
+.c-tip, .c-hint, .c-success, .c-check, .c-done { --co: #4ecdc4; }
+.c-abstract, .c-summary, .c-tldr { --co: #68b068; }
+.c-warning, .c-caution, .c-attention { --co: #c8980a; }
+.c-danger, .c-error, .c-bug, .c-failure, .c-fail, .c-missing { --co: #d05050; }
+.c-question, .c-help, .c-faq { --co: #9b8bdb; }
+.c-example { --co: #b07ad0; }
+.c-quote, .c-cite { --co: #888; }
+
 .loading { padding: 40px 56px; color: var(--tx2); font-size: 13px; }
 .err     { padding: 40px 56px; color: #c05050; font-size: 13px; }
 
@@ -1028,8 +1055,73 @@ body {
 const FM = __FM__;
 const TC = __TC__;
 const tcol = t => TC[t] || "#888";
+const esc = s => String(s ?? "").replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
 let vault = null, tabs = [], activeTab = null, expanded = new Set(), searchQ = "";
+
+// ── Note resolution (mirrors VaultIndex.resolve in viewer.py) ──
+let noteIdx = null;
+function resolveNote(target) {
+  if (!vault) return null;
+  if (!noteIdx) {
+    noteIdx = { byPath: new Map(), byStem: new Map() };
+    vault.folders.forEach(s => s.notes.forEach(n => {
+      const p = n.path.toLowerCase();
+      noteIdx.byPath.set(p, n);
+      noteIdx.byPath.set(p.replace(/\.md$/, ""), n);
+      const st = n.name.toLowerCase();
+      if (!noteIdx.byStem.has(st)) noteIdx.byStem.set(st, n);
+    }));
+  }
+  const t = String(target || "").trim().replace(/\\/g, "/").replace(/^\/+/, "")
+    .replace(/\.md$/i, "").toLowerCase();
+  return noteIdx.byPath.get(t) || noteIdx.byStem.get(t) || null;
+}
+
+// ── Markdown extensions: wikilinks + callouts ──
+if (typeof marked !== "undefined") {
+  marked.use({
+    extensions: [{
+      name: "wikilink", level: "inline",
+      start(src) { const i = src.search(/!?\[\[/); return i < 0 ? undefined : i; },
+      tokenizer(src) {
+        const m = /^(!?)\[\[([^\]\n|#]+?)(?:#([^\]\n|]*?))?(?:\\?\|([^\]\n]*?))?\]\]/.exec(src);
+        if (!m) return;
+        return { type: "wikilink", raw: m[0], embed: !!m[1],
+          target: m[2].replace(/\\$/, "").trim(),
+          heading: (m[3] || "").replace(/\\$/, "").trim(),
+          label: (m[4] || "").trim() };
+      },
+      renderer(tok) {
+        const label = tok.label || (tok.heading ? `${tok.target} › ${tok.heading}` : tok.target);
+        const n = resolveNote(tok.target);
+        if (!n) return `<span class="wl missing" title="Note not found">${esc(label)}</span>`;
+        return `<a class="wl" href="#" data-path="${esc(n.path)}">${esc(label)}</a>`;
+      },
+    }],
+    renderer: {
+      blockquote(quote) {
+        const m = /^\s*<p>\[!([A-Za-z][\w-]*)\][+-]?[ \t]*([^\n]*?)(?:\n([\s\S]*?))?<\/p>([\s\S]*)$/.exec(quote);
+        if (!m) return false;
+        const type = m[1].toLowerCase();
+        const title = m[2].trim() || type.charAt(0).toUpperCase() + type.slice(1);
+        const body = (m[3] ? `<p>${m[3]}</p>` : "") + m[4];
+        return `<div class="callout c-${type}"><div class="callout-title">${title}</div>` +
+          (body.trim() ? `<div class="callout-body">${body}</div>` : "") + `</div>\n`;
+      },
+    },
+  });
+}
+
+// delegated click handler for wikilinks (content, backlinks, chat bubbles)
+document.addEventListener("click", e => {
+  const a = e.target.closest && e.target.closest("a.wl[data-path]");
+  if (!a) return;
+  e.preventDefault();
+  const n = vault?.folders.flatMap(s => s.notes).find(x => x.path === a.dataset.path);
+  if (n) openNote({ path: n.path, name: n.name, type: n.type, folder: n.path.split("/")[0] });
+});
 
 // ── Tree ──────────────────────────────────────────────────────
 function renderTree() {
@@ -1183,6 +1275,7 @@ async function load() {
   btn.classList.add("spinning");
   try {
     vault = await fetch("/api/vault").then(r => r.json());
+    noteIdx = null;
     renderTree();
   } catch(e) {
     document.getElementById("tree").innerHTML = `<div class="err">${e.message}</div>`;
