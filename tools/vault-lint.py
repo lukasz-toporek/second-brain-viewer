@@ -50,8 +50,9 @@ def load_lint_config(vault: Path) -> dict:
 
 
 def apply_config(vault: Path) -> None:
-    global VAULT, VALID_TYPES, REQUIRED_FIELDS, EXCLUDED, EXCLUDED_DIRS
+    global VAULT, VALID_TYPES, REQUIRED_FIELDS, EXCLUDED, EXCLUDED_DIRS, _CI_INDEX
     VAULT = vault.resolve()
+    _CI_INDEX = None
     cfg = load_lint_config(VAULT)
     if "valid_types" in cfg:
         VALID_TYPES = set(cfg["valid_types"])
@@ -85,25 +86,41 @@ def parse_frontmatter(text: str) -> dict | None:
 def extract_wikilinks(text: str) -> list[str]:
     return [m.rstrip("\\").strip() for m in re.findall(r"\[\[([^\]|#\n]+)", text)]
 
+_CI_INDEX: dict | None = None
+
+
+def _ci_index() -> dict:
+    """Lower-cased lookup of every file in the vault: path (with/without .md) and bare name."""
+    global _CI_INDEX
+    if _CI_INDEX is None:
+        idx: dict[str, Path] = {}
+        for f in sorted(VAULT.rglob("*")):
+            if not f.is_file() or any(part in EXCLUDED_DIRS for part in f.relative_to(VAULT).parts):
+                continue
+            rel = f.relative_to(VAULT).as_posix().lower()
+            idx.setdefault(rel, f)
+            if rel.endswith(".md"):
+                idx.setdefault(rel[:-3], f)
+            idx.setdefault("name:" + f.name.lower(), f)
+            if f.name.lower().endswith(".md"):
+                idx.setdefault("name:" + f.name.lower()[:-3], f)
+        _CI_INDEX = idx
+    return _CI_INDEX
+
+
 def resolve_wikilink(link: str, source_file: Path) -> Path | None:
-    target = link.strip()
-    # Try exact match relative to vault root
-    for ext in ("", ".md"):
-        candidate = VAULT / (target + ext)
-        if candidate.exists():
-            return candidate
-    # Try relative to source file's directory
-    for ext in ("", ".md"):
-        candidate = source_file.parent / (target + ext)
-        if candidate.exists():
-            return candidate
-    # Try just filename anywhere in vault
-    name = Path(target).name
-    for ext in ("", ".md"):
-        matches = list(VAULT.rglob(name + ext))
-        if matches:
-            return matches[0]
-    return None
+    """Resolve like Obsidian: case-insensitive, by vault path or bare note name."""
+    target = link.strip().replace("\\", "/").lstrip("/")
+    # exact matches first (also finds files in excluded dirs, as before)
+    for base in (VAULT, source_file.parent):
+        for ext in ("", ".md"):
+            candidate = base / (target + ext)
+            if candidate.exists():
+                return candidate
+    idx = _ci_index()
+    low = target.lower()
+    return idx.get(low) or idx.get("name:" + Path(low).name)
+
 
 def lint() -> int:
     if "--vault" in sys.argv:
