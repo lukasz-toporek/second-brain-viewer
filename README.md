@@ -18,6 +18,10 @@ A lightweight local viewer for Markdown knowledge bases. Zero dependencies — P
 - **Obsidian syntax** — `[[wikilinks]]` (`[[A|alias]]`, `[[dir/A]]`, `[[A#Heading|x]]`), `> [!note]` callouts (foldable with `-` / `+`), `![[Note]]` embeds, a "Linked from" backlinks section
 - **Dataview inline fields** — `[state:: …] [due:: …] [link:: …]` render as chips; open tasks past their `due` date are marked overdue
 - **Mobile layout** — below 580 px a ☰ button at the left of the tab row opens the sidebar as an overlay with a backdrop (closes when a note opens, on Escape, or on a backdrop click)
+- **Tabs** — every tab has a **×** (on hover, always on the active tab and on touch devices; `aria-label="Close tab"`);
+  middle-click or **Delete** on a focused tab closes it too. Closing the active tab activates its neighbour (or shows the empty
+  start screen) and updates the URL hash. At 8 tabs the **least recently used** tab that is not active is dropped. A tab's tooltip is the
+  note's full vault path; when the tabs don't fit the bar scrolls sideways (also with the mouse wheel) and keeps the active tab in view.
 - **Deep links** — `#<note path>` in the URL; Back/Forward work
 - **Offline mode** and **single-file export** (see below)
 

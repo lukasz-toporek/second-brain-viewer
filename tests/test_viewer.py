@@ -2280,6 +2280,56 @@ class DefaultBadgeTests(unittest.TestCase):
         self.assertIn("const PALETTE = " + json.dumps(PALETTE), page_script("offline"))
 
 
+class TabTests(unittest.TestCase):
+    @unittest.skipUnless(NODE, "node not available")
+    def test_lru_eviction_never_drops_the_active_tab_or_just_the_oldest(self):
+        r = run_page_js("""
+          const mk = n => ({path: n + ".md", name: n});
+          const nine = "abcdefghi".split("").map(mk);               // 9 tabs: one over the limit
+          const used = new Map();
+          // a..h were opened in order (a is the oldest), then a was used again, then i opened
+          "abcdefgh".split("").forEach((n, i) => used.set(n + ".md", i + 1));
+          used.set("a.md", 9); used.set("i.md", 10);
+          const lru = tabToEvict(nine, used, "i.md");
+          // the oldest tab is active: it must survive, the next least recently used goes
+          const used2 = new Map(used); used2.set("a.md", 0);
+          const keepsActive = tabToEvict(nine, used2, "a.md");
+          const unknown = tabToEvict([mk("x"), mk("y")], new Map([["y.md", 5]]), "y.md");   // never-used tab goes first
+          console.log(JSON.stringify({lru: lru.path, keepsActive: keepsActive.path, unknown: unknown.path,
+            only: tabToEvict([mk("z")], new Map(), "z.md"), limit: TAB_LIMIT}));""")
+        self.assertEqual(r["lru"], "b.md")                                     # not "a.md", the oldest opened
+        self.assertEqual(r["keepsActive"], "b.md")
+        self.assertEqual(r["unknown"], "x.md")
+        self.assertIsNone(r["only"])
+        self.assertEqual(r["limit"], 8)
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_closing_a_tab_picks_the_neighbour(self):
+        r = run_page_js("""
+          const mk = n => ({path: n, name: n});
+          const t = ["a", "b", "c", "d"].map(mk);
+          const c = (path, active) => { const r = closeTabResult(t, path, active); return [r.tabs.map(x => x.path).join(""), r.next === undefined ? "same" : r.next && r.next.path]; };
+          console.log(JSON.stringify({middle: c("b", "b"), last: c("d", "d"), first: c("a", "a"), other: c("c", "a"),
+            missing: c("zz", "a"), single: (() => { const r = closeTabResult([mk("a")], "a", "a"); return [r.tabs.length, r.next]; })()}));""")
+        self.assertEqual(r["middle"], ["acd", "c"])        # right neighbour
+        self.assertEqual(r["last"], ["abc", "c"])          # no right one: the left neighbour
+        self.assertEqual(r["first"], ["bcd", "b"])
+        self.assertEqual(r["other"], ["abd", "same"])      # closing an inactive tab keeps the active one
+        self.assertEqual(r["missing"], ["abcd", "same"])
+        self.assertEqual(r["single"], [0, None])           # none left: the start screen
+
+    def test_tab_markup_and_handlers(self):
+        js = page_script("offline")
+        self.assertIn('aria-label="Close tab"', js)
+        self.assertIn('title="${esc(t.path)}"', js)                              # tooltip: the full vault path
+        self.assertIn('addEventListener("auxclick"', js)                         # middle click closes
+        self.assertIn('scrollIntoView({ block: "nearest", inline: "nearest" })', js)   # active tab stays in view
+        css = viewer.render_page("offline").split("<style>")[1].split("</style>")[0]
+        self.assertRegex(css, r"\.tab:hover \.tab-x, \.tab\.active \.tab-x")     # shown on hover and on the active tab
+        self.assertRegex(css, r"@media \(hover: none\) \{ \.tab-x \{ opacity: 1; \} \}")   # always on touch devices
+        self.assertNotIn("tabs.shift()", js)                                     # no silent dropping of the oldest
+
+
 class IndexTests(unittest.TestCase):
     def test_resolution_forms(self):
         viewer.init_config(VAULT)

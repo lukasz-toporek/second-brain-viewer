@@ -1129,7 +1129,7 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 0 16px;
+  padding: 0 6px 0 16px;
   height: 36px;
   font-size: 12px;
   color: var(--tx2);
@@ -1159,6 +1159,17 @@ body {
   border-radius: 50%;
   flex-shrink: 0;
 }
+.tab-name { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+.tab-x {
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  width: 18px; height: 18px; margin-left: 2px; padding: 0;
+  background: none; border: none; border-radius: 4px; color: var(--tx2); cursor: pointer;
+  opacity: 0; transition: opacity .08s, background .08s, color .08s;
+}
+.tab:hover .tab-x, .tab.active .tab-x, .tab-x:focus-visible { opacity: 1; }
+@media (hover: none) { .tab-x { opacity: 1; } }
+.tab-x:hover { background: var(--sa); color: var(--tx); }
+.tab:focus-visible { outline: 2px solid var(--ac); outline-offset: -2px; }
 
 /* ── Content ── */
 .content {
@@ -1781,6 +1792,28 @@ function folderPaths(nodes, out = new Set()) {
   nodes.forEach(n => { out.add(n.path); folderPaths(n.folders, out); });
   return out;
 }
+// ── Tabs (pure) ──
+const TAB_LIMIT = 8;
+// Which tab to drop when there are more than TAB_LIMIT: the least recently used one that is not `active`.
+// `lastUsed` maps a path to a counter that grows each time the tab becomes active.
+function tabToEvict(tabs, lastUsed, active) {
+  let victim = null, best = Infinity;
+  for (const t of tabs) {
+    if (t.path === active) continue;
+    const u = lastUsed.has(t.path) ? lastUsed.get(t.path) : -1;
+    if (u < best) { best = u; victim = t; }
+  }
+  return victim;
+}
+// Tabs after closing `path`, plus `next`: the tab to activate when the closed one was the active tab
+// (its right neighbour, else its left one), null when none is left, undefined when the active tab is unchanged.
+function closeTabResult(tabs, path, active) {
+  const i = tabs.findIndex(t => t.path === path);
+  if (i < 0) return { tabs, next: undefined };
+  const rest = tabs.filter((_, j) => j !== i);
+  if (path !== active) return { tabs: rest, next: undefined };
+  return { tabs: rest, next: rest.length ? rest[Math.min(i, rest.length - 1)] : null };
+}
 const CHEVRON = `<svg class="ch" aria-hidden="true" focusable="false" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 4 10 8 6 12"/></svg>`;
 // ctx: {expanded: Set of folder paths, active: note path, light: bool}
 function folderHtml(node, depth, ctx) {
@@ -2291,16 +2324,51 @@ treeEl().addEventListener("click", e => {
 });
 
 // ── Tabs ──────────────────────────────────────────────────────
+const CLOSE_ICON = `<svg aria-hidden="true" focusable="false" width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M3 3l10 10M13 3L3 13"/></svg>`;
+const tabLastUsed = new Map();
+let tabClock = 0;
 function renderTabs() {
   const bar = document.getElementById("tabs");
-  bar.innerHTML = "";
-  tabs.forEach(t => {
-    const el = document.createElement("div");
-    el.className = "tab" + (activeTab === t.path ? " active" : "");
-    el.innerHTML = `<span class="ti" data-type="${esc(t.type)}" style="background:${esc(tcol(t.type))}"></span>${esc(t.name)}`;
-    el.addEventListener("click", () => switchTo(t));
-    bar.appendChild(el);
+  bar.setAttribute("role", "tablist");
+  bar.innerHTML = tabs.map(t => {
+    const on = activeTab === t.path;
+    return `<div class="tab${on ? " active" : ""}" role="tab" aria-selected="${on}" tabindex="0" data-path="${esc(t.path)}" title="${esc(t.path)}">` +
+      `<span class="ti" data-type="${esc(t.type)}" style="background:${esc(tcol(t.type))}"></span><span class="tab-name">${esc(t.name)}</span>` +
+      `<button type="button" class="tab-x" tabindex="-1" aria-label="Close tab" title="Close tab">${CLOSE_ICON}</button></div>`;
+  }).join("");
+  const el = bar.querySelector(".tab.active");
+  if (el) el.scrollIntoView({ block: "nearest", inline: "nearest" });        // keep the active tab in view
+}
+{
+  const bar = document.getElementById("tabs");
+  const tabOf = e => { const el = e.target.closest(".tab"); return el && tabs.find(t => t.path === el.dataset.path); };
+  bar.addEventListener("click", e => {
+    const t = tabOf(e);
+    if (!t) return;
+    if (e.target.closest(".tab-x")) closeTab(t.path); else switchTo(t);
   });
+  bar.addEventListener("mousedown", e => { if (e.button === 1) e.preventDefault(); });      // no autoscroll on middle click
+  bar.addEventListener("auxclick", e => { const t = tabOf(e); if (t && e.button === 1) { e.preventDefault(); closeTab(t.path); } });
+  bar.addEventListener("keydown", e => {
+    const t = tabOf(e);
+    if (!t || e.target.closest(".tab-x")) return;
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); switchTo(t); }
+    else if (e.key === "Delete") { e.preventDefault(); closeTab(t.path); }
+  });
+  // a vertical wheel scrolls the tab bar sideways when the tabs do not fit
+  bar.addEventListener("wheel", e => {
+    if (bar.scrollWidth > bar.clientWidth && Math.abs(e.deltaY) > Math.abs(e.deltaX)) { bar.scrollLeft += e.deltaY; e.preventDefault(); }
+  }, { passive: false });
+}
+
+// Closes a tab. Closing the active one activates its neighbour (the URL hash follows), or shows the empty
+// start screen when no tab is left.
+function closeTab(path) {
+  const r = closeTabResult(tabs, path, activeTab);
+  tabs = r.tabs;
+  tabLastUsed.delete(path);
+  if (r.next === undefined) { renderTabs(); return; }
+  if (r.next) openNote(r.next); else showWelcome();
 }
 
 const switchTo = t => openNote(t);
@@ -2327,11 +2395,13 @@ function openNote(note) {
   closeSidebar();
   if (graphMode) closeGraph();
   closePlugin();
-  if (!tabs.find(t => t.path === note.path)) {
-    tabs.push(note);
-    if (tabs.length > 8) tabs.shift();
-  }
+  if (!tabs.find(t => t.path === note.path)) tabs.push(note);
   activeTab = note.path;
+  tabLastUsed.set(note.path, ++tabClock);
+  if (tabs.length > TAB_LIMIT) {                       // over the limit: drop the least recently used tab, never the active one
+    const victim = tabToEvict(tabs, tabLastUsed, activeTab);
+    if (victim) { tabs = tabs.filter(t => t !== victim); tabLastUsed.delete(victim.path); }
+  }
   renderTabs();
   loadContent(note);
   highlight();
@@ -2339,15 +2409,21 @@ function openNote(note) {
 }
 
 const welcomeHTML = document.getElementById("content").innerHTML;
+// The empty start screen (no active note); the hash is cleared without adding a history entry.
+function showWelcome() {
+  activeTab = null;
+  renderTabs(); highlight();
+  document.getElementById("content").innerHTML = welcomeHTML;
+  setChatContext("", "");
+  if (location.hash) history.replaceState(null, "", location.pathname + location.search);
+}
 function routeFromHash() {
   if (!vault) return;                         // initial route happens after the first load()
   let p = "";
   try { p = decodeURIComponent(location.hash.replace(/^#/, "")); } catch (_) { return; }
   if (!p) {                                   // back to the empty hash → welcome screen
     if (activeTab === null) return;
-    activeTab = null;
-    renderTabs(); highlight();
-    document.getElementById("content").innerHTML = welcomeHTML;
+    showWelcome();
     return;
   }
   if (p === activeTab) return;
