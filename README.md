@@ -142,6 +142,14 @@ Offline and export always behave as `"block"` (their CSPs never allowed remote i
 rendered by the app's Markdown setup, i.e. note bodies, embedded notes and plug-in `renderMarkdown()` output. Any other
 value is reported on stderr and treated as `"block"`.
 
+### Theme: light / dark
+
+The viewer follows the operating system's appearance setting (`prefers-color-scheme`), and switches live when the OS
+setting changes, including an open graph. The optional `"theme"` key in `viewer.json` is `"system"` (default),
+`"dark"` or `"light"`; the last two force a theme. Any other value prints a warning and falls back to `"system"`.
+It works the same in online, `--offline` and `--export` and needs no network access. Colours from `"types"` and
+`"folders"` stay as configured. Plug-ins should use the theme CSS variables (list in `docs/plugins.md`).
+
 ### Plug-ins (frontend, v1)
 
 A vault can add its own toolbar views without forking `viewer.py`. List the scripts in the vault's `viewer.json`:
@@ -157,7 +165,16 @@ A vault can add its own toolbar views without forking `viewer.py`. List the scri
 - Each enabled plug-in is served at `/plugins/<id>.js` from an exact allow-list built from the config (no directory
   listing, no other path) and added as `<script src>` after the app script; `--export` inlines it instead. The CSPs are
   unchanged, so a plug-in cannot add remote origins (the export keeps `connect-src 'none'`).
-- **A plug-in is trusted code** with full access to the page and the notes: enable only scripts you wrote or read.
+- **Trust model.** A plug-in is trusted code with full access to the page, the vault data the page holds and, in
+  online mode, `/api/chat`. Plug-ins are enabled by the vault's *own* config, which is looked up in the vault and up
+  to 4 folders above it, so opening a vault you didn't write can run its plug-ins. Enable plug-ins only in vaults you
+  trust, and start the viewer with **`--no-plugins`** (or set `"plugins_enabled": false` in the config; default
+  `true`) when you open someone else's vault: the `"plugins"` key is then ignored entirely (nothing listed, nothing
+  served under `/plugins/`, nothing inlined in an export) and one line says so. When plug-ins are enabled, startup
+  prints the config file that enabled them, so you can tell when a config from a parent folder is in effect.
+- `--offline` narrows what a plug-in can reach (same-origin only, no chat, `connect-src 'self'`, no remote images),
+  and `--export` keeps `connect-src 'none'`. It is not a sandbox: a plug-in still runs with page privileges and can,
+  for example, navigate the window away or read everything on the page.
 - Host API 1: `window.VaultViewer.register({id, title, api: 1, mount(el, host), unmount?()})` (refused with a console
   warning if `api` is greater than 1 or the `id` is not enabled). `host` gives `api(kind, arg)` (the app's own data
   access, so it works in an export), `openNote(path)`, `notes()` (`[{path, name, type, folder}]`), `esc(s)`,
@@ -179,6 +196,8 @@ See `docs/plugins.md` for the design and what is still future work (Python data 
 - `POST /api/chat` requires `Content-Type: application/json` and the `X-Vault-Viewer: 1` header (sent by the page), and bodies over 1 MB are refused.
 - `/plugins/<id>.js` only serves the plug-ins enabled in the vault's config (see Plug-ins).
 - `/api/note` resolves paths and refuses anything outside the vault, skipped files/folders and non-`.md` files; `/api/file` does the same for the allow-listed attachment types.
+- Symlinks whose real path is outside the vault (note files, folders or attachments) are ignored everywhere: sidebar,
+  search, graph, backlinks, `/api/note`, `/api/file` and `--export`. Symlinks that stay inside the vault work.
 - Note content is never trusted: raw HTML in Markdown is shown as text, and links/images only allow `http(s)`, `mailto`, `#` and relative URLs. Everything inserted via `innerHTML` is escaped.
 - Chat still sends the current note to your configured backend; use `--offline` if that is not acceptable.
 
@@ -225,7 +244,9 @@ Place a `viewer.json` in the vault root (or any parent directory — the viewer 
   },
   "link_deprioritise": ["90-meta/Szablony", "_Archive"],
   "remote_images": "allow",
+  "theme": "system",
   "plugins": [],
+  "plugins_enabled": true,
   "system_prompt": "You are a knowledge base assistant. Answer concisely."
 }
 ```

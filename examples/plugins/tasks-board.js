@@ -62,7 +62,7 @@
     el.innerHTML = rows.length
       ? `<p style="margin-bottom:12px;color:var(--tx2)">${rows.length} overdue (before ${e(now)})</p>` +
         `<table class="tasks-board" style="width:100%;border-collapse:collapse">` +
-        rows.map(r => `<tr><td style="padding:6px 12px 6px 0;white-space:nowrap;color:#d05050">${e(r.due)}</td>` +
+        rows.map(r => `<tr><td style="padding:6px 12px 6px 0;white-space:nowrap;color:var(--k-red)">${e(r.due)}</td>` +
           `<td style="padding:6px 12px 6px 0">${e(r.text)}` +
           (r.state ? ` <span style="color:var(--tx2)">· ${e(r.state)}</span>` : "") + `</td>` +
           `<td style="padding:6px 0"><a href="#" data-path="${e(r.path)}" style="color:var(--ac)">${e(r.note)}</a></td></tr>`).join("") +

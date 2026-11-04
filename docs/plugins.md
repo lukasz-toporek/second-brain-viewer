@@ -79,10 +79,31 @@ A plugin is a folder with a `plugin.json` manifest and static files:
 - extra frontmatter chip renderers keyed by field name,
 - extra sidebar sections.
 
+## Theming
+The viewer follows the OS light/dark setting (`"theme": "system"`, or `"dark"` / `"light"` in `viewer.json`),
+and can switch while the page is open. A plug-in must not hard-code colours; use these CSS variables
+(`var(--tx2)` etc.), which exist in both themes:
+
+- surfaces and text: `--bg` (page), `--sb` (panels), `--sh` (hover / code background), `--sa` (active),
+  `--bd` (borders), `--tx` (text), `--tx2` (muted text), `--ac` (accent), `--ac2` (accent background),
+  `--on-ac` (text on an accent fill), `--err` (error text);
+- hues for status colours, readable on `--bg` in both themes: `--k-blue`, `--k-teal`, `--k-green`, `--k-amber`,
+  `--k-red`, `--k-violet`, `--k-purple`, `--k-grey`, `--k-idle`;
+- code: `--code-fg`, `--pre-bg`, `--pre-fg`.
+
+For a tinted background use `color-mix(in srgb, var(--k-red) 14%, transparent)`.
+
 ## Security model
 - Plugins are trusted code, equivalent to running a script: they are **off unless listed
   and `enabled` in the vault's own config**, and the viewer prints the enabled plugin ids
-  at startup. A config found in a parent directory is where the user's trust already is.
+  at startup together with the path of the config file that enabled them (a config found in
+  a parent directory is easy to miss). Plugins run with full page privileges: they can read
+  every note the page holds and, online, call `/api/chat`.
+- To open a vault you do not trust, start with `--no-plugins` or set `"plugins_enabled": false`
+  (default `true`): the `"plugins"` key is ignored, nothing is served under `/plugins/` and
+  nothing is inlined into an export.
+- `--offline` limits where a plugin can connect (same origin only, no chat); it does not
+  sandbox it, so a plugin can still, for example, navigate the window away.
 - Plugin files are served from an allow-list; no directory listing, no path traversal
   (reuse `safe_note_path`-style `resolve()` + `is_relative_to` checks).
 - The existing CSP already limits plugins to same-origin scripts/styles and `connect-src 'self'`

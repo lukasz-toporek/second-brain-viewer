@@ -570,6 +570,48 @@ class AttachmentRenderTests(unittest.TestCase):
         self.assertIn('width="120"', html)
         self.assertNotIn("<script", html)
 
+    def fixture_line(self):
+        text = (VAULT / "README.md").read_text(encoding="utf-8")     # a skipped file: no effect on the index or lint
+        return next(l for l in text.splitlines() if l.startswith("- attachment wikilinks"))
+
+    def test_wikilink_to_attachment_is_a_link_only_embed_is_an_image(self):
+        att = 'href="/api/file?path=img%2Fpic.png" target="_blank" rel="noopener noreferrer"'
+        html = self.render("Note.md", "[[pic.png]]")
+        self.assertIn(f'<a class="wl att" {att}>pic.png</a>', html)
+        self.assertNotIn("<img", html)
+        html = self.render("Note.md", "[[pic.png|the label]]")
+        self.assertIn(f'<a class="wl att" {att}>the label</a>', html)
+        self.assertNotIn("<img", html)
+        html = self.render("Note.md", "![[pic.png]]")
+        self.assertIn('<img src="/api/file?path=img%2Fpic.png"', html)
+        self.assertNotIn("<a ", html)
+        html = self.render("Note.md", "[[spec.pdf]] ![[spec.pdf]]")
+        self.assertIn('rel="noopener noreferrer">spec.pdf</a>', html)             # plain link
+        self.assertIn('rel="noopener noreferrer">📄 spec.pdf</a>', html)           # embed keeps the icon
+
+    def test_fixture_line_renders_one_image_and_two_links(self):
+        html = self.render("Note.md", self.fixture_line())      # doc.pdf is not in this vault: placeholder
+        self.assertEqual(html.count("<img"), 1)
+        self.assertEqual(html.count('class="wl att"'), 2)
+        self.assertEqual(html.count('class="wl missing"'), 1)
+
+    def test_wikilink_to_attachment_in_export(self):
+        att = self.export_attachments()
+        html = self.render("Note.md", "[[pic.png]] [[spec.pdf]]", export={"attachments": att})
+        self.assertIn('href="data:image/png;base64,', html)
+        self.assertIn("spec.pdf (attachment not included in export)", html)
+        self.assertNotIn("<img", html)
+
+    def test_page_script_is_valid_and_image_branch_is_guarded(self):
+        for mode in ("online", "offline", "export"):
+            self.assertRegex(page_script(mode), r"if \(tok\.embed && ATT_EXT\.test\(tok\.target\)\)")
+        if NODE:
+            with tempfile.TemporaryDirectory() as d:
+                f = Path(d) / "page.js"
+                f.write_text(page_script("online"), encoding="utf-8")
+                r = subprocess.run([NODE, "--check", str(f)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_pdf_becomes_link_in_new_tab(self):
         html = self.render("Note.md", "[spec](files/spec.pdf) ![[spec.pdf]]")
         self.assertEqual(html.count('href="/api/file?path=files%2Fspec.pdf" target="_blank" rel="noopener noreferrer"'), 2)
@@ -1597,6 +1639,308 @@ class MobileSidebarTests(unittest.TestCase):
                 self.assertIn('getElementById("sb-backdrop").addEventListener("click", closeSidebar)', js)
                 self.assertRegex(js, r'e\.key === "Escape" && sidebarOpen\(\)\) \{ closeSidebar\(\)')
                 self.assertRegex(js, r"function openNote\(note\) \{\s*closeSidebar\(\);")
+
+
+class PluginsDisabledTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name) / "vault"
+        make_plugin_vault(self.root)
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(viewer.init_config, VAULT)
+
+    def disable_in_config(self):
+        cfgp = self.root / ".viewer.json"
+        cfg = json.loads(cfgp.read_text(encoding="utf-8"))
+        cfg["plugins_enabled"] = False
+        cfgp.write_text(json.dumps(cfg), encoding="utf-8")
+
+    def test_flag_disables_everything(self):
+        viewer.init_config(self.root, no_plugins=True)
+        self.assertEqual(viewer.PLUGINS, {})
+        srv = viewer.make_server(0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        port = srv.server_address[1]
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request("GET", "/plugins/tasks-board.js", headers={"Host": f"localhost:{port}"})
+        self.assertEqual(c.getresponse().status, 404)
+        c.close()
+        html = viewer.render_page("export", {"notes": {}})
+        self.assertNotIn("tasks-board", html)
+        self.assertNotIn("/plugins/", viewer.render_page("online"))
+        self.assertIn('"plugins": []', html)
+
+    def test_config_key_disables_everything(self):
+        self.disable_in_config()
+        s = Server(vault=self.root)
+        self.addCleanup(s.stop)
+        self.assertEqual(viewer.PLUGINS, {})
+        self.assertEqual(s.req("GET", "/plugins/tasks-board.js")[0], 404)
+        self.assertNotIn("tasks-board", viewer.render_page("export", {"notes": {}}))
+
+    def test_default_is_unchanged(self):
+        s = Server(vault=self.root)
+        self.addCleanup(s.stop)
+        self.assertEqual(list(viewer.PLUGINS), ["tasks-board"])
+        self.assertEqual(s.req("GET", "/plugins/tasks-board.js")[0], 200)
+
+    def run_cli(self, *extra):
+        out = Path(self._tmp.name) / "o.html"
+        r = subprocess.run([sys.executable, str(ROOT / "viewer.py"), "--vault", str(self.root), "--export", str(out), *extra],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout, out.read_text(encoding="utf-8")
+
+    def test_cli_flag_in_export(self):
+        stdout, html = self.run_cli("--no-plugins")
+        self.assertIn("Plug-ins disabled (--no-plugins)", stdout)
+        self.assertNotIn("Plug-in enabled", stdout)
+        self.assertNotIn("tasks-board", html)
+
+    def test_cli_config_key_in_export(self):
+        self.disable_in_config()
+        stdout, html = self.run_cli()
+        self.assertIn('Plug-ins disabled ("plugins_enabled": false)', stdout)
+        self.assertNotIn("tasks-board", html)
+
+    def test_startup_prints_the_config_path(self):
+        child = self.root / "child"               # no config of its own: the parent folder's one is in effect
+        child.mkdir()
+        with contextlib.redirect_stderr(io.StringIO()):       # its plug-in file is not under child/: a warning
+            viewer.init_config(child)
+        self.assertEqual(viewer.CONFIG_PATH, self.root / ".viewer.json")
+        viewer.init_config(self.root)
+        self.assertEqual(viewer.CONFIG_PATH, self.root / ".viewer.json")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            viewer.print_plugins()
+        self.assertIn(f"Plug-ins enabled by {self.root / '.viewer.json'}", buf.getvalue())
+        self.assertIn("Plug-in enabled: tasks-board", buf.getvalue())
+
+
+class SymlinkLeakTests(unittest.TestCase):
+    """Notes whose real path is outside the vault must not reach any index, API or export."""
+    MARKER = "ZXQ-LEAK-MARKER-7731"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.root = base / "vault"
+        outside = base / "outside"
+        (outside / "dir").mkdir(parents=True)
+        (outside / "Leak.md").write_text(f"---\ntype: wiedza\n---\n# Leak\n{self.MARKER} [[Inside]]\n", encoding="utf-8")
+        (outside / "dir" / "Deep.md").write_text(f"# Deep\n{self.MARKER}\n", encoding="utf-8")
+        self.root.mkdir()
+        (self.root / "Real.md").write_text("# Real\nreal body [[Inside]]\n", encoding="utf-8")
+        (self.root / "sub").mkdir()
+        (self.root / "sub" / "Loop.md").write_text("# Loop\n", encoding="utf-8")
+        try:
+            (self.root / "Leak.md").symlink_to(outside / "Leak.md")
+            (self.root / "Inside.md").symlink_to(self.root / "Real.md")
+            (self.root / "linkdir").symlink_to(outside / "dir", target_is_directory=True)
+            (self.root / "Broken.md").symlink_to(base / "nowhere.md")
+            (self.root / "Self.md").symlink_to(self.root / "Self.md")       # loop
+            (self.root / "innerdir").symlink_to(self.root / "sub", target_is_directory=True)
+        except OSError:
+            self.skipTest("symlinks not supported")
+        self.addCleanup(viewer.init_config, VAULT)
+
+    def test_nothing_leaks_through_the_api(self):
+        s = Server(vault=self.root)
+        self.addCleanup(s.stop)
+        for url in ("/api/vault", f"/api/search?q={self.MARKER}", "/api/graph"):
+            with self.subTest(url=url):
+                st, _, body = s.req("GET", url)
+                self.assertEqual(st, 200)
+                self.assertNotIn(self.MARKER, body.decode())
+                self.assertNotIn("Leak.md", body.decode())
+                self.assertNotIn("Deep.md", body.decode())
+        self.assertEqual(json.loads(s.req("GET", f"/api/search?q={self.MARKER}")[2]), [])
+        for rel in ("Leak.md", "linkdir/Deep.md"):
+            self.assertIn(s.req("GET", "/api/note?path=" + rel)[0], (403, 404))
+        st, _, body = s.req("GET", "/api/note?path=Real.md")
+        self.assertEqual(st, 200)
+        self.assertNotIn(self.MARKER, body.decode())                          # backlinks included
+
+    def test_symlinks_inside_the_vault_still_work(self):
+        s = Server(vault=self.root)
+        self.addCleanup(s.stop)
+        v = json.loads(s.req("GET", "/api/vault")[2])
+        self.assertIn("Inside.md", json.dumps(v["tree"] if "tree" in v else v))
+        self.assertEqual(s.req("GET", "/api/note?path=Inside.md")[0], 200)
+        self.assertEqual(s.req("GET", "/api/note?path=innerdir/Loop.md")[0], 200)
+        self.assertEqual(viewer.VaultIndex().resolve("Inside"), "Inside.md")
+        paths = [p.relative_to(viewer.VAULT).as_posix() for p in viewer.vault_files()]
+        self.assertNotIn("Broken.md", paths)
+        self.assertNotIn("Self.md", paths)
+
+    def test_export_has_no_marker(self):
+        out = Path(self._tmp.name) / "out.html"
+        r = subprocess.run([sys.executable, str(ROOT / "viewer.py"), "--vault", str(self.root), "--export", str(out)],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        html = out.read_text(encoding="utf-8")
+        self.assertNotIn(self.MARKER, html)
+        self.assertIn("Inside.md", html)
+
+    def test_only_vault_files_walks_the_vault(self):
+        src = (ROOT / "viewer.py").read_text(encoding="utf-8")
+        self.assertEqual(len(re.findall(r"VAULT\.rglob\(", src)), 1)
+        self.assertIn('for p in VAULT.rglob("*")', src.split("def vault_files")[1].split("\ndef ")[0])
+
+    def test_lint_ignores_outside_notes(self):
+        spec = importlib.util.spec_from_file_location("vault_lint", ROOT / "tools" / "vault-lint.py")
+        lint = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lint)
+        buf = io.StringIO()
+        old = sys.argv
+        sys.argv = ["vault-lint.py", "--vault", str(self.root)]
+        try:
+            with contextlib.redirect_stdout(buf):
+                lint.lint()
+        finally:
+            sys.argv = old
+        self.assertNotIn("Leak.md", buf.getvalue())
+        self.assertNotIn("Deep.md", buf.getvalue())
+
+
+def _lum(h):
+    h = h.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    ch = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+    ch = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in ch]
+    return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2]
+
+
+def contrast(a, b):
+    la, lb = sorted((_lum(a), _lum(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def css_blocks():
+    """(dark vars, light vars in the media query, light vars in [data-theme=light]) from the page CSS."""
+    css = re.search(r"<style>(.*?)</style>", viewer.VIEWER_HTML, re.S).group(1)
+    dark = re.search(r"^:root \{(.*?)^\}", css, re.S | re.M).group(1)
+    media = re.search(r"@media \(prefers-color-scheme: light\) \{\s*:root:not\(\[data-theme=\"dark\"\]\) \{(.*?)\n  \}\n\}", css, re.S).group(1)
+    forced = re.search(r':root\[data-theme="light"\] \{(.*?)^\}', css, re.S | re.M).group(1)
+    var = lambda block: dict(re.findall(r"(--[\w-]+):\s*([^;]+);", block))
+    return var(dark), var(media), var(forced), css
+
+
+class ThemeTests(unittest.TestCase):
+    def tearDown(self):
+        viewer.init_config(VAULT)
+
+    def test_css_has_both_themes_and_color_scheme(self):
+        dark, light, forced, css = css_blocks()
+        self.assertIn("color-scheme: light dark;", css)
+        self.assertIn('@media (prefers-color-scheme: light)', css)
+        self.assertEqual(dark["--bg"], "#131313")                      # today's dark palette is unchanged
+        self.assertEqual(dark["--ac"], "#e07050")
+        self.assertEqual(light, forced)                                 # media query and forced light agree
+        self.assertEqual(set(light), set(dark) - set())                 # same variable names in both themes
+        for mode in ("online", "offline", "export"):
+            html = viewer.render_page(mode, {"notes": {}})
+            self.assertIn('<meta name="color-scheme" content="light dark">', html)
+
+    def test_every_var_used_is_defined_in_both_themes(self):
+        dark, light, _, css = css_blocks()
+        js = viewer.VIEWER_HTML
+        used = set(re.findall(r"var\((--[\w-]+)", js)) | set(re.findall(r'cssVar\("(--[\w-]+)"\)', js))
+        used.discard("--co")                 # per-callout variable, set on the element itself
+        self.assertTrue(used)
+        self.assertEqual(sorted(used - set(dark)), [])
+        self.assertEqual(sorted(used - set(light)), [])
+        # --co / --st style per-element variables are set where they are used, not in :root
+        self.assertEqual(sorted(set(dark) - set(light)), [])
+
+    def test_light_theme_contrast(self):
+        _, light, _, _ = css_blocks()
+        bg = light["--bg"]
+        pairs = [("--tx", "--bg"), ("--tx2", "--bg"), ("--tx2", "--sb"), ("--tx", "--sh"), ("--ac", "--bg"),
+                 ("--code-fg", "--sh"), ("--pre-fg", "--pre-bg"), ("--err", "--bg"), ("--tx", "--sa"),
+                 ("--tx2", "--sh"), ("--ac", "--sh")]
+        pairs += [(k, "--bg") for k in light if k.startswith("--k-")]
+        for fg, back in pairs:
+            with self.subTest(fg=fg, bg=back):
+                self.assertGreaterEqual(contrast(light[fg], light[back]), 4.5, f"{fg} on {back}")
+        # callout / state text on its own 14% tint of the same hue over the page background
+        for k in [k for k in light if k.startswith("--k-")]:
+            fg = light[k].lstrip("#")
+            f = [int(fg[i:i + 2], 16) for i in (0, 2, 4)] if len(fg) == 6 else [int(c * 2, 16) for c in fg]
+            b = [int(bg[i:i + 2], 16) for i in (1, 3, 5)]
+            tint = "#" + "".join(f"{round(c * .14 + d * .86):02x}" for c, d in zip(f, b))
+            with self.subTest(tint=k):
+                self.assertGreaterEqual(contrast(light[k], tint), 4.5)
+
+    def test_dark_palette_text_contrast_unchanged_or_better(self):
+        dark, _, _, _ = css_blocks()
+        self.assertGreaterEqual(contrast(dark["--tx"], dark["--bg"]), 9)
+
+    def test_theme_setting_reaches_the_page_in_all_modes(self):
+        for theme, attr, scheme in (("light", ' data-theme="light"', "light"), ("dark", ' data-theme="dark"', "dark"),
+                                    ("system", "", "light dark")):
+            with tempfile.TemporaryDirectory() as d:
+                root = Path(d) / "v"
+                shutil.copytree(VAULT, root)
+                (root / ".viewer.json").write_text(json.dumps({"theme": theme}), encoding="utf-8")
+                viewer.init_config(root)
+                for mode in ("online", "offline", "export"):
+                    with self.subTest(theme=theme, mode=mode):
+                        html = viewer.render_page(mode, {"notes": {}})
+                        self.assertIn(f'<html lang="pl"{attr}>', html)
+                        self.assertIn(f'<meta name="color-scheme" content="{scheme}">', html)
+                        self.assertIn(f'"theme": "{theme}"', html)
+                        self.assertNotIn("__THEMEATTR__", html)
+
+    def test_default_is_system_and_invalid_falls_back_with_warning(self):
+        viewer.init_config(VAULT)
+        self.assertEqual(viewer.THEME, "system")
+        self.assertIn('<html lang="pl">', viewer.render_page("offline"))
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "v"
+            shutil.copytree(VAULT, root)
+            (root / ".viewer.json").write_text(json.dumps({"theme": "sepia"}), encoding="utf-8")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                viewer.init_config(root)
+            self.assertEqual(viewer.THEME, "system")
+            self.assertIn('"theme" must be one of system, dark, light', err.getvalue())
+            self.assertIn('<html lang="pl">', viewer.render_page("online"))
+
+    def test_graph_uses_theme_variables(self):
+        js = viewer.VIEWER_HTML
+        self.assertNotIn("#0d0d0d", js.split("</style>", 1)[1])
+        self.assertIn("--graph-bg", js)
+        self.assertIn("getComputedStyle", js)
+        self.assertIn("(prefers-color-scheme: light)", js.split("</style>", 1)[1])
+        self.assertIn('addEventListener("change"', js)
+        self.assertNotIn("rgba(255,255,255", js.split("</style>", 1)[1])
+
+    def test_no_hardcoded_neutrals_left_in_rules(self):
+        """Colours that depend on the theme are variables; literals remain only in the palette blocks."""
+        _, _, _, css = css_blocks()
+        body = re.sub(r"^:root.*?^\}", "", css, flags=re.S | re.M)
+        body = re.sub(r"@media \(prefers-color-scheme: light\) \{.*?\n  \}\n\}", "", body, flags=re.S)
+        body = re.sub(r':root\[data-theme="light"\] \{.*?^\}', "", body, flags=re.S | re.M)
+        for bad in ("#0d0d0d", "#111", "#1e1e1e", "#333", "#b8a8d8", "#c0cce0", "rgba(255,255,255", "#c05050"):
+            self.assertNotIn(bad, body)
+
+    def test_cli_warns_on_invalid_theme(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "v"
+            shutil.copytree(VAULT, root)
+            (root / ".viewer.json").write_text(json.dumps({"theme": "neon"}), encoding="utf-8")
+            out = Path(d) / "o.html"
+            r = subprocess.run([sys.executable, str(ROOT / "viewer.py"), "--vault", str(root), "--export", str(out)],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('"theme" must be one of', r.stderr)
+            self.assertIn('<html lang="pl">', out.read_text(encoding="utf-8"))
 
 
 class IndexTests(unittest.TestCase):
