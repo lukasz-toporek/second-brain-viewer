@@ -545,6 +545,30 @@ class RelativeLinkTests(unittest.TestCase):
         self.assertIn('href="a.pdf"', html)
 
 
+class MobileSidebarTests(unittest.TestCase):
+    """Static checks only; the layout itself needs a browser (see the report)."""
+
+    def test_toggle_markup_css_and_handlers_exist(self):
+        for mode in ("online", "offline"):
+            with self.subTest(mode=mode):
+                viewer.init_config(VAULT)
+                html = viewer.render_page(mode)
+                self.assertIn('id="menu-btn"', html)
+                self.assertIn('id="sb-backdrop"', html)
+                # button precedes the tabs inside the tab row
+                self.assertLess(html.index('id="menu-btn"'), html.index('id="tabs"'))
+                css = html.split("<style>")[1].split("</style>")[0]
+                self.assertRegex(css, r"\.menu-btn \{ display: none; \}")             # hidden on desktop
+                media = css[css.index("@media (max-width: 580px)"):]
+                self.assertRegex(media, r"\.menu-btn \{\s*display: flex")              # shown below 580px
+                self.assertIn("body.sb-open .sb {", media)
+                self.assertIn("body.sb-open .sb-backdrop {", media)
+                js = page_script(mode)
+                self.assertIn('getElementById("sb-backdrop").addEventListener("click", closeSidebar)', js)
+                self.assertRegex(js, r'e\.key === "Escape" && sidebarOpen\(\)\) \{ closeSidebar\(\)')
+                self.assertRegex(js, r"function openNote\(note\) \{\s*closeSidebar\(\);")
+
+
 class IndexTests(unittest.TestCase):
     def test_resolution_forms(self):
         viewer.init_config(VAULT)

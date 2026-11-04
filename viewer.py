@@ -1109,15 +1109,34 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
 .toolbar-btn:hover { color: var(--tx); background: var(--sh); }
 .toolbar-btn.active { color: var(--ac); background: var(--ac2); }
 
+/* mobile sidebar toggle: hidden on desktop */
+.menu-btn { display: none; }
+.sb-backdrop { display: none; }
+
 @media (max-width: 580px) {
   .sb { display: none; }
+  .menu-btn {
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+    width: 40px; background: none; border: none; border-right: 1px solid var(--bd);
+    color: var(--tx2); font-size: 18px; line-height: 1; cursor: pointer; font-family: inherit;
+  }
+  .menu-btn:hover, body.sb-open .menu-btn { color: var(--tx); background: var(--sh); }
+  /* the sidebar becomes an overlay over the content, with a backdrop */
+  body.sb-open .sb {
+    display: flex; position: fixed; top: 0; left: 0; bottom: 0;
+    width: min(300px, 85vw); z-index: 30; box-shadow: 4px 0 24px rgba(0,0,0,.5);
+  }
+  body.sb-open .sb-backdrop {
+    display: block; position: fixed; inset: 0; z-index: 29; background: rgba(0,0,0,.55);
+  }
   .chat-panel { width: 100%; position: absolute; right: 0; top: 0; bottom: 0; z-index: 10; }
 }
 </style>
 </head>
 <body>
 
-<aside class="sb">
+<div class="sb-backdrop" id="sb-backdrop"></div>
+<aside class="sb" id="sb">
   <div class="sb-top">
     <span class="sb-title">Explorer</span>
     <button class="rbtn" id="rbtn" title="Refresh (R)">
@@ -1138,6 +1157,7 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
 
 <div class="main">
   <div class="tabrow">
+    <button class="menu-btn" id="menu-btn" aria-label="Open sidebar" aria-controls="sb" aria-expanded="false" title="Notes">&#9776;</button>
     <div class="tabs" id="tabs"></div>
     <div class="toolbar-btns">
       <button class="toolbar-btn" id="graph-btn">
@@ -1505,6 +1525,7 @@ const hashFor = path => "#" + encodeURIComponent(path);
 // Opens (or switches to) a note tab. activeTab is set *before* the hash is written, so the
 // resulting hashchange sees "already active" and does nothing: no double load, no loop.
 function openNote(note) {
+  closeSidebar();
   if (graphMode) closeGraph();
   if (!tabs.find(t => t.path === note.path)) {
     tabs.push(note);
@@ -1655,7 +1676,18 @@ document.getElementById("srch").addEventListener("input", e => {
   searchTimer = setTimeout(runSearch, 150);     // debounce
 });
 
+// ── Mobile sidebar overlay (the ☰ button only exists below 580px) ──
+const sidebarOpen = () => document.body.classList.contains("sb-open");
+function setSidebar(open) {
+  document.body.classList.toggle("sb-open", open);
+  document.getElementById("menu-btn").setAttribute("aria-expanded", String(open));
+}
+const closeSidebar = () => setSidebar(false);
+document.getElementById("menu-btn").addEventListener("click", () => setSidebar(!sidebarOpen()));
+document.getElementById("sb-backdrop").addEventListener("click", closeSidebar);
+
 document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && sidebarOpen()) { closeSidebar(); return; }   // also from the search box
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
   if (e.key === "r" && !e.ctrlKey && !e.metaKey) load();
   if (e.key === "/") { e.preventDefault(); document.getElementById("srch").focus(); }

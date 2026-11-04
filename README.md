@@ -11,6 +11,7 @@ A lightweight local viewer for Markdown knowledge bases. Zero dependencies — P
 - **Live reload** — file watcher auto-refreshes the browser on vault changes
 - **Obsidian syntax** — `[[wikilinks]]` (`[[A|alias]]`, `[[dir/A]]`, `[[A#Heading|x]]`), `> [!note]` callouts, a "Linked from" backlinks section
 - **Dataview inline fields** — `[state:: …] [due:: …] [link:: …]` render as chips; open tasks past their `due` date are marked overdue
+- **Mobile layout** — below 580 px a ☰ button at the left of the tab row opens the sidebar as an overlay with a backdrop (closes when a note opens, on Escape, or on a backdrop click)
 - **Deep links** — `#<note path>` in the URL; Back/Forward work
 - **Offline mode** and **single-file export** (see below)
 
