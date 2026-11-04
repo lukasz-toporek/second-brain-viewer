@@ -570,6 +570,48 @@ class AttachmentRenderTests(unittest.TestCase):
         self.assertIn('width="120"', html)
         self.assertNotIn("<script", html)
 
+    def fixture_line(self):
+        text = (VAULT / "README.md").read_text(encoding="utf-8")     # a skipped file: no effect on the index or lint
+        return next(l for l in text.splitlines() if l.startswith("- attachment wikilinks"))
+
+    def test_wikilink_to_attachment_is_a_link_only_embed_is_an_image(self):
+        att = 'href="/api/file?path=img%2Fpic.png" target="_blank" rel="noopener noreferrer"'
+        html = self.render("Note.md", "[[pic.png]]")
+        self.assertIn(f'<a class="wl att" {att}>pic.png</a>', html)
+        self.assertNotIn("<img", html)
+        html = self.render("Note.md", "[[pic.png|the label]]")
+        self.assertIn(f'<a class="wl att" {att}>the label</a>', html)
+        self.assertNotIn("<img", html)
+        html = self.render("Note.md", "![[pic.png]]")
+        self.assertIn('<img src="/api/file?path=img%2Fpic.png"', html)
+        self.assertNotIn("<a ", html)
+        html = self.render("Note.md", "[[spec.pdf]] ![[spec.pdf]]")
+        self.assertIn('rel="noopener noreferrer">spec.pdf</a>', html)             # plain link
+        self.assertIn('rel="noopener noreferrer">📄 spec.pdf</a>', html)           # embed keeps the icon
+
+    def test_fixture_line_renders_one_image_and_two_links(self):
+        html = self.render("Note.md", self.fixture_line())      # doc.pdf is not in this vault: placeholder
+        self.assertEqual(html.count("<img"), 1)
+        self.assertEqual(html.count('class="wl att"'), 2)
+        self.assertEqual(html.count('class="wl missing"'), 1)
+
+    def test_wikilink_to_attachment_in_export(self):
+        att = self.export_attachments()
+        html = self.render("Note.md", "[[pic.png]] [[spec.pdf]]", export={"attachments": att})
+        self.assertIn('href="data:image/png;base64,', html)
+        self.assertIn("spec.pdf (attachment not included in export)", html)
+        self.assertNotIn("<img", html)
+
+    def test_page_script_is_valid_and_image_branch_is_guarded(self):
+        for mode in ("online", "offline", "export"):
+            self.assertRegex(page_script(mode), r"if \(tok\.embed && ATT_EXT\.test\(tok\.target\)\)")
+        if NODE:
+            with tempfile.TemporaryDirectory() as d:
+                f = Path(d) / "page.js"
+                f.write_text(page_script("online"), encoding="utf-8")
+                r = subprocess.run([NODE, "--check", str(f)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_pdf_becomes_link_in_new_tab(self):
         html = self.render("Note.md", "[spec](files/spec.pdf) ![[spec.pdf]]")
         self.assertEqual(html.count('href="/api/file?path=files%2Fspec.pdf" target="_blank" rel="noopener noreferrer"'), 2)

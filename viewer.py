@@ -1711,7 +1711,14 @@ if (typeof marked !== "undefined") {
           label: (m[4] || "").trim() };
       },
       renderer(tok) {
-        if (ATT_EXT.test(tok.target)) {      // ![[pic.png]], ![[pic.png|alt]], ![[pic.png|300]]; [[a.pdf]]
+        if (ATT_EXT.test(tok.target) && !tok.embed) {    // [[pic.png]], [[pic.png|label]], [[a.pdf]]: a link, as in Obsidian
+          const apath = attachmentPath(tok.target, true), name = tok.target.split("/").pop();
+          if (!apath) return MISSING_ATT(name);
+          const src = attachmentSrc(apath);
+          return src ? `<a class="wl att" href="${esc(src)}" target="_blank" rel="noopener noreferrer">${esc(tok.label || name)}</a>`
+                     : SKIPPED_ATT(name);
+        }
+        if (tok.embed && ATT_EXT.test(tok.target)) {      // ![[pic.png]], ![[pic.png|alt]], ![[pic.png|300]]; ![[a.pdf]]
           const size = /^\d+(?:x\d+)?$/.exec(tok.label);
           return attachmentHtml(attachmentPath(tok.target, true), tok.target.split("/").pop(),
             size ? tok.target : (tok.label || tok.target), "", size ? tok.label.split("x")[0] : "");
