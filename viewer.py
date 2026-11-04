@@ -1629,7 +1629,7 @@ __DATA__
 const FLAGS = __FLAGS__;   // {chat, watch, export}
 const FM = __FM__;
 const TC = __TC__;
-const tcol = t => TC[t] || "#888";
+const TCL = __TCL__;      // optional "types_light": type -> colour used instead of TC in the light theme
 const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const DONE_STATES = new Set(["done", "waived", "missed"]);
 const todayStr = () => { const d = new Date(), p = n => String(n).padStart(2, "0");
@@ -1646,6 +1646,79 @@ function safeUrl(u) {
 }
 const esc = s => String(s ?? "").replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+// ── Theme-aware colours (pure; tests/test_viewer.py re-implements the maths in Python and compares) ──
+// Colours in viewer.json are written for the dark theme. In the light theme:
+//  * a folder badge uses "bg_light"/"fg_light" when given, else a tint of its colour with text darkened
+//    (hue kept) until it reaches 4.5:1 against that tint;
+//  * a note-type colour uses "types_light" when given, else the configured colour darkened (hue kept)
+//    until it reaches 3:1 against the page background (enough for dots, node fills and chip text).
+const LIGHT_BG = "#fbfbfa", LIGHT_SH = "#e9e9e5", DARK_SH = "#191919";   // = --bg and --sh (light), --sb (dark)
+const BADGE_MIN = 4.5, TYPE_MIN = 3;
+const own = (o, k) => Object.prototype.hasOwnProperty.call(o || {}, k);
+const lightMq = (typeof window !== "undefined" && window.matchMedia) ? window.matchMedia("(prefers-color-scheme: light)") : null;
+const isLight = () => FLAGS.theme === "light" || (FLAGS.theme !== "dark" && !!(lightMq && lightMq.matches));
+const hexRgb = h => {
+  const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(String(h ?? "").trim());
+  if (!m) return null;
+  const s = m[1].length === 3 ? [...m[1]].map(c => c + c).join("") : m[1];
+  return [0, 2, 4].map(i => parseInt(s.slice(i, i + 2), 16));
+};
+const rgbHex = c => "#" + c.map(v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0")).join("");
+const lumOf = c => {
+  const [r, g, b] = c.map(v => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+};
+const contrastOf = (a, b) => { const x = lumOf(a), y = lumOf(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+const mixRgb = (a, b, pct) => a.map((v, i) => v * pct + b[i] * (1 - pct));          // pct of a over b
+// `hex` scaled towards black (so the hue stays) until it reaches `min`:1 against `bgHex`.
+function darkenTo(hex, bgHex, min) {
+  const c = hexRgb(hex), bg = hexRgb(bgHex);
+  if (!c || !bg) return hex;
+  for (let i = 0; i <= 50; i++) {
+    const t = c.map(v => Math.round(v * (1 - i * 0.02)));
+    if (contrastOf(t, bg) >= min) return rgbHex(t);
+  }
+  return "#000000";
+}
+// "#rgb"/"#rrggbb" + a two-digit alpha -> "#rrggbbaa" (canvas colours); anything else is returned as is
+const hexAlpha = (col, aa) => { const c = hexRgb(col); return c ? rgbHex(c) + aa : col; };
+// FNV-1a: a stable hash, so a folder or type always gets the same generated colour
+function hash32(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h >>> 0;
+}
+const typeGrey = light => (light ? darkenTo("#888888", LIGHT_BG, TYPE_MIN) : "#888");
+// Colour of note type `t` in the dark or light theme (maps default to the page's config).
+function tcol(t, light = isLight(), tc = TC, tcl = TCL) {
+  if (!t) return typeGrey(light);
+  const cfg = own(tc, t) && tc[t] ? tc[t] : "#888";
+  if (!light) return cfg;
+  if (own(tcl, t) && tcl[t]) return tcl[t];
+  return darkenTo(cfg, LIGHT_BG, TYPE_MIN);
+}
+// Light-theme badge derived from one accent colour: 15% tint over --sh, text darkened to 4.5:1 on it.
+function derivedLightBadge(base) {
+  const c = hexRgb(base);
+  if (!c) return { bg: "var(--sh)", fg: "var(--tx2)" };
+  const bg = rgbHex(mixRgb(c, hexRgb(LIGHT_SH), 0.15));
+  return { bg, fg: darkenTo(base, bg, BADGE_MIN) };
+}
+const folderLabel = name => String(name).replace(/^\d+[-\s]+/, "");
+// {bg, fg, letter} of a folder badge. `path` is the vault-relative folder path (a top-level folder: its name).
+function folderBadge(path, light = isLight(), fm = FM) {
+  const cfg = own(fm, path) && fm[path] && typeof fm[path] === "object" ? fm[path] : null;
+  const letter = (cfg && cfg.letter) || "?";
+  if (!cfg) return light ? { ...derivedLightBadge(null), letter } : { bg: "#1a1a1a", fg: "#777", letter };
+  if (!light) return { bg: cfg.bg, fg: cfg.fg, letter };
+  const d = derivedLightBadge(cfg.fg || cfg.bg);
+  const bg = cfg.bg_light || d.bg;
+  return { bg, fg: cfg.fg_light || (cfg.bg_light ? darkenTo(cfg.fg || cfg.bg, bg, BADGE_MIN) : d.fg), letter };
+}
+// Colour of a frontmatter chip (type: coloured like the dots, status: green, the rest: grey)
+const chipColor = (key, v) => key === "type" ? tcol(v) : key === "status" ? "var(--k-green)" : "var(--k-grey)";
+const chipStyle = c => `background:color-mix(in srgb, ${esc(c)} 12%, transparent);color:${esc(c)}`;
 
 // Full-text search over {path, name, content} notes: mirrors search_notes() in viewer.py
 // (the live server answers /api/search; --export runs this over the embedded notes).
@@ -2081,9 +2154,9 @@ function renderTree() {
   vault.folders.forEach(sec => {
     const notes = sec.notes;
 
-    const fm = FM[sec.folder] || { bg:"#1a1a1a", fg:"#777", letter:"?" };
+    const fm = folderBadge(sec.folder);
     const open = expanded.has(sec.folder);
-    const label = sec.folder.replace(/^\d+[-\s]+/, "");
+    const label = folderLabel(sec.folder);
 
     const el = document.createElement("div");
     el.className = "folder";
@@ -2105,7 +2178,7 @@ function renderTree() {
       ni.className = "ni" + (activeTab === n.path ? " active" : "");
       ni.dataset.path = n.path;
       ni.innerHTML =
-        `<span class="nd" style="background:${esc(tcol(n.type))}"></span>` +
+        `<span class="nd" data-type="${esc(n.type)}" style="background:${esc(tcol(n.type))}"></span>` +
         `<span class="nn">${esc(n.name)}</span>`;
       ni.addEventListener("click", () => openNote({
         path: n.path, name: n.name, type: n.type, folder: sec.folder
@@ -2133,7 +2206,7 @@ function renderTabs() {
   tabs.forEach(t => {
     const el = document.createElement("div");
     el.className = "tab" + (activeTab === t.path ? " active" : "");
-    el.innerHTML = `<span class="ti" style="background:${esc(tcol(t.type))}"></span>${esc(t.name)}`;
+    el.innerHTML = `<span class="ti" data-type="${esc(t.type)}" style="background:${esc(tcol(t.type))}"></span>${esc(t.name)}`;
     el.addEventListener("click", () => switchTo(t));
     bar.appendChild(el);
   });
@@ -2234,8 +2307,7 @@ function showNote(data) {
       .map(([k, v]) => [k, Array.isArray(v) ? v.join(", ") : String(v ?? "")])
       .filter(([k, v]) => v && k !== "title");
     chips = kv.map(([key, v]) => {
-      const c = key === "type" ? tcol(v) : key === "status" ? "var(--k-green)" : "var(--k-grey)";
-      return `<span class="chip" style="background:color-mix(in srgb, ${esc(c)} 12%, transparent);color:${esc(c)}">${esc(key)}: ${esc(v)}</span>`;
+      return `<span class="chip" data-k="${esc(key)}" data-v="${esc(v)}" style="${chipStyle(chipColor(key, v))}">${esc(key)}: ${esc(v)}</span>`;
     }).join("");
     if (chips) chips = `<div class="chips">${chips}</div>`;
   }
@@ -2280,8 +2352,9 @@ async function load() {
 
 // ── Events ────────────────────────────────────────────────────
 // ── Sidebar search: a result list replaces the tree while the box has a query ──
-let searchTimer = null, searchSeq = 0;
+let searchTimer = null, searchSeq = 0, lastResults = null;
 function renderSearch(results) {
+  lastResults = results;
   const tree = document.getElementById("tree");
   tree.innerHTML = "";
   if (!results.length) { tree.innerHTML = `<div class="loading">No results</div>`; return; }
@@ -2291,7 +2364,7 @@ function renderSearch(results) {
     el.className = "ni sr" + (activeTab === r.path ? " active" : "");
     el.dataset.path = r.path;
     el.innerHTML =
-      `<span class="nd" style="background:${esc(tcol(n.type))}"></span>` +
+      `<span class="nd" data-type="${esc(n.type)}" style="background:${esc(tcol(n.type))}"></span>` +
       `<span class="sr-main"><span class="nn">${esc(r.name)}</span>` +
       `<span class="sr-folder">${esc(r.folder)}</span>` +
       (r.snippet ? `<span class="sr-snip">${esc(r.snippet)}</span>` : "") + `</span>`;
@@ -2377,13 +2450,23 @@ let graphColors = { bg: "", link: "", label: "" };
 function readGraphColors() {
   graphColors = { bg: cssVar("--graph-bg"), link: cssVar("--graph-link"), label: cssVar("--graph-label") };
 }
+// The OS theme changed while the page is open: CSS variables switch by themselves; what JS colours
+// (graph canvas, folder badges, type dots, tabs, chips) is redone here. The graph canvas repaints every frame.
+function applyTheme() {
+  refreshGraphTheme();
+  if (!vault) return;
+  if (searchQ) { if (lastResults) renderSearch(lastResults); } else renderTree();
+  renderTabs();
+  document.querySelectorAll(".chip[data-k]").forEach(el =>
+    el.setAttribute("style", chipStyle(chipColor(el.dataset.k, el.dataset.v))));
+}
 function refreshGraphTheme() {
   readGraphColors();
   if (fgInstance) fgInstance.backgroundColor(graphColors.bg).linkColor(() => graphColors.link);
 }
 {
   const mq = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)");
-  const onTheme = () => refreshGraphTheme();      // CSS variables switch by themselves; only the canvas needs a nudge
+  const onTheme = () => applyTheme();
   if (mq) { if (mq.addEventListener) mq.addEventListener("change", onTheme); else if (mq.addListener) mq.addListener(onTheme); }
 }
 
@@ -2420,12 +2503,12 @@ function renderGraph() {
     .nodeLabel(d => esc(d.name) + (degree[d.id] ? ` · ${degree[d.id]} links` : ""))   // force-graph inserts this as HTML
     .nodeCanvasObject((node, ctx, gs) => {
       const r = nodeRadius(node);
-      const col = tcol(node.type);
+      const col = tcol(node.type);                       // theme-aware: read on every frame
       ctx.beginPath();
       ctx.arc(node.x, node.y, r, 0, 2 * Math.PI);
-      ctx.fillStyle = col + (degree[node.id] ? "dd" : "55");
+      ctx.fillStyle = hexAlpha(col, degree[node.id] ? "dd" : "55");
       ctx.fill();
-      ctx.strokeStyle = col + "44";
+      ctx.strokeStyle = hexAlpha(col, "44");
       ctx.lineWidth = 1.5;
       ctx.stroke();
       if (gs > 0.55) {
@@ -2793,6 +2876,7 @@ def render_page(mode: str = "online", data: dict = None) -> str:
     repl = {
         "FM": js_json(CONFIG.get("folders", {})),
         "TC": js_json(CONFIG.get("types", {})),
+        "TCL": js_json(CONFIG.get("types_light") if isinstance(CONFIG.get("types_light"), dict) else {}),
         "TITLE": html_escape(CONFIG.get("title", VAULT.name)),
         "FLAGS": js_json(flags),
         "THEMEATTR": "" if THEME == "system" else f' data-theme="{THEME}"',
@@ -2800,7 +2884,7 @@ def render_page(mode: str = "online", data: dict = None) -> str:
         "HEAD": head, "LIBS": libs, "DATA": data_tag, "PLUGINS": plug,
     }
     # single pass, so substituted content is never re-scanned for placeholders
-    return re.sub(r"__(FM|TC|TITLE|FLAGS|THEMEATTR|SCHEME|HEAD|LIBS|DATA|PLUGINS)__", lambda m: repl[m.group(1)], VIEWER_HTML)
+    return re.sub(r"__(FM|TCL|TC|TITLE|FLAGS|THEMEATTR|SCHEME|HEAD|LIBS|DATA|PLUGINS)__", lambda m: repl[m.group(1)], VIEWER_HTML)
 
 
 BIND_HOST = "127.0.0.1"

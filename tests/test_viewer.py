@@ -45,7 +45,7 @@ def run_page_js(snippet: str, mode="offline", export_data=None):
     document.addEventListener, which is stubbed. `snippet` runs after it and prints JSON.
     """
     js = page_script(mode)
-    a = js.index("// Only http(s), mailto")
+    a = js.index("const FM = ")
     b = js.index("// delegated click handler for wikilinks")
     prelude = (
         f"global.window = {{__EXPORT__: {json.dumps(export_data)}}}; global.document = {{addEventListener(){{}}}};\n"
@@ -1951,6 +1951,152 @@ class ThemeTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn('"theme" must be one of', r.stderr)
             self.assertIn('<html lang="pl">', out.read_text(encoding="utf-8"))
+
+
+# ── Light-theme colours: a Python mirror of the page's colour maths (keep it parallel to darkenTo() etc.) ──
+LIGHT_BG, LIGHT_SH = "#fbfbfa", "#e9e9e5"
+
+
+def hex_rgb(h):
+    m = re.fullmatch(r"#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})", h.strip())
+    if not m:
+        return None
+    s = m.group(1)
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    return [int(s[i:i + 2], 16) for i in (0, 2, 4)]
+
+
+def js_round(x):                       # Math.round: halves go up (Python's round() goes to even)
+    return int(x + 0.5)
+
+
+def rgb_hex(c):
+    return "#" + "".join(f"{max(0, min(255, js_round(v))):02x}" for v in c)
+
+
+def contrast_rgb(a, b):
+    def lum(c):
+        ch = [v / 255 for v in c]
+        ch = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in ch]
+        return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2]
+    x, y = lum(a), lum(b)
+    return (max(x, y) + 0.05) / (min(x, y) + 0.05)
+
+
+def darken_to(hex_, bg_hex, minimum):
+    c, bg = hex_rgb(hex_), hex_rgb(bg_hex)
+    if c is None or bg is None:
+        return hex_
+    for i in range(51):
+        t = [js_round(v * (1 - i * 0.02)) for v in c]
+        if contrast_rgb(t, bg) >= minimum:
+            return rgb_hex(t)
+    return "#000000"
+
+
+def derived_light_badge(base):
+    c = hex_rgb(base)
+    bg = rgb_hex([v * 0.15 + w * 0.85 for v, w in zip(c, hex_rgb(LIGHT_SH))])
+    return bg, darken_to(base, bg, 4.5)
+
+
+class LightColourTests(unittest.TestCase):
+    """bg_light / fg_light / types_light: config reaches the page, and the derived colours are readable."""
+    CFG = {"folders": {"k": {"bg": "#0a2020", "fg": "#4ecdc4", "letter": "K", "bg_light": "#d8efec", "fg_light": "#086860"}},
+           "types": {"wiedza": "#4ecdc4", "x": "#888"}, "types_light": {"wiedza": "#086860"}}
+
+    def tearDown(self):
+        viewer.init_config(VAULT)
+
+    def test_light_config_reaches_the_page_in_all_modes(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "v"
+            shutil.copytree(VAULT, root)
+            (root / ".viewer.json").write_text(json.dumps(self.CFG), encoding="utf-8")
+            viewer.init_config(root)
+            for mode in ("online", "offline", "export"):
+                with self.subTest(mode=mode):
+                    html = viewer.render_page(mode, {"notes": {}})
+                    self.assertIn('"bg_light": "#d8efec"', html)
+                    self.assertIn('"fg_light": "#086860"', html)
+                    self.assertIn('const TCL = {"wiedza": "#086860"}', html)
+                    self.assertNotIn("__TCL__", html)
+
+    def test_types_light_defaults_to_empty_and_ignores_garbage(self):
+        viewer.init_config(VAULT)
+        self.assertIn("const TCL = {};", viewer.render_page("offline"))
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "v"
+            shutil.copytree(VAULT, root)
+            (root / ".viewer.json").write_text(json.dumps({"types_light": ["no"]}), encoding="utf-8")
+            viewer.init_config(root)
+            self.assertIn("const TCL = {};", viewer.render_page("offline"))
+
+    def test_repo_viewer_json_light_values_are_readable(self):
+        cfg = json.loads((ROOT / "viewer.json").read_text(encoding="utf-8"))
+        for name, f in cfg["folders"].items():
+            with self.subTest(folder=name, kind="explicit"):
+                self.assertGreaterEqual(contrast_rgb(hex_rgb(f["fg_light"]), hex_rgb(f["bg_light"])), 4.5)
+            with self.subTest(folder=name, kind="derived"):     # what the page derives when bg_light/fg_light are absent
+                bg, fg = derived_light_badge(f["fg"] if f["fg"].startswith("#") else f["bg"])
+                self.assertGreaterEqual(contrast_rgb(hex_rgb(fg), hex_rgb(bg)), 4.5)
+        for t, col in cfg["types_light"].items():
+            with self.subTest(type=t):
+                self.assertGreaterEqual(contrast_rgb(hex_rgb(col), hex_rgb(LIGHT_BG)), 3)
+        for t, col in cfg["types"].items():
+            with self.subTest(type=t, kind="darkened fallback"):
+                self.assertGreaterEqual(contrast_rgb(hex_rgb(darken_to(col, LIGHT_BG, 3)), hex_rgb(LIGHT_BG)), 3)
+        self.assertGreaterEqual(contrast_rgb(hex_rgb(darken_to("#888", LIGHT_BG, 3)), hex_rgb(LIGHT_BG)), 3)
+
+    def test_page_constants_match_the_css_palette(self):
+        _, light, _, _ = css_blocks()
+        js = page_script("offline")
+        self.assertIn(f'LIGHT_BG = "{light["--bg"]}"', js)
+        self.assertIn(f'LIGHT_SH = "{light["--sh"]}"', js)
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_js_matches_the_python_mirror(self):
+        colours = ["#888", "#888888", "#4ecdc4", "#5b9bd5", "#e07050", "#c8980a", "#9b8bdb", "#68b068", "#fff", "#000", "#777", "#555", "#d4709a"]
+        out = run_page_js(f"""
+          const cols = {json.dumps(colours)};
+          console.log(JSON.stringify({{
+            dark: cols.map(c => darkenTo(c, LIGHT_BG, 3)),
+            badge: cols.map(c => derivedLightBadge(c)),
+          }}));""")
+        self.assertEqual(out["dark"], [darken_to(c, LIGHT_BG, 3) for c in colours])
+        self.assertEqual([[b["bg"], b["fg"]] for b in out["badge"]], [list(derived_light_badge(c)) for c in colours])
+        for c in colours:
+            bg, fg = derived_light_badge(c)
+            self.assertGreaterEqual(contrast_rgb(hex_rgb(fg), hex_rgb(bg)), 4.5, c)
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_dark_theme_is_untouched_and_light_theme_uses_the_new_keys(self):
+        r = run_page_js("""
+          const fm = {k: {bg: "#0a2020", fg: "#4ecdc4", letter: "K", bg_light: "#d8efec", fg_light: "#086860"},
+                      plain: {bg: "#102030", fg: "#5b9bd5", letter: "D"}, onlybg: {bg: "#181818", letter: "M"}};
+          const tc = {wiedza: "#4ecdc4", grey: "#888"}, tcl = {wiedza: "#086860"};
+          console.log(JSON.stringify({
+            darkK: folderBadge("k", false, fm), lightK: folderBadge("k", true, fm),
+            darkPlain: folderBadge("plain", false, fm), lightPlain: folderBadge("plain", true, fm),
+            lightOnlyBg: folderBadge("onlybg", true, fm),
+            darkMissing: folderBadge("zzz", false, fm), lightMissing: folderBadge("zzz", true, fm),
+            tDark: [tcol("wiedza", false, tc, tcl), tcol("grey", false, tc, tcl), tcol("", false, tc, tcl)],
+            tLight: [tcol("wiedza", true, tc, tcl), tcol("grey", true, tc, tcl), tcol("", true, tc, tcl)],
+            alpha: [hexAlpha("#888", "dd"), hexAlpha("#4ecdc4", "44"), hexAlpha("var(--x)", "44")],
+          }));""")
+        self.assertEqual(r["darkK"], {"bg": "#0a2020", "fg": "#4ecdc4", "letter": "K"})           # exactly as configured
+        self.assertEqual(r["lightK"], {"bg": "#d8efec", "fg": "#086860", "letter": "K"})
+        self.assertEqual(r["darkPlain"], {"bg": "#102030", "fg": "#5b9bd5", "letter": "D"})
+        bg, fg = derived_light_badge("#5b9bd5")
+        self.assertEqual(r["lightPlain"], {"bg": bg, "fg": fg, "letter": "D"})
+        self.assertNotEqual(r["lightPlain"]["bg"], "#102030")                                  # no dark square in light mode
+        self.assertEqual(r["darkMissing"], {"bg": "#1a1a1a", "fg": "#777", "letter": "?"})       # built-in fallback, as before
+        self.assertEqual(r["lightMissing"], {"bg": "var(--sh)", "fg": "var(--tx2)", "letter": "?"})
+        self.assertEqual(r["tDark"], ["#4ecdc4", "#888", "#888"])
+        self.assertEqual(r["tLight"][0], "#086860")                                              # types_light wins
+        self.assertEqual(r["tLight"][1], darken_to("#888", LIGHT_BG, 3))                          # kept, darkened to >= 3:1
+        self.assertEqual(r["alpha"], ["#888888dd", "#4ecdc444", "var(--x)"])
 
 
 class IndexTests(unittest.TestCase):

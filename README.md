@@ -147,8 +147,25 @@ value is reported on stderr and treated as `"block"`.
 The viewer follows the operating system's appearance setting (`prefers-color-scheme`), and switches live when the OS
 setting changes, including an open graph. The optional `"theme"` key in `viewer.json` is `"system"` (default),
 `"dark"` or `"light"`; the last two force a theme. Any other value prints a warning and falls back to `"system"`.
-It works the same in online, `--offline` and `--export` and needs no network access. Colours from `"types"` and
-`"folders"` stay as configured. Plug-ins should use the theme CSS variables (list in `docs/plugins.md`).
+It works the same in online, `--offline` and `--export` and needs no network access. Plug-ins should use the theme
+CSS variables (list in `docs/plugins.md`).
+
+Colours in `"folders"` and `"types"` are written for the dark theme, which uses them exactly as configured. In the
+light theme:
+
+- **Folder badges.** Add optional `"bg_light"` and `"fg_light"` to a `"folders"` entry and they are used instead.
+  Without them the badge is derived from the configured colour: a 15% tint of it over the light sidebar colour, with
+  the letter darkened (hue kept) until it reaches **4.5:1** contrast against that tint.
+- **Type colours.** An optional top-level `"types_light": {"<type>": "#rrggbb"}` map is used for the types it lists. For
+  any other type the configured colour is darkened (hue kept) until it reaches **3:1** against the page background,
+  which is enough for dots, graph nodes and chip text.
+- Switching the OS theme while the page is open re-colours the tree, tabs, chips and an open graph without a reload.
+
+```json
+"folders": {"10-knowledge": {"bg": "#0a2020", "fg": "#4ecdc4", "letter": "K", "bg_light": "#d8efec", "fg_light": "#086860"}},
+"types": {"wiedza": "#4ecdc4"},
+"types_light": {"wiedza": "#086860"}
+```
 
 ### Plug-ins (frontend, v1)
 
@@ -231,7 +248,7 @@ Place a `viewer.json` in the vault root (or any parent directory — the viewer 
   "skip_files": ["README.md", "_index.md"],
   "folder_order": ["00-inbox", "01-daily", "10-knowledge", "20-projects", "30-learning", "90-meta"],
   "folders": {
-    "00-inbox":     {"bg": "#1e1e1e", "fg": "#777",    "letter": "I"},
+    "00-inbox":     {"bg": "#1e1e1e", "fg": "#777",    "letter": "I", "bg_light": "#e4e4e0", "fg_light": "#555555"},
     "01-daily":     {"bg": "#102030", "fg": "#5b9bd5", "letter": "D"},
     "10-knowledge": {"bg": "#0a2020", "fg": "#4ecdc4", "letter": "K"},
     "20-projects":  {"bg": "#201008", "fg": "#e07050", "letter": "P"},
@@ -242,6 +259,7 @@ Place a `viewer.json` in the vault root (or any parent directory — the viewer 
     "daily": "#5b9bd5",
     "meta":  "#888"
   },
+  "types_light": {"daily": "#1f63a6", "meta": "#595959"},
   "link_deprioritise": ["90-meta/Szablony", "_Archive"],
   "remote_images": "allow",
   "theme": "system",
