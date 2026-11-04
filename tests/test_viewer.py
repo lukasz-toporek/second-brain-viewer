@@ -15,6 +15,7 @@ import hashlib
 import http.client
 import importlib.util
 import json
+import os
 import re
 import shutil
 import struct
@@ -940,8 +941,11 @@ class LintTests(unittest.TestCase):
     def test_fixture_vault_output_is_unchanged(self):
         r = self.run_lint(VAULT)
         self.assertEqual(r.returncode, 1, r.stderr)
-        self.assertIn("3 problem(ów) w 9 plikach", r.stdout)
+        # 3 original problems + 3 broken Markdown note links (the stricter lint): Nope.md, other.md and the one above the root
+        self.assertIn("6 problem(ów) w 9 plikach", r.stdout)
         self.assertIn("zepsuty wikilink: [[Does Not Exist]]", r.stdout)
+        self.assertEqual(r.stdout.count("zepsuty link:"), 3)
+        self.assertIn("(Nope.md) — brak notatki 10-knowledge/deep/Nope.md", r.stdout)
         self.assertEqual(r.stdout.count("brak wymaganego pola 'status' dla type: projekt"), 2)
         self.assertNotIn("brak frontmattera", r.stdout)
 
@@ -2762,7 +2766,7 @@ class LintStructureTests(LinkVaultCase):
         "Beta.md": "---\ntype: wiedza\nup:\n---\n# Beta (empty up)\n[[Hub]]\n",
         "NoUp.md": "---\ntype: wiedza\n---\n# NoUp\n[[Hub]]\n",
         "BadUp.md": '---\ntype: wiedza\nup: "[[Nope]]"\n---\n# BadUp\n[[Hub]]\n',
-        "PlainUp.md": "---\ntype: wiedza\nup: Hub\n---\n# PlainUp (a bare name resolves too)\n[[Hub]]\n",
+        "PlainUp.md": "---\ntype: wiedza\nup: Hub\n---\n# PlainUp (a bare name draws no line)\n[[Hub]]\n",
         "ListUp.md": '---\ntype: wiedza\nup:\n  - "[[Hub]]"\n  - "[[Alpha]]"\n---\n# ListUp (a list works)\n[[Hub]]\n',
         "island/I1.md": '---\ntype: wiedza\nup: "[[I2]]"\n---\n# I1\n[[I2]]\n',
         "island/I2.md": '---\ntype: wiedza\nup: "[[I3]]"\n---\n# I2\n[[I3]]\n',
@@ -2797,10 +2801,12 @@ class LintStructureTests(LinkVaultCase):
             self.assertRegex(out, rf"{missing}\n  • brak pola up:")
         self.assertRegex(out, r"BadUp\.md\n  • zepsute up: \[\[Nope\]\]")
         self.assertNotIn("brak pola up", out.split("BadUp.md")[1].split("\n\n")[0])          # not reported as missing too
-        for ok in ("Home.md", "Alpha.md", "PlainUp.md", "ListUp.md", "Hub.md"):               # home is exempt; the rest resolve
+        self.assertRegex(out, r'PlainUp\.md\n  • brak linku w up: Hub — użyj up: "\[\[Hub\]\]" \(taka notatka istnieje')
+        for ok in ("Home.md", "Alpha.md", "ListUp.md", "Hub.md"):                             # home is exempt; the rest resolve
             self.assertNotRegex(out, rf"\n{re.escape(ok)}\n")
         self.assertEqual(out.count("brak pola up"), 2)
         self.assertEqual(out.count("zepsute up"), 1)
+        self.assertEqual(out.count("brak linku w up"), 1)
 
     def test_groups_report_in_the_config_is_informational(self):
         (self.root / "BadUp.md").unlink()                                                  # leave a vault with no real issue
@@ -2826,6 +2832,158 @@ class LintStructureTests(LinkVaultCase):
         line = next(l for l in r.stdout.splitlines() if "(25)" in l)
         self.assertEqual(line.count(".md"), 20)
         self.assertIn("… i 5 więcej", line)
+
+
+class LintPolishTests(LinkVaultCase):
+    """require_up accepts only what the graph draws; no-frontmatter hint; Markdown note links in the lint."""
+    NOTES = {
+        "People.md": "---\ntype: home\n---\n# People\n",
+        "Sub/Deep.md": "---\ntype: wiedza\nup: \"[[People]]\"\n---\n# Deep\n",
+        "Attach.pdf": "x",
+    }
+
+    def lint(self, notes, require_up=True):
+        for rel, text in notes.items():
+            f = self.root / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(text, encoding="utf-8")
+        (self.root / ".viewer.json").write_text(json.dumps({"title": "L", "lint": {"require_up": require_up}}), encoding="utf-8")
+        return subprocess.run([sys.executable, str(ROOT / "tools" / "vault-lint.py"), "--vault", str(self.root)], capture_output=True, text=True)
+
+    @staticmethod
+    def fm(up_line):
+        return f"---\ntype: wiedza\n{up_line}\n---\n# N\n"
+
+    def test_up_forms(self):
+        cases = {
+            "BareYes.md": "up: People", "BareNo.md": "up: Nobody", "Quoted.md": 'up: "[[People]]"',
+            "Unquoted.md": "up: [[People]]", "Mixed.md": 'up:\n  - Nobody\n  - "[[People]]"',
+            "MixedBare.md": 'up:\n  - People\n  - Nobody', "Broken.md": 'up: "[[Nobody]]"',
+        }
+        r = self.lint({k: self.fm(v) for k, v in cases.items()} | {"Home2.md": "---\ntype: home\n---\n"})
+        out = r.stdout
+        self.assertEqual(r.returncode, 1)
+        self.assertRegex(out, r'BareYes\.md\n  • brak linku w up: People — użyj up: "\[\[People\]\]" \(taka notatka istnieje')
+        self.assertRegex(out, r'BareNo\.md\n  • brak linku w up: Nobody — użyj up: "\[\[Nobody\]\]"\n')
+        self.assertRegex(out, r"Broken\.md\n  • zepsute up")
+        self.assertRegex(out, r"MixedBare\.md\n  • brak linku w up: People")
+        for ok in ("Quoted.md", "Unquoted.md", "Mixed.md", "Home2.md"):
+            self.assertNotRegex(out, rf"\n{ok}\n")
+        # the lint agrees with the graph: every accepted note has an edge to People, no bare one has
+        edges = {e for e in self.edges() if "People.md" in e}
+        for ok in ("Quoted", "Unquoted", "Mixed"):
+            self.assertTrue(any(f"{ok}.md" in e for e in edges), ok)
+        for bad in ("BareYes", "BareNo", "MixedBare"):
+            self.assertFalse(any(f"{bad}.md" in e for e in edges), bad)
+
+    def test_note_without_frontmatter_gets_the_up_hint_only_with_require_up(self):
+        r = self.lint({"Plain.md": "# no frontmatter\n"})
+        self.assertRegex(r.stdout, r'Plain\.md\n  • brak frontmattera \(lint\.require_up: dodaj up: "\[\[…\]\]"\)')
+        self.assertEqual(r.stdout.count("Plain.md"), 1)
+        r = self.lint({"Plain.md": "# no frontmatter\n"}, require_up=False)
+        self.assertIn("  • brak frontmattera\n", r.stdout + "\n")
+        self.assertNotIn("require_up", r.stdout)
+
+    def test_markdown_note_links(self):
+        body = "\n".join([
+            "[ok](../People.md)", "[ok2](./../People.md#h)", "[sp](My%20Note.md)", "[missing](Missing.md)", "[up](../../x.md)",
+            "[web](http://example.com/a.md)", "[mail](mailto:a@b.c)", "[frag](#h)", "[att](Attach.pdf)", "![img](pic.png)",
+            "`[code](Inline.md)`", "```", "[fenced](Fenced.md)", "```",
+        ])
+        r = self.lint({"Sub/Links.md": f'---\ntype: wiedza\nup: "[[People]]"\n---\n{body}\n', "Sub/My Note.md": self.fm('up: "[[People]]"')},
+                      require_up=False)
+        out = r.stdout
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("zepsuty link: […](Missing.md) — brak notatki Sub/Missing.md", out)
+        self.assertIn("zepsuty link: […](../../x.md) — wychodzi poza katalog vaulta", out)
+        self.assertEqual(out.count("zepsuty link"), 2, out)
+
+    def test_md_link_check_matches_the_graph(self):
+        self.lint({"Sub/L.md": self.fm('up: "[[People]]"') + "[a](../People.md) [b](Gone.md)\n"})
+        edges = self.edges()
+        self.assertTrue(any("Sub/L.md" in e and "People.md" in e for e in edges))
+        self.assertEqual(len([e for e in edges if "Sub/L.md" in e]), 1)                   # Gone.md adds no line
+
+
+def run_snippet_js(js: str):
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "t.js"
+        f.write_text(js, encoding="utf-8")
+        r = subprocess.run([NODE, str(f)], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise AssertionError(r.stderr)
+    return json.loads(r.stdout)
+
+
+@unittest.skipUnless(NODE, "node not available")
+class HashAndTreeStateTests(unittest.TestCase):
+    NFC = unicodedata.normalize("NFC", "Zażółć")
+    NFD = unicodedata.normalize("NFD", "Zażółć")
+
+    def find_note(self, paths, query):
+        js = page_script("offline")
+        a = js.index("let noteByPath = null")
+        b = js.index("\n};", js.index("const findNote")) + 3
+        notes = [{"path": p} for p in paths]
+        return run_snippet_js(f"let vault = {{folders: [{{notes: {json.dumps(notes)}}}]}};\n{js[a:b]}\n"
+                              f"const r = findNote({json.dumps(query)}); console.log(JSON.stringify(r ? r.path : null));")
+
+    def test_find_note_falls_back_to_nfc(self):
+        self.assertNotEqual(self.NFC, self.NFD)
+        self.assertEqual(self.find_note([self.NFD + ".md"], self.NFC + ".md"), self.NFD + ".md")      # on-disk path comes back
+        self.assertEqual(self.find_note([self.NFC + ".md"], self.NFD + ".md"), self.NFC + ".md")
+        self.assertEqual(self.find_note(["A.md"], "B.md"), None)
+
+    def test_exact_match_wins_and_first_in_vault_order(self):
+        both = [self.NFD + ".md", self.NFC + ".md"]
+        self.assertEqual(self.find_note(both, self.NFC + ".md"), self.NFC + ".md")                    # exact
+        self.assertEqual(self.find_note([self.NFD + ".md", "d/" + self.NFD + ".md"], self.NFC + ".md"), self.NFD + ".md")
+
+    def test_api_note_accepts_only_the_on_disk_path(self):
+        # The page always asks the API with the path it found (findNote returns the on-disk one), so the server
+        # needs no NFC fallback of its own.
+        self.assertIn("hashFor(note.path)", viewer.VIEWER_HTML)
+
+    def tree_state(self, flags, store):
+        js = page_script("offline")
+        a = js.index("const treeKey")
+        b = js.index("} catch (_) {}\n", a) + len("} catch (_) {}\n")
+        return run_snippet_js(f"const FLAGS = {json.dumps(flags)}; const _s = {json.dumps(store)};\n"
+                              "global.localStorage = {getItem: k => (k in _s ? _s[k] : null), setItem: (k, v) => { _s[k] = v; }};\n"
+                              f"{js[a:b]}\nconsole.log(JSON.stringify([treeKey(), _s]));")
+
+    def test_tree_key_has_vault_id_and_migrates_once(self):
+        key, store = self.tree_state({"title": "T", "vault_id": "abc"}, {"sbv-tree:T": '["x"]'})
+        self.assertEqual(key, "sbv-tree:T:abc")
+        self.assertEqual(store, {"sbv-tree:T": '["x"]', "sbv-tree:T:abc": '["x"]'})                    # copied, old key kept
+        key, store = self.tree_state({"title": "T", "vault_id": "def"}, {"sbv-tree:T:def": '["y"]', "sbv-tree:T": '["x"]'})
+        self.assertEqual(store["sbv-tree:T:def"], '["y"]')                                             # existing state not overwritten
+
+    def test_vault_id_in_every_mode_but_not_the_path(self):
+        with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+            ids = []
+            for d in (d1, d2):
+                viewer.init_config(Path(d))
+                self.addCleanup(viewer.init_config, VAULT)
+                vid = viewer.vault_id()
+                ids.append(vid)
+                self.assertRegex(vid, r"^[0-9a-f]{12}$")
+                for mode in ("online", "offline", "export"):
+                    html = viewer.render_page(mode, {"folders": []} if mode == "export" else None)
+                    self.assertIn(f'"vault_id":"{vid}"', html.replace(" ", ""), mode)
+                    self.assertNotIn(str(Path(d).resolve()), html, mode)
+            self.assertNotEqual(*ids)
+
+
+class HelpTests(unittest.TestCase):
+    def test_help_prints_usage_and_writes_nothing(self):
+        for script in (ROOT / "viewer.py", ROOT / "tools" / "vault-lint.py"):
+            for flag in ("--help", "-h"):
+                with tempfile.TemporaryDirectory() as d:
+                    r = subprocess.run([sys.executable, str(script), flag, "--vault", d], cwd=d, capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 0, (script, flag, r.stderr))
+                    self.assertIn("Usage" if script.name == "viewer.py" else "python3 vault-lint.py", r.stdout)
+                    self.assertEqual(os.listdir(d), [], (script, flag))
 
 
 class IndexTests(unittest.TestCase):

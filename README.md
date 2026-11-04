@@ -7,7 +7,7 @@ A lightweight local viewer for Markdown knowledge bases. Zero dependencies — P
 - **Nested file tree** sidebar and **full-text search** (see below). Folders nest to any depth: sub-folders first, then notes,
   both sorted case-insensitively and number-aware (`2-x` before `10-x`); every folder shows a chevron, its label (number prefix
   stripped at every level) and a recursive note count, and expands on its own. `folder_order` still orders the top level and
-  `(vault root)` notes stay in their own group. Which folders are open is remembered per vault title in `localStorage`, by
+  `(vault root)` notes stay in their own group. Which folders are open is remembered per vault (title plus a short hash of the vault path; the path itself is never put in the page) in `localStorage`, by
   vault-relative folder path (entries for folders that no longer exist are dropped); live reload keeps it and the active highlight.
 - **Note rendering** with Markdown and frontmatter chips
 - **Wikilink graph** (force-directed, powered by [force-graph](https://github.com/vasturiano/force-graph))
@@ -58,6 +58,7 @@ python3 viewer.py --vault PATH
 
 # Print _index.md to stdout (dry run)
 python3 viewer.py --vault PATH --dry-run
+python3 viewer.py --help                  # usage (also -h); writes nothing
 
 # Custom port
 python3 viewer.py --vault PATH --serve --port 8080
@@ -276,7 +277,7 @@ TMPDIR="$B/link" python3 -m unittest discover tests
 ### Tools
 
 ```bash
-# Lint frontmatter and wikilinks
+# Lint frontmatter, wikilinks and Markdown note links ([x](Note.md); a broken one is reported)
 cd ~/Projects/second-brain
 python3 ~/Projects/second-brain-viewer/tools/vault-lint.py
 # (accepts --vault PATH; valid types / required fields come from the optional
@@ -284,7 +285,7 @@ python3 ~/Projects/second-brain-viewer/tools/vault-lint.py
 
 # Opt-in structure checks ("lint": {"require_up": true, "report_groups": true} in viewer.json) and a link-group report
 python3 ~/Projects/second-brain-viewer/tools/vault-lint.py --groups
-# (every note except type: home needs an `up:` that resolves; --groups lists the separate groups of the link graph —
+# (every note except type: home needs an `up: "[[Hub]]"` wikilink that resolves, a bare name is reported; --groups lists the separate groups of the link graph —
 #  see docs/note-linking.md)
 
 # Create today's daily note from template (90-meta/Szablony/Daily.md)

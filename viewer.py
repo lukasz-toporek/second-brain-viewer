@@ -645,33 +645,54 @@ def extract_md_links(text: str) -> list[str]:
             for m in _MDLINK_RE.finditer(blank_code(text)) if not m.group(0).startswith("[[")]      # [[w]](x) is a wikilink, then text
 
 
-def rel_link_path(base: str, href: str, ext: str = ".md"):
-    """Vault-relative path a scheme-less, non-# link points to, resolved against the folder of `base`
-    (``.`` and ``..`` normalised, never above the vault root); None if it is not a link ending in `ext`.
-    Mirror of ``relLinkPath()`` in the page: keep the two visibly parallel."""
+def _walk_link(base: str, href: str, ext: str):
+    """(vault-relative path, escaped) for rel_link_path(); (None, False) if not a link ending in `ext`.
+    `escaped` is True when a ``..`` tried to go above the vault root (the path is then clamped to the root)."""
     u = href.strip()
     if not u or u[0] == "#" or re.match(r"[a-z][a-z0-9+.-]*:", u, re.I) or re.match(r"[\\/]{2}", u):
-        return None
+        return None, False
     p = re.split(r"[#?]", u)[0]
     if re.search(r"%(?![0-9a-fA-F]{2})", p):           # decodeURIComponent would throw
-        return None
+        return None, False
     try:
         p = unquote(p, errors="strict")
     except UnicodeDecodeError:
-        return None
+        return None, False
     p = p.replace("\\", "/")
     if not p.lower().endswith(ext):
-        return None
+        return None, False
     parts = [] if p.startswith("/") else base.split("/")[:-1]
+    escaped = False
     for seg in p.split("/"):
         if seg in ("", "."):
             continue
         if seg == "..":
             if parts:
                 parts.pop()
+            else:
+                escaped = True
         else:
             parts.append(seg)
-    return "/".join(parts)
+    return "/".join(parts), escaped
+
+
+def rel_link_path(base: str, href: str, ext: str = ".md"):
+    """Vault-relative path a scheme-less, non-# link points to, resolved against the folder of `base`
+    (``.`` and ``..`` normalised, never above the vault root); None if it is not a link ending in `ext`.
+    Mirror of ``relLinkPath()`` in the page: keep the two visibly parallel."""
+    return _walk_link(base, href, ext)[0]
+
+
+def link_escapes_root(base: str, href: str, ext: str = ".md") -> bool:
+    """True when a note link's ``..`` goes above the vault root (rel_link_path() silently clamps it)."""
+    return _walk_link(base, href, ext)[1]
+
+
+def frontmatter_links(value) -> list[str]:
+    """Wikilink targets in one frontmatter value (text or a list of texts): the only form of a frontmatter
+    value that draws a graph line, since build_graph() reads links with extract_wikilinks() too."""
+    items = value if isinstance(value, list) else [value] if value is not None else []
+    return [t for item in items for t in extract_wikilinks(str(item))]
 
 
 def note_aliases(fm: dict) -> list[str]:
@@ -2526,7 +2547,12 @@ document.addEventListener("click", e => {
 
 // ── Tree ──────────────────────────────────────────────────────
 // Expanded folders are remembered by vault-relative folder path, per vault title, in localStorage.
-const treeKey = () => "sbv-tree:" + (FLAGS.title || "");
+const treeKey = () => "sbv-tree:" + (FLAGS.title || "") + ":" + (FLAGS.vault_id || "");
+// one-time migration: state saved under the old per-title key is copied to this vault's key (the old key stays)
+try {
+  const old = "sbv-tree:" + (FLAGS.title || "");
+  if (localStorage.getItem(treeKey()) === null && localStorage.getItem(old) !== null) localStorage.setItem(treeKey(), localStorage.getItem(old));
+} catch (_) {}
 function loadExpanded() {
   try {
     const a = JSON.parse(localStorage.getItem(treeKey()) || "[]");
@@ -2731,11 +2757,19 @@ function highlight() {
 }
 
 // ── Open note ─────────────────────────────────────────────────
-let noteByPath = null;                       // rebuilt after every load()
+let noteByPath = null, noteByNfc = null;     // rebuilt after every load()
 const findNote = path => {
   if (!vault) return undefined;
   if (!noteByPath) { noteByPath = new Map(); vault.folders.forEach(s => s.notes.forEach(n => noteByPath.set(n.path, n))); }
-  return noteByPath.get(path);
+  const hit = noteByPath.get(path);
+  if (hit || typeof path !== "string") return hit;
+  // A hash typed or pasted in another Unicode form than the file name on disk (NFD vs NFC): compare normalised.
+  // An exact match always wins; among notes that differ only in form, the first in vault order.
+  if (!noteByNfc) {
+    noteByNfc = new Map();
+    vault.folders.forEach(s => s.notes.forEach(n => { const k = n.path.normalize("NFC"); if (!noteByNfc.has(k)) noteByNfc.set(k, n); }));
+  }
+  return noteByNfc.get(path.normalize("NFC"));
 };
 const hashFor = path => "#" + encodeURIComponent(path);
 
@@ -2856,7 +2890,7 @@ async function load() {
   try {
     const first = !vault;
     vault = await api("vault");
-    noteIdx = null; fileIdx = null; noteByPath = null;
+    noteIdx = null; fileIdx = null; noteByPath = null; noteByNfc = null;
     if (first) expanded = loadExpanded();
     {                                                          // forget folders that no longer exist
       const live = folderPaths(buildTree(vault.folders)), n = expanded.size;
@@ -3387,12 +3421,18 @@ def js_json(obj) -> str:
     return json.dumps(obj, ensure_ascii=False).replace("</", "<\\/").replace("<!--", "<\\u0021--")
 
 
+def vault_id() -> str:
+    """Short opaque id of this vault (12 hex digits of SHA-256 of its resolved path): keys per-vault browser state.
+    The path itself never goes into the page or the export."""
+    return hashlib.sha256(str(VAULT.resolve()).encode("utf-8")).hexdigest()[:12]
+
+
 def render_page(mode: str = "online", data: dict = None) -> str:
     """mode: 'online' (CDN libs, chat) | 'offline' (vendored, no chat) | 'export' (single file)."""
     flags = {"chat": mode == "online", "watch": mode != "export", "export": mode == "export",
              # offline and export never load remote images; online follows the "remote_images" setting
              "remote_images": REMOTE_IMAGES if mode == "online" else "block",
-             "plugins": list(PLUGINS), "theme": THEME, "title": CONFIG.get("title", VAULT.name)}
+             "plugins": list(PLUGINS), "theme": THEME, "title": CONFIG.get("title", VAULT.name), "vault_id": vault_id()}
     head, libs, data_tag = "", "", ""
     if mode == "online":
         head, libs = CDN_FONTS, cdn_libs()
@@ -3873,6 +3913,9 @@ def serve(port: int = 5001) -> None:
 
 def main() -> None:
     args = sys.argv[1:]
+    if "-h" in args or "--help" in args:      # before anything reads config or writes a file
+        print((__doc__ or "").strip())
+        return
 
     # --vault PATH  (default: current working directory)
     vault_path = Path.cwd()

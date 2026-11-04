@@ -106,7 +106,7 @@ Home
 Run it from the viewer's repo folder (or give it `--vault PATH`):
 
 ```bash
-python3 tools/vault-lint.py --vault /path/to/vault           # frontmatter, broken wikilinks, alias clashes, opt-in checks
+python3 tools/vault-lint.py --vault /path/to/vault           # frontmatter, broken wikilinks and Markdown note links, alias clashes, opt-in checks
 python3 tools/vault-lint.py --vault /path/to/vault --groups  # only the link-group report
 ```
 
@@ -119,9 +119,16 @@ Two optional structure checks live in the `"lint"` key of the vault's `viewer.js
 }
 ```
 
-- **`"require_up": true`**: every note except `type: home` must have an `up:` value that resolves to a note. A missing or empty
-  `up:` and a broken one (nothing it names exists) are reported **separately**, and both make the exit code non-zero. A list is
-  fine if at least one item resolves; a bare name (`up: People`) works as well as `up: "[[People]]"`.
+- **`"require_up": true`**: every note except `type: home` must have an `up:` that is a **wikilink** resolving to a note, because
+  that is the only form of a frontmatter value that draws a line. Three cases are reported **separately**, and all make the exit
+  code non-zero:
+  - missing or empty `up:` (`brak pola up:`);
+  - `up:` with a link that resolves to nothing (`zepsute up:`);
+  - `up:` that is a bare name, not a link (`brak linku w up: People — użyj up: "[[People]]"`). If a note of that name exists the
+    message says so: the fix is only adding the quotes and brackets. Unquoted `up: [[People]]` is fine (the parser reads it as text).
+
+  A list passes if at least one item is a resolving link. A note with no frontmatter at all gets
+  `brak frontmattera (lint.require_up: dodaj up: "[[…]]")`.
 - **`"report_groups": true`**: after the checks, how many separate groups the link graph has (connected components, ignoring
   link direction), and the notes that are not in the largest group, up to 20 per group and then a count. This is informational:
   it never changes the exit code.
@@ -136,6 +143,12 @@ Grupy powiązań: 3 (notatek: 12, linków: 11)
 
 The goal is **one group** and no broken links; each listed note needs an `up` link or a link from the main group.
 The report prints note paths, so for a vault with personal data, run it only on your own machine.
+
+**Markdown note links.** The lint also checks `[text](Note.md)` links, with the same helpers the graph uses: relative to the note's
+folder, `../` and `%20` handled, links in code ignored. A link that points to no note is reported (`zepsuty link: […](Missing.md)`),
+and so is one that goes above the vault root (`../../x.md` from the top level). Images, attachments, `http(s):`/`mailto:` links,
+`#fragments` and anything not ending in `.md` are not note links and are never reported. This makes the lint stricter for vaults
+that use Markdown links.
 
 Instead of `require_up` you can still require any other field per type with
 `"lint": {"required_fields": {"<type>": ["up", …]}}`.

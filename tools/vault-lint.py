@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vault lint: checks frontmatter and wikilinks in the vault.
+"""Vault lint: checks frontmatter, wikilinks and Markdown note links ([x](Note.md)) in the vault.
 
     python3 vault-lint.py [--vault PATH]
     python3 vault-lint.py [--vault PATH] --groups     # only the link-group report (see report_groups)
@@ -18,8 +18,9 @@ The schema comes from the optional "lint" key of the vault's viewer config
     }
 
 Opt-in structure checks (docs/note-linking.md):
-  require_up     every note except type: home needs an `up:` value that resolves to a note (missing and broken are
-                 reported separately and make the exit code non-zero);
+  require_up     every note except type: home needs an `up:` that is a wikilink resolving to a note, e.g.
+                 up: "[[People]]" (missing, broken and bare-name `up: People` are reported separately and make the
+                 exit code non-zero);
   report_groups  after the checks, how many separate groups the link graph has and which notes are outside the
                  largest one (up to 20 per group). Informational: it never changes the exit code. --groups prints
                  only this report.
@@ -159,17 +160,22 @@ def resolve_wikilink(link: str, source_file: Path) -> Path | None:
     return idx.get(low) or idx.get("name:" + Path(low).name)
 
 
-def up_problem(fm: dict) -> str:
-    """"" when the note's `up:` resolves to a note, "missing" when there is no value, "broken" when none resolves."""
+def up_problem(fm: dict) -> tuple[str, str]:
+    """(kind, detail) for a note's `up:`. kind is "" when it holds a wikilink that resolves (the only form the
+    graph draws a line for), "missing" when there is no value, "broken" when it has links but none resolves,
+    "bare" when it has plain text and no link at all (detail: the first such name, "+" appended when a note of
+    that name exists, so the fix is only adding `"[[…]]"`)."""
     v = fm.get("up")
     items = [str(x).strip() for x in (v if isinstance(v, list) else [v] if v is not None else []) if str(x).strip()]
     if not items:
-        return "missing"
+        return "missing", ""
     idx = shared_index()
-    for item in items:
-        if any(idx.resolve(t) for t in (extract_wikilinks(item) or [item])):
-            return ""
-    return "broken"
+    links = viewer.frontmatter_links(items)
+    if any(idx.resolve(t) for t in links):
+        return "", ""
+    if links:
+        return "broken", ""
+    return "bare", items[0] + ("+" if idx.resolve(items[0]) else "")
 
 
 def groups_report() -> list[str]:
@@ -187,6 +193,9 @@ def groups_report() -> list[str]:
 
 
 def lint() -> int:
+    if "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
+        print(__doc__.strip())
+        return 0
     if "--vault" in sys.argv:
         apply_config(Path(sys.argv[sys.argv.index("--vault") + 1]))
     else:
@@ -206,7 +215,8 @@ def lint() -> int:
 
         # Check frontmatter presence
         if fm is None:
-            issues.append((str(rel), "brak frontmattera"))
+            issues.append((str(rel), "brak frontmattera" +
+                           (" (lint.require_up: dodaj up: \"[[…]]\")" if REQUIRE_UP else "")))
             continue
 
         # Check type field
@@ -223,16 +233,31 @@ def lint() -> int:
 
         # Structure: every note except type: home links "up" to a note (opt-in)
         if REQUIRE_UP and note_type != "home":
-            problem = up_problem(fm)
+            problem, detail = up_problem(fm)
             if problem == "missing":
                 issues.append((str(rel), "brak pola up: (lint.require_up)"))
             elif problem == "broken":
                 issues.append((str(rel), f"zepsute up: {fm_str(fm, 'up')} nie wskazuje żadnej notatki"))
+            elif problem == "bare":
+                name, exists = detail.rstrip("+"), detail.endswith("+")
+                issues.append((str(rel), f"brak linku w up: {name} — użyj up: \"[[{name}]]\"" +
+                               (" (taka notatka istnieje, wystarczy dodać cudzysłów i [[ ]])" if exists else "")))
 
         # Check wikilinks
         for link in extract_wikilinks(text):
             if resolve_wikilink(link, f) is None:
                 issues.append((str(rel), f"zepsuty wikilink: [[{link}]]"))
+
+        # Markdown note links [x](Note.md): by path, exactly as the graph reads them
+        relp = rel.as_posix()
+        for href in viewer.extract_md_links(text):
+            target = viewer.rel_link_path(relp, href)
+            if target is None:
+                continue                                    # not a note link (image, URL, #fragment, attachment)
+            if viewer.link_escapes_root(relp, href):
+                issues.append((str(rel), f"zepsuty link: […]({href}) — wychodzi poza katalog vaulta"))
+            elif shared_index().resolve_path(target) is None:
+                issues.append((str(rel), f"zepsuty link: […]({href}) — brak notatki {target}"))
 
     shown = {str(f.relative_to(VAULT)) for f in md_files}
     for kind, alias, kept, ignored in shared_index().alias_issues:
