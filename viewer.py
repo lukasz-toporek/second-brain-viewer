@@ -60,7 +60,8 @@ def load_config(vault_path: Path) -> dict:
 
 
 def init_config(vault_path: Path) -> None:
-    global VAULT, OUTPUT, SKIP_NAMES, SKIP_DIRS, FOLDER_ORDER, CONFIG
+    global VAULT, OUTPUT, SKIP_NAMES, SKIP_DIRS, FOLDER_ORDER, CONFIG, _INDEX_CACHE
+    _INDEX_CACHE = (None, None)          # the cache is keyed by vault-relative paths: drop it per vault
     VAULT = vault_path.resolve()
     CONFIG = load_config(VAULT)
     OUTPUT = VAULT / "_index.md"
@@ -1571,7 +1572,7 @@ function renderGraph() {
     .backgroundColor("#0d0d0d")
     .linkColor(() => "rgba(255,255,255,0.12)")
     .linkWidth(1)
-    .nodeLabel(d => `${d.name}${degree[d.id] ? ` · ${degree[d.id]} links` : ""}`)
+    .nodeLabel(d => esc(d.name) + (degree[d.id] ? ` · ${degree[d.id]} links` : ""))   // force-graph inserts this as HTML
     .nodeCanvasObject((node, ctx, gs) => {
       const r = nodeRadius(node);
       const col = tcol(node.type);

@@ -18,8 +18,8 @@ VAULT = ROOT / "tests" / "fixtures" / "vault"
 
 
 class Server:
-    def __init__(self, offline=False):
-        viewer.init_config(VAULT)
+    def __init__(self, offline=False, vault=VAULT):
+        viewer.init_config(vault)
         viewer.OFFLINE = offline
         self.srv = viewer.make_server(0)
         self.port = self.srv.server_address[1]
@@ -169,6 +169,33 @@ class OfflineTests(unittest.TestCase):
             self.assertGreater(len(body), 1000)
         for bad in ("/vendor/../viewer.py", "/vendor/README.md", "/vendor/%2e%2e/viewer.py", "/vendor/"):
             self.assertEqual(self.s.req("GET", bad)[0], 404, bad)
+
+
+class GraphXssTests(unittest.TestCase):
+    NAME = "<img src=x onerror=alert(1)>"
+
+    def test_graph_label_is_escaped(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            try:
+                (root / (self.NAME + ".md")).write_text("# hostile\n\n[[Other]]\n", encoding="utf-8")
+            except OSError:
+                self.skipTest("file system rejects < > in names")
+            (root / "Other.md").write_text("# Other\n", encoding="utf-8")
+            s = Server(vault=root)
+            try:
+                st, _, b = s.req("GET", "/api/graph")
+                self.assertEqual(st, 200)
+                names = {n["name"] for n in json.loads(b)["nodes"]}
+                self.assertIn(self.NAME, names)                 # raw name stays data...
+                _, _, page = s.req("GET", "/")
+            finally:
+                s.stop()
+        js = page.decode()
+        # ...and the page must escape it before force-graph inserts the label as HTML
+        self.assertRegex(js, r"\.nodeLabel\(d => esc\(d\.name\)")
+        self.assertNotRegex(js, r"\.nodeLabel\(d => `\$\{d\.name\}")
+        self.assertNotIn("<img src=x", js)                      # not embedded in the page itself
 
 
 class CliTests(unittest.TestCase):
