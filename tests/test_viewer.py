@@ -1,5 +1,7 @@
 """Tests for viewer.py (stdlib unittest). Run: python3 -m unittest discover tests"""
 import base64
+import contextlib
+import io
 import hashlib
 import http.client
 import importlib.util
@@ -27,7 +29,7 @@ def page_script(mode="offline") -> str:
     return re.findall(r"<script>(.*?)</script>", viewer.render_page(mode), re.S)[-1]
 
 
-def run_page_js(snippet: str, mode="offline"):
+def run_page_js(snippet: str, mode="offline", export_data=None):
     """Run the page's note-resolution + Markdown-extension code (real vendored marked) under node.
 
     The slice of the page script from safeUrl() to the wikilink click handler touches no DOM except
@@ -37,7 +39,7 @@ def run_page_js(snippet: str, mode="offline"):
     a = js.index("// Only http(s), mailto")
     b = js.index("// delegated click handler for wikilinks")
     prelude = (
-        "global.window = {}; global.document = {addEventListener(){}};\n"
+        f"global.window = {{__EXPORT__: {json.dumps(export_data)}}}; global.document = {{addEventListener(){{}}}};\n"
         f"global.marked = require({json.dumps(str(ROOT / 'vendor' / 'marked.min.js'))}).marked;\n"
         "const FLAGS = {};\n")
     with tempfile.TemporaryDirectory() as d:
@@ -412,6 +414,223 @@ class LinkDeprioritiseTests(unittest.TestCase):
                            check=True, capture_output=True)
             data = re.search(r"window\.__EXPORT__ = (.*?);</script>", out.read_text(encoding="utf-8"), re.S).group(1)
         self.assertEqual(json.loads(data.replace("<\\/", "</"))["vault"]["stems"]["weekly"], "Journal/Weekly.md")
+
+
+PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+SVG_DOC = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+PDF_DOC = b"%PDF-1.4\n% fake test document\n"
+
+
+def make_attach_vault(root: Path, config=None):
+    """Fake vault with attachments, a name clash (Archive/pic.png vs img/pic.png) and hidden files."""
+    (root / "img").mkdir(parents=True)
+    (root / "files").mkdir()
+    (root / "Archive").mkdir()
+    (root / "sub").mkdir()
+    (root / ".obsidian").mkdir()
+    (root / "img" / "pic.png").write_bytes(PNG_1X1)
+    (root / "img" / "vec.svg").write_bytes(SVG_DOC)
+    (root / "files" / "spec.pdf").write_bytes(PDF_DOC)
+    (root / "Archive" / "pic.png").write_bytes(PNG_1X1 + b"\0")
+    (root / ".obsidian" / "hidden.png").write_bytes(PNG_1X1)
+    (root / "Note.md").write_text("# Note\n\n![[pic.png]]\n", encoding="utf-8")
+    (root / "sub" / "Deep.md").write_text("# Deep\n\n![](../img/pic.png)\n", encoding="utf-8")
+    (root / "secret.py").write_text("print('x')\n", encoding="utf-8")
+    sibling = root.parent / (root.name + "-secret")
+    sibling.mkdir(exist_ok=True)
+    (sibling / "s.png").write_bytes(PNG_1X1)
+    if config is not None:
+        (root / ".viewer.json").write_text(json.dumps(config), encoding="utf-8")
+
+
+class AttachmentServerTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name) / "vault"
+        self.root.mkdir()
+        make_attach_vault(self.root)
+        self.s = Server(vault=self.root)
+
+    def tearDown(self):
+        self.s.stop()
+        viewer.init_config(VAULT)
+        self._tmp.cleanup()
+
+    def get(self, rel):
+        return self.s.req("GET", "/api/file?path=" + rel)
+
+    def test_png_is_served_with_fixed_type_and_nosniff(self):
+        st, h, body = self.get("img/pic.png")
+        self.assertEqual(st, 200)
+        self.assertEqual(body, PNG_1X1)
+        self.assertEqual(h["Content-Type"], "image/png")
+        self.assertEqual(h["X-Content-Type-Options"], "nosniff")
+
+    def test_svg_is_sandboxed(self):
+        st, h, body = self.get("img/vec.svg")
+        self.assertEqual(st, 200)
+        self.assertEqual(h["Content-Type"], "image/svg+xml")
+        self.assertEqual(h["Content-Security-Policy"], "sandbox; default-src 'none'; style-src 'unsafe-inline'")
+        self.assertEqual(h["X-Content-Type-Options"], "nosniff")
+
+    def test_pdf_is_served(self):
+        st, h, body = self.get("files/spec.pdf")
+        self.assertEqual((st, h["Content-Type"], body), (200, "application/pdf", PDF_DOC))
+
+    def test_rejections(self):
+        sibling = self.root.parent / (self.root.name + "-secret") / "s.png"
+        cases = [
+            "Note.md", "secret.py", "", "img",                     # wrong type / empty / a directory
+            "../vault-secret/s.png", "img/../../vault-secret/s.png",
+            "..%2Fvault-secret%2Fs.png", str(sibling), "/etc/passwd",
+            ".obsidian/hidden.png",                                 # skipped dir
+            "img/pic.png%00.md", "img/missing.png",
+        ]
+        for rel in cases:
+            with self.subTest(rel=rel):
+                st, _, body = self.get(rel)
+                self.assertIn(st, (403, 404))
+                self.assertNotEqual(body, PNG_1X1)
+
+    def test_symlink_out_of_vault_is_rejected_and_not_indexed(self):
+        outside = self.root.parent / (self.root.name + "-secret") / "s.png"
+        try:
+            (self.root / "img" / "link.png").symlink_to(outside)
+        except OSError:
+            self.skipTest("symlinks not supported")
+        self.assertIn(self.get("img/link.png")[0], (403, 404))
+        self.assertNotIn("img/link.png", viewer.VaultIndex().file_paths)
+
+    def test_size_limit(self):
+        old = viewer.ATTACH_MAX_BYTES
+        viewer.ATTACH_MAX_BYTES = 10
+        try:
+            self.assertEqual(self.get("img/pic.png")[0], 413)
+        finally:
+            viewer.ATTACH_MAX_BYTES = old
+        self.assertEqual(self.get("img/pic.png")[0], 200)
+
+    def test_wrong_host_rejected(self):
+        self.assertEqual(self.s.req("GET", "/api/file?path=img/pic.png", host="evil.example")[0], 403)
+
+    def test_vault_payload_lists_attachments(self):
+        v = json.loads(self.s.req("GET", "/api/vault")[2])
+        self.assertEqual(v["files"]["pic.png"], "Archive/pic.png")          # first in vault order
+        self.assertEqual(v["files"]["spec.pdf"], "files/spec.pdf")
+        self.assertEqual(v["file_paths"], ["Archive/pic.png", "files/spec.pdf", "img/pic.png", "img/vec.svg"])
+        self.assertNotIn("hidden.png", v["files"])                          # skipped dir
+        self.assertNotIn("secret.py", v["files"])                           # not an attachment type
+
+    def test_attachment_change_invalidates_index(self):
+        self.assertNotIn("new.png", json.loads(self.s.req("GET", "/api/vault")[2])["files"])
+        (self.root / "img" / "new.png").write_bytes(PNG_1X1)
+        self.assertEqual(json.loads(self.s.req("GET", "/api/vault")[2])["files"]["new.png"], "img/new.png")
+
+
+class AttachmentIndexTests(unittest.TestCase):
+    def test_link_deprioritise_applies_to_attachments(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "vault"
+            root.mkdir()
+            make_attach_vault(root, {"link_deprioritise": ["Archive"]})
+            viewer.init_config(root)
+            try:
+                self.assertEqual(viewer.VaultIndex().files["pic.png"], "img/pic.png")
+            finally:
+                viewer.init_config(VAULT)
+
+
+@unittest.skipUnless(NODE, "node not available")
+class AttachmentRenderTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls._tmp.name) / "vault"
+        cls.root.mkdir()
+        make_attach_vault(cls.root, {"link_deprioritise": ["Archive"]})
+        viewer.init_config(cls.root)
+        cls.vault = json.dumps(viewer.vault_payload())
+        cls.idx = viewer.get_index()
+        viewer.init_config(VAULT)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def render(self, base, md, export=None):
+        return run_page_js(f"vault = {self.vault}; currentNotePath = {json.dumps(base)};"
+                           f"console.log(JSON.stringify(marked.parse({json.dumps(md)})));", export_data=export)
+
+    def test_images_resolve_relative_and_by_name(self):
+        html = self.render("sub/Deep.md", "![alt text](../img/pic.png) ![[pic.png]] ![[img/vec.svg|vector]] ![[pic.png|120]]")
+        self.assertEqual(html.count('src="/api/file?path=img%2Fpic.png"'), 3)     # clash -> img/ wins
+        self.assertIn('alt="alt text"', html)
+        self.assertIn('src="/api/file?path=img%2Fvec.svg" alt="vector"', html)
+        self.assertIn('width="120"', html)
+        self.assertNotIn("<script", html)
+
+    def test_pdf_becomes_link_in_new_tab(self):
+        html = self.render("Note.md", "[spec](files/spec.pdf) ![[spec.pdf]]")
+        self.assertEqual(html.count('href="/api/file?path=files%2Fspec.pdf" target="_blank" rel="noopener noreferrer"'), 2)
+
+    def test_unresolved_attachment_is_a_placeholder(self):
+        html = self.render("Note.md", "![](nope.png) ![[<b>x</b>.png]] ![](../../../etc/y.png)")
+        self.assertEqual(html.count('class="wl missing"'), 3)
+        self.assertNotIn("<img", html)
+        self.assertNotIn("<b>", html)
+
+    def test_other_links_unchanged(self):
+        html = self.render("Note.md", "![](https://example.com/a.png) [x](unknown.txt) [y](other.pdf)")
+        self.assertIn('<img src="https://example.com/a.png"', html)
+        self.assertIn('href="unknown.txt"', html)
+        self.assertIn('href="other.pdf"', html)                                   # not a vault file: untouched
+
+    def export_attachments(self):
+        viewer.init_config(self.root)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                return viewer.export_attachments(self.idx)
+        finally:
+            viewer.init_config(VAULT)
+
+    def test_export_inlines_images_and_placeholders_the_rest(self):
+        att = self.export_attachments()
+        self.assertEqual(sorted(att), ["Archive/pic.png", "img/pic.png", "img/vec.svg"])   # PDF left out
+        self.assertTrue(att["img/pic.png"].startswith("data:image/png;base64,"))
+        html = self.render("Note.md", "![[pic.png]] [spec](files/spec.pdf) ![[spec.pdf]]", export={"attachments": att})
+        self.assertIn('<img src="data:image/png;base64,', html)
+        self.assertEqual(html.count("attachment not included in export"), 4)        # title + text, twice
+        self.assertNotIn("/api/file", html)
+
+    def test_export_limits(self):
+        old = (viewer.EXPORT_FILE_MAX, viewer.EXPORT_TOTAL_MAX)
+        try:
+            viewer.EXPORT_FILE_MAX = len(PNG_1X1)                    # Archive/pic.png is 1 byte bigger
+            self.assertEqual(sorted(self.export_attachments()), ["img/pic.png"])   # the others are bigger
+            viewer.EXPORT_FILE_MAX = 2 * 1024 * 1024
+            viewer.EXPORT_TOTAL_MAX = len(PNG_1X1) * 2           # Archive/pic.png (+1 byte) fits, then nothing else does
+            self.assertEqual(sorted(self.export_attachments()), ["Archive/pic.png"])
+        finally:
+            viewer.EXPORT_FILE_MAX, viewer.EXPORT_TOTAL_MAX = old
+
+
+class AttachmentExportCliTests(unittest.TestCase):
+    def test_export_file_inlines_and_prints_summary(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "vault"
+            root.mkdir()
+            make_attach_vault(root)
+            out = Path(d) / "out.html"
+            r = subprocess.run([sys.executable, str(ROOT / "viewer.py"), "--vault", str(root), "--export", str(out)],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            html = out.read_text(encoding="utf-8")
+        self.assertIn("Attachments: 3 included", r.stdout)
+        self.assertIn("1 not included", r.stdout)
+        self.assertIn("data:image/png;base64,", html)
+        self.assertNotIn("data:application/pdf", html)
+        self.assertNotRegex(html, r'<script[^>]+src=')
 
 
 class GraphXssTests(unittest.TestCase):

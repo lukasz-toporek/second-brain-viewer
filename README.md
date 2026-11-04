@@ -9,7 +9,8 @@ A lightweight local viewer for Markdown knowledge bases. Zero dependencies — P
 - **Wikilink graph** (force-directed, powered by [force-graph](https://github.com/vasturiano/force-graph))
 - **Chat** with your vault via Claude, Anthropic API, or any OpenAI-compatible backend (Ollama etc.)
 - **Live reload** — file watcher auto-refreshes the browser on vault changes
-- **Relative Markdown links** — `[text](../dir/Other%20note.md#Heading)` open the note like a wikilink (resolved against the current note's folder; other relative links such as images are left as they are)
+- **Relative Markdown links** — `[text](../dir/Other%20note.md#Heading)` open the note like a wikilink (resolved against the current note's folder)
+- **Attachments** — `![](pic.png)`, `![[pic.png]]`, `[doc](files/spec.pdf)` show vault images and link PDFs (see below)
 - **Obsidian syntax** — `[[wikilinks]]` (`[[A|alias]]`, `[[dir/A]]`, `[[A#Heading|x]]`), `> [!note]` callouts, a "Linked from" backlinks section
 - **Dataview inline fields** — `[state:: …] [due:: …] [link:: …]` render as chips; open tasks past their `due` date are marked overdue
 - **Mobile layout** — below 580 px a ☰ button at the left of the tab row opens the sidebar as an overlay with a backdrop (closes when a note opens, on Escape, or on a backdrop click)
@@ -76,11 +77,32 @@ name matches first, then body-only matches, at most 50, an empty list for querie
 It is covered by the same `Host` check as the other endpoints. In an exported file (`--export`) the identical
 search runs client-side over the embedded notes.
 
+### Attachments: `/api/file`
+
+Images (`png jpg jpeg gif webp avif bmp ico svg`) and PDFs in the vault are served by
+`GET /api/file?path=<vault-relative path>` with the same checks as `/api/note` (resolved inside the vault, skipped
+files/folders refused, no `\0`). Anything else (`.md`, `.py`, …) gets 403, a missing file 404, a file over 25 MB 413.
+`Content-Type` comes from the extension (never sniffed; `X-Content-Type-Options: nosniff`), and SVGs also get
+`Content-Security-Policy: sandbox; default-src 'none'; style-src 'unsafe-inline'`, so opening one directly cannot run script.
+
+How references resolve:
+
+- **Relative paths** (`![](../img/pic.png)`, `[x](files/a.pdf)`) are resolved against the current note's folder.
+- **Bare names** (`![[pic.png]]`, `![[pic.png|alt]]`, `![[pic.png|300]]` for a width) use a vault-wide name lookup like Obsidian.
+  The server owns that map: `/api/vault` (and the export) carries `"files"` (lower-cased file name → path, with the same
+  `link_deprioritise` rule as notes) and `"file_paths"` (every attachment).
+- Images render as `<img src="/api/file?path=…">`; PDFs become a link opening in a new tab. A reference that
+  matches no vault file shows a dashed "missing" placeholder with the file name.
+
 ### Static export
 
 `--export OUT.html` writes one file containing the UI, both libraries, every note, backlinks and graph data.
 It needs no server or network and opens from `file://` (CSP `connect-src 'none'`, no chat, no live reload).
 **The file contains the full text of every note** — share it only with people who may read the whole vault.
+
+Attachments in an export: images are inlined as `data:` URLs (each ≤ 2 MB, 50 MB in total). PDFs are never inlined, and
+images over a limit are left out; both show an "attachment not included in export" placeholder. `--export` prints a
+summary line (included/skipped counts and total size).
 
 ### Security notes
 
@@ -91,7 +113,7 @@ It needs no server or network and opens from `file://` (CSP `connect-src 'none'`
 - Note names are escaped before force-graph inserts graph hover labels as HTML.
 - The server binds to `127.0.0.1` only and rejects any `Host` other than `localhost:<port>` / `127.0.0.1:<port>` (DNS-rebinding protection).
 - `POST /api/chat` requires `Content-Type: application/json` and the `X-Vault-Viewer: 1` header (sent by the page), and bodies over 1 MB are refused.
-- `/api/note` resolves paths and refuses anything outside the vault, skipped files/folders and non-`.md` files.
+- `/api/note` resolves paths and refuses anything outside the vault, skipped files/folders and non-`.md` files; `/api/file` does the same for the allow-listed attachment types.
 - Note content is never trusted: raw HTML in Markdown is shown as text, and links/images only allow `http(s)`, `mailto`, `#` and relative URLs. Everything inserted via `innerHTML` is escaped.
 - Chat still sends the current note to your configured backend; use `--offline` if that is not acceptable.
 

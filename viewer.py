@@ -181,6 +181,44 @@ def skip(path: Path) -> bool:
     return any(part in SKIP_DIRS for part in path.parts)
 
 
+# Vault attachments served by /api/file (extension -> Content-Type; never guessed from content).
+ATTACH_TYPES: dict = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+    "webp": "image/webp", "avif": "image/avif", "bmp": "image/bmp", "ico": "image/x-icon",
+    "svg": "image/svg+xml", "pdf": "application/pdf",
+}
+ATTACH_MAX_BYTES = 25 * 1024 * 1024        # /api/file refuses larger files (413)
+EXPORT_FILE_MAX = 2 * 1024 * 1024          # --export inlines images up to this size each...
+EXPORT_TOTAL_MAX = 50 * 1024 * 1024        # ...and up to this much in all; PDFs are never inlined
+SVG_CSP = "sandbox; default-src 'none'; style-src 'unsafe-inline'"
+
+
+def attach_ext(path) -> str:
+    """Lower-cased extension (no dot) if `path` is an allowed attachment type, else ''."""
+    ext = Path(str(path)).suffix.lower().lstrip(".")
+    return ext if ext in ATTACH_TYPES else ""
+
+
+def vault_files() -> list:
+    """Sorted absolute paths of every tracked note (.md) and attachment, in one tree walk.
+
+    Attachments are only those with an allowed extension that are not skipped and really live
+    inside the vault (a symlink pointing out of it is left out).
+    """
+    out = []
+    for p in VAULT.rglob("*"):
+        if p.suffix == ".md":
+            if not skip(p):
+                out.append(p)
+        elif attach_ext(p) and not skip(p):
+            try:
+                if p.is_file() and p.resolve().is_relative_to(VAULT):
+                    out.append(p)
+            except OSError:
+                pass
+    return sorted(out)
+
+
 def parse_frontmatter(text: str) -> dict:
     if not text.startswith("---"):
         return {}
@@ -298,11 +336,17 @@ class VaultIndex:
         self.notes: list[dict] = []          # {path, name, type, folder, text}
         self.by_path: dict[str, str] = {}
         self.by_stem: dict[str, str] = {}
+        self.files: dict[str, str] = {}      # lower-cased attachment file name -> path (same clash rules)
+        self.file_paths: list[str] = []      # every attachment path, in vault order
         self.deprioritised = link_deprioritise_prefixes()
-        for path in sorted(VAULT.rglob("*.md")):
-            if skip(path):
-                continue
+        for path in vault_files():
             rel = path.relative_to(VAULT).as_posix()
+            if path.suffix != ".md":
+                self.file_paths.append(rel)
+                cur = self.files.get(path.name.lower())
+                if cur is None or (self.is_deprioritised(cur) and not self.is_deprioritised(rel)):
+                    self.files[path.name.lower()] = rel
+                continue
             text = path.read_text(encoding="utf-8")
             fm = parse_frontmatter(text)
             self.notes.append({
@@ -356,8 +400,10 @@ def get_index() -> VaultIndex:
 
 
 def vault_payload() -> dict:
-    """scan_vault() plus the server-resolved bare-name map ("stems") used by the browser's resolveNote()."""
-    return {**scan_vault(), "stems": get_index().by_stem}
+    """scan_vault() plus the server-resolved bare-name maps used by the browser: "stems" (notes) and
+    "files" (attachments, by lower-cased file name), and the full attachment path list."""
+    idx = get_index()
+    return {**scan_vault(), "stems": idx.by_stem, "files": idx.files, "file_paths": idx.file_paths}
 
 
 def build_graph() -> dict:
@@ -411,11 +457,13 @@ def search_notes(q: str, notes: list) -> list:
 # ── File watcher ────────────────────────────────────────────────────────────
 
 def vault_snapshot() -> dict:
-    """Return {rel_path: mtime} for all tracked .md files."""
+    """Return {rel_path: mtime} for all tracked .md files and attachments."""
     snap = {}
-    for p in VAULT.rglob("*.md"):
-        if not skip(p):
+    for p in vault_files():
+        try:
             snap[p.relative_to(VAULT).as_posix()] = p.stat().st_mtime
+        except OSError:
+            pass
     return snap
 
 
@@ -868,6 +916,7 @@ body {
 .md a.wl { color: var(--ac); border-bottom: 1px dotted rgba(224,112,80,.5); }
 .md a.wl:hover { text-decoration: none; border-bottom-style: solid; }
 .md .wl.missing { color: var(--tx2); border-bottom: 1px dashed var(--tx2); cursor: help; }
+.md img { max-width: 100%; height: auto; }
 
 /* callouts */
 .callout {
@@ -1287,7 +1336,7 @@ let vault = null, tabs = [], activeTab = null, expanded = new Set(), searchQ = "
 // ── Note resolution (mirrors VaultIndex.resolve in viewer.py) ──
 // Bare names are NOT resolved here: the server decides which note a name means (name clashes,
 // "link_deprioritise") and ships the final map as vault.stems.
-let noteIdx = null;
+let noteIdx = null, fileIdx = null;
 function resolveNote(target, pathOnly) {
   if (!vault) return null;
   if (!noteIdx) {
@@ -1309,15 +1358,16 @@ function resolveNote(target, pathOnly) {
 // Path of the note currently being rendered; showNote() sets it before marked.parse (chat bubbles
 // use the active note).
 let currentNotePath = "";
-// Vault-relative path (with .md) a scheme-less, non-# link points to, resolved against the folder of
-// `base` (. and .. normalised, never above the vault root); null if it is not such a .md link.
-function relLinkPath(base, href) {
+// Vault-relative path a scheme-less, non-# link points to, resolved against the folder of `base`
+// (. and .. normalised, never above the vault root); null if it is not a link ending in `ext`
+// (default: .md notes; the attachment code passes ATT_EXT).
+function relLinkPath(base, href, ext) {
   const u = String(href ?? "").trim();
   if (!u || u[0] === "#" || /^[a-z][a-z0-9+.-]*:/i.test(u) || /^[\\/]{2}/.test(u)) return null;
   let p = u.split(/[#?]/)[0];
   try { p = decodeURIComponent(p); } catch (_) { return null; }
   p = p.replace(/\\/g, "/");
-  if (!/\.md$/i.test(p)) return null;
+  if (!(ext || /\.md$/i).test(p)) return null;
   const parts = p.startsWith("/") ? [] : String(base || "").split("/").slice(0, -1);
   for (const seg of p.split("/")) {
     if (seg === "" || seg === ".") continue;
@@ -1325,6 +1375,43 @@ function relLinkPath(base, href) {
   }
   return parts.join("/");
 }
+
+// ── Attachments (images, PDFs): /api/file?path=… live, data: URLs (EXPORT.attachments) in an export ──
+// The server owns the name -> path map (vault.files, name clashes and "link_deprioritise" included).
+const IMG_EXT = /\.(png|jpe?g|gif|webp|avif|bmp|ico|svg)$/i, ATT_EXT = /\.(png|jpe?g|gif|webp|avif|bmp|ico|svg|pdf)$/i;
+function attachmentPath(target, wiki) {
+  if (!vault) return null;
+  if (!fileIdx) {
+    fileIdx = { byPath: new Map(), names: new Map(Object.entries(vault.files || {})) };
+    (vault.file_paths || []).forEach(p => fileIdx.byPath.set(p.toLowerCase(), p));
+  }
+  if (wiki) {           // ![[pic.png]] / ![[img/pic.png]]: vault path, else Obsidian's vault-wide name lookup
+    const t = String(target || "").trim().replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
+    const hit = fileIdx.byPath.get(t);
+    if (hit) return hit;
+    const named = fileIdx.names.get(t.split("/").pop());
+    return named && (t.indexOf("/") < 0 || named.toLowerCase().endsWith("/" + t)) ? named : null;
+  }
+  const rel = relLinkPath(currentNotePath, target, ATT_EXT);    // relative to the note's folder
+  return rel === null ? null : (fileIdx.byPath.get(rel.toLowerCase()) || null);
+}
+function attachmentSrc(path) {
+  if (EXPORT) return (EXPORT.attachments || {})[path] || null;
+  return "/api/file?path=" + encodeURIComponent(path);
+}
+const MISSING_ATT = name => `<span class="wl missing" title="Attachment not found">${esc(name)}</span>`;
+const SKIPPED_ATT = name => `<span class="wl missing" title="attachment not included in export">${esc(name)} (attachment not included in export)</span>`;
+// An image or PDF as HTML. `path` is null when it did not resolve to a vault file.
+function attachmentHtml(path, name, alt, title, width) {
+  if (!path) return MISSING_ATT(name);
+  const src = attachmentSrc(path);
+  if (!src) return SKIPPED_ATT(name);
+  if (!IMG_EXT.test(path))
+    return `<a class="wl att" href="${esc(src)}" target="_blank" rel="noopener noreferrer">📄 ${esc(name)}</a>`;
+  return `<img src="${esc(src)}" alt="${esc(alt)}"${title ? ` title="${esc(title)}"` : ""}` +
+    `${width ? ` width="${esc(width)}"` : ""} loading="lazy">`;
+}
+const baseName = p => { try { return decodeURIComponent(String(p).split(/[#?]/)[0]).split(/[\\/]/).pop(); } catch (_) { return String(p); } };
 
 // ── Markdown extensions: wikilinks + callouts ──
 if (typeof marked !== "undefined") {
@@ -1341,6 +1428,11 @@ if (typeof marked !== "undefined") {
           label: (m[4] || "").trim() };
       },
       renderer(tok) {
+        if (ATT_EXT.test(tok.target)) {      // ![[pic.png]], ![[pic.png|alt]], ![[pic.png|300]]; [[a.pdf]]
+          const size = /^\d+(?:x\d+)?$/.exec(tok.label);
+          return attachmentHtml(attachmentPath(tok.target, true), tok.target.split("/").pop(),
+            size ? tok.target : (tok.label || tok.target), "", size ? tok.label.split("x")[0] : "");
+        }
         const label = tok.label || (tok.heading ? `${tok.target} › ${tok.heading}` : tok.target);
         const n = resolveNote(tok.target);
         if (!n) return `<span class="wl missing" title="Note not found">${esc(label)}</span>`;
@@ -1357,6 +1449,12 @@ if (typeof marked !== "undefined") {
           return n ? `<a class="wl" href="#" data-path="${esc(n.path)}">${text}</a>`
                    : `<span class="wl missing" title="Note not found">${text}</span>`;
         }
+        const apath = attachmentPath(href, false);
+        if (apath) {                     // [doc](files/spec.pdf): a vault attachment
+          const src = attachmentSrc(apath);
+          return src ? `<a class="wl att" href="${esc(src)}" target="_blank" rel="noopener noreferrer">${text}</a>`
+                     : SKIPPED_ATT(baseName(href));
+        }
         const u = safeUrl(href);
         if (u === null) return text;
         const t = title ? ` title="${esc(title)}"` : "";
@@ -1365,6 +1463,8 @@ if (typeof marked !== "undefined") {
         return `<a href="${esc(u)}"${t}${ext}>${text}</a>`;
       },
       image(href, title, text) {
+        if (relLinkPath(currentNotePath, href, ATT_EXT) !== null)      // ![](pic.png), ![](../img/a.pdf)
+          return attachmentHtml(attachmentPath(href, false), baseName(href), text, title);
         const u = safeUrl(href);
         if (u === null) return esc(text);
         return `<img src="${esc(u)}" alt="${esc(text)}"${title ? ` title="${esc(title)}"` : ""}>`;
@@ -1626,7 +1726,7 @@ async function load() {
   try {
     const first = !vault;
     vault = await api("vault");
-    noteIdx = null;
+    noteIdx = null; fileIdx = null;
     if (searchQ) runSearch(); else renderTree();
     if (first) routeFromHash();
   } catch(e) {
@@ -2092,6 +2192,23 @@ def safe_note_path(rel: str):
     return full
 
 
+def safe_file_path(rel: str):
+    """Like safe_note_path() but for attachments: allowed extension (ATTACH_TYPES), never .md."""
+    if not rel or "\0" in rel:
+        return None
+    try:
+        root = VAULT.resolve()
+        full = (root / rel).resolve()
+        if not full.is_relative_to(root):
+            return None
+        relp = full.relative_to(root)
+    except (ValueError, OSError):
+        return None
+    if not attach_ext(full) or skip(relp):
+        return None
+    return full
+
+
 class VaultHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -2157,6 +2274,25 @@ class VaultHandler(BaseHTTPRequestHandler):
             }
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self._respond(200, "application/json; charset=utf-8", body, cache=False)
+
+        elif parsed.path == "/api/file":
+            fp = safe_file_path(parse_qs(parsed.query).get("path", [""])[0])
+            if fp is None:
+                self._respond(403, "text/plain", b"Forbidden")
+                return
+            try:
+                size = fp.stat().st_size if fp.is_file() else -1
+            except OSError:
+                size = -1
+            if size < 0:
+                self._respond(404, "text/plain", b"Not found")
+                return
+            if size > ATTACH_MAX_BYTES:
+                self._respond(413, "text/plain", b"File too large")
+                return
+            ext = attach_ext(fp)
+            self._respond(200, ATTACH_TYPES[ext], fp.read_bytes(), cache=False,
+                          csp=SVG_CSP if ext == "svg" else None)
 
         elif parsed.path == "/api/watch":
             self.send_response(200)
@@ -2389,7 +2525,7 @@ class VaultHandler(BaseHTTPRequestHandler):
         except Exception as e:
             sse_error(str(e))
 
-    def _respond(self, code, ct, body, cache=True, close=False):
+    def _respond(self, code, ct, body, cache=True, close=False, csp=None):
         self.send_response(code)
         if close:
             # an unread request body may still be on the wire: don't let the client reuse the socket
@@ -2399,11 +2535,38 @@ class VaultHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", len(body))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", CSP_OFFLINE if OFFLINE else CSP_ONLINE)
+        self.send_header("Content-Security-Policy", csp or (CSP_OFFLINE if OFFLINE else CSP_ONLINE))
         if not cache:
             self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
+
+
+def export_attachments(idx: "VaultIndex") -> dict:
+    """{path: data: URL} for the images that fit the export limits; prints a summary line.
+
+    Each image must be <= EXPORT_FILE_MAX and the total <= EXPORT_TOTAL_MAX. PDFs and anything over
+    a limit are left out; the page shows an "attachment not included in export" placeholder instead.
+    """
+    out: dict = {}
+    total = skipped = 0
+    for rel in idx.file_paths:
+        ext = attach_ext(rel)
+        fp = VAULT / rel
+        try:
+            size = fp.stat().st_size
+        except OSError:
+            skipped += 1
+            continue
+        if ext == "pdf" or size > EXPORT_FILE_MAX or total + size > EXPORT_TOTAL_MAX:
+            skipped += 1
+            continue
+        out[rel] = f"data:{ATTACH_TYPES[ext]};base64," + base64.b64encode(fp.read_bytes()).decode("ascii")
+        total += size
+    if idx.file_paths:
+        print(f"✓ Attachments: {len(out)} included ({total // 1024} KiB), {skipped} not included "
+              f"(PDFs, or over {EXPORT_FILE_MAX // (1024 * 1024)} MB each / {EXPORT_TOTAL_MAX // (1024 * 1024)} MB total)")
+    return out
 
 
 def export_html(out_path: Path) -> None:
@@ -2417,7 +2580,9 @@ def export_html(out_path: Path) -> None:
             "type": fm.get("type", ""), "status": fm.get("status", ""),
             "backlinks": idx.backlinks_for(n["path"]),
         }
-    html = render_page("export", {"vault": vault_payload(), "graph": build_graph(), "notes": notes})
+    attachments = export_attachments(idx)
+    html = render_page("export", {"vault": vault_payload(), "graph": build_graph(), "notes": notes,
+                                  "attachments": attachments})
     out_path.write_text(html, encoding="utf-8")
     print(f"✓ Exported {len(notes)} notes → {out_path} ({out_path.stat().st_size // 1024} KiB)")
     print("⚠ WARNING: this file contains the full content of every note in the vault. "
