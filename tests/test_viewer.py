@@ -1,4 +1,13 @@
-"""Tests for viewer.py (stdlib unittest). Run: python3 -m unittest discover tests"""
+"""Tests for viewer.py (stdlib unittest). Run: python3 -m unittest discover tests
+
+Paths rule: the viewer works with RESOLVED paths (VAULT, CONFIG_PATH, PLUGINS, ... are
+all .resolve()d, the symlink safety checks depend on it). On macOS the temp folder is
+reached through a symlink (/var -> /private/var), so a test must compare resolved
+paths: `self.root.resolve() / "x"`, never `self.root / "x"`, against a viewer path.
+Simulate that on any OS:
+    B=$(mktemp -d); mkdir $B/real; ln -s $B/real $B/link
+    TMPDIR=$B/link python3 -m unittest discover tests
+"""
 import base64
 import contextlib
 import io
@@ -1710,13 +1719,14 @@ class PluginsDisabledTests(unittest.TestCase):
         child.mkdir()
         with contextlib.redirect_stderr(io.StringIO()):       # its plug-in file is not under child/: a warning
             viewer.init_config(child)
-        self.assertEqual(viewer.CONFIG_PATH, self.root / ".viewer.json")
+        real_cfg = self.root.resolve() / ".viewer.json"       # the viewer works with resolved paths
+        self.assertEqual(viewer.CONFIG_PATH, real_cfg)
         viewer.init_config(self.root)
-        self.assertEqual(viewer.CONFIG_PATH, self.root / ".viewer.json")
+        self.assertEqual(viewer.CONFIG_PATH, real_cfg)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             viewer.print_plugins()
-        self.assertIn(f"Plug-ins enabled by {self.root / '.viewer.json'}", buf.getvalue())
+        self.assertIn(f"Plug-ins enabled by {real_cfg}", buf.getvalue())
         self.assertIn("Plug-in enabled: tasks-board", buf.getvalue())
 
 
