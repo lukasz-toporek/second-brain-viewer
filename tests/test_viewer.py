@@ -1,5 +1,8 @@
 """Tests for viewer.py (stdlib unittest). Run: python3 -m unittest discover tests"""
+import base64
+import hashlib
 import http.client
+import importlib.util
 import json
 import re
 import shutil
@@ -130,9 +133,34 @@ class OnlineTests(unittest.TestCase):
 
     def test_page_online_has_chat_and_cdn(self):
         _, h, b = self.s.req("GET", "/")
-        self.assertNotIn("Content-Security-Policy", h)
+        self.assertEqual(h["Content-Security-Policy"], viewer.CSP_ONLINE)
         self.assertIn(b"cdn.jsdelivr.net", b)
+        self.assertNotIn(b"cdnjs.cloudflare.com", b)
         self.assertIn(b'"chat": true', b)
+
+    def test_online_csp_value(self):
+        csp = viewer.CSP_ONLINE
+        self.assertEqual(csp, "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+                              "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+                              "font-src https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self'")
+        for path in ("/api/vault", "/api/graph"):
+            self.assertEqual(self.s.req("GET", path)[1]["Content-Security-Policy"], csp)
+
+    def test_online_libs_have_sri_matching_vendor_files(self):
+        html = self.s.req("GET", "/")[2].decode()
+        tags = re.findall(r'<script src="(https://cdn[^"]+)"([^>]*)></script>', html)
+        self.assertEqual(len(tags), 2)
+        by_url = {u: a for u, a in tags}
+        for name, url in viewer.CDN_URLS.items():
+            digest = base64.b64encode(hashlib.sha384((ROOT / "vendor" / name).read_bytes()).digest()).decode()
+            self.assertIn(f'integrity="sha384-{digest}"', by_url[url], name)
+            self.assertIn('crossorigin="anonymous"', by_url[url], name)
+
+    def test_cdn_urls_match_fetch_vendor(self):
+        spec = importlib.util.spec_from_file_location("fetch_vendor", ROOT / "tools" / "fetch-vendor.py")
+        fv = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fv)
+        self.assertEqual({k: v["url"] for k, v in fv.LIBS.items()}, viewer.CDN_URLS)
 
     def test_title_is_escaped(self):
         self.assertNotIn("<img", viewer.render_page("online").split("<body>")[1].split("<script")[0])
@@ -160,6 +188,10 @@ class OfflineTests(unittest.TestCase):
         self.assertNotRegex(b.decode(), r'(src|href)="https?://')
         self.assertIn(b'"chat": false', b)
         self.assertIn("Content-Security-Policy", self.s.req("GET", "/api/vault")[1])
+        self.assertEqual(
+            viewer.CSP_OFFLINE,
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; connect-src 'self'")
 
     def test_vendor_allow_list(self):
         for name in viewer.VENDOR_FILES:
@@ -228,6 +260,18 @@ class CliTests(unittest.TestCase):
                                 "--serve", "--offline"], capture_output=True, text=True, timeout=20)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("fetch-vendor.py", r.stderr)
+
+    def test_online_without_vendor_still_renders_without_sri(self):
+        with tempfile.TemporaryDirectory() as d:
+            shutil.copy(ROOT / "viewer.py", d)               # no vendor/ next to this copy
+            code = ("import sys; sys.path.insert(0, sys.argv[1]); import viewer; "
+                    "viewer.init_config(__import__('pathlib').Path(sys.argv[2])); "
+                    "viewer.render_page('online'); print(viewer.render_page('online'))")
+            r = subprocess.run([sys.executable, "-c", code, d, str(VAULT)], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("https://cdn.jsdelivr.net/npm/marked@9.1.6/marked.min.js", r.stdout)
+        self.assertNotIn("integrity=", r.stdout)
+        self.assertEqual(r.stderr.count("warning:"), 1)      # warned once, not per render
 
     def test_page_script_syntax(self):
         node = shutil.which("node")

@@ -13,6 +13,8 @@ Usage:
     python3 viewer.py --export OUT.html      # one self-contained file (contains all notes!)
 """
 
+import base64
+import hashlib
 import json
 import os
 import re
@@ -1798,13 +1800,49 @@ load();
 
 CSP_OFFLINE = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
                "style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'")
+CSP_ONLINE = ("default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+              "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
+              "img-src 'self' data: https:; connect-src 'self'")
 
 VENDOR_DIR: Path = Path(__file__).resolve().parent / "vendor"
 VENDOR_FILES = ("marked.min.js", "force-graph.min.js")
-CDN_LIBS = (
-    '<script src="https://cdn.jsdelivr.net/npm/force-graph@1.43.5/dist/force-graph.min.js"></script>\n'
-    '<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>'
-)
+# Same jsDelivr URLs as tools/fetch-vendor.py, so the files in vendor/ are byte-identical to what
+# the browser downloads in online mode and the SRI hashes below can be computed from them.
+CDN_URLS = {
+    "marked.min.js": "https://cdn.jsdelivr.net/npm/marked@9.1.6/marked.min.js",
+    "force-graph.min.js": "https://cdn.jsdelivr.net/npm/force-graph@1.43.5/dist/force-graph.min.js",
+}
+CDN_ORDER = ("force-graph.min.js", "marked.min.js")
+_SRI_CACHE: dict = {}
+_SRI_WARNED: bool = False
+
+
+def vendor_sri() -> dict:
+    """{file: 'sha384-<base64>'} computed from vendor/ (cached). Missing files are left out."""
+    global _SRI_WARNED
+    if not _SRI_CACHE:
+        for f in VENDOR_FILES:
+            p = VENDOR_DIR / f
+            if p.is_file():
+                _SRI_CACHE[f] = "sha384-" + base64.b64encode(hashlib.sha384(p.read_bytes()).digest()).decode()
+        missing = [f for f in VENDOR_FILES if f not in _SRI_CACHE]
+        if missing and not _SRI_WARNED:
+            _SRI_WARNED = True
+            print(f"warning: {', '.join(missing)} not found in {VENDOR_DIR}; online mode will load "
+                  f"them from the CDN without Subresource Integrity "
+                  f"(run tools/fetch-vendor.py to enable it)", file=sys.stderr)
+    return _SRI_CACHE
+
+
+def cdn_libs() -> str:
+    sri = vendor_sri()
+    tags = []
+    for f in CDN_ORDER:
+        attrs = f' integrity="{sri[f]}" crossorigin="anonymous"' if f in sri else ""
+        tags.append(f'<script src="{CDN_URLS[f]}"{attrs}></script>')
+    return "\n".join(tags)
+
+
 CDN_FONTS = ('<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600'
              '&family=JetBrains+Mono:wght@400&display=swap">')
 
@@ -1827,7 +1865,7 @@ def render_page(mode: str = "online", data: dict = None) -> str:
     flags = {"chat": mode == "online", "watch": mode != "export", "export": mode == "export"}
     head, libs, data_tag = "", "", ""
     if mode == "online":
-        head, libs = CDN_FONTS, CDN_LIBS
+        head, libs = CDN_FONTS, cdn_libs()
     elif mode == "offline":
         libs = "\n".join(f'<script src="/vendor/{f}"></script>' for f in VENDOR_FILES)
     else:
@@ -1935,8 +1973,7 @@ class VaultHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
-            if OFFLINE:
-                self.send_header("Content-Security-Policy", CSP_OFFLINE)
+            self.send_header("Content-Security-Policy", CSP_OFFLINE if OFFLINE else CSP_ONLINE)
             self.end_headers()
             last = vault_snapshot()
             ticks = 0
@@ -2173,8 +2210,7 @@ class VaultHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", len(body))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        if OFFLINE:
-            self.send_header("Content-Security-Policy", CSP_OFFLINE)
+        self.send_header("Content-Security-Policy", CSP_OFFLINE if OFFLINE else CSP_ONLINE)
         if not cache:
             self.send_header("Cache-Control", "no-cache")
         self.end_headers()
@@ -2246,6 +2282,8 @@ def main() -> None:
     OFFLINE = "--offline" in args or CONFIG.get("offline") is True
     if OFFLINE and "--serve" in args:
         check_vendor()
+    elif "--serve" in args:
+        vendor_sri()                      # warn once at startup if online mode can't pin the CDN files
 
     if "--serve" in args:
         port = 5001
