@@ -1053,6 +1053,11 @@ body {
 
 .fnotes { padding: 0 4px 2px 22px; }
 .fnotes[hidden] { display: none; }
+/* nested folders: ~13px per level (--depth is also set on each .folder) */
+.folder.sub > .fhd { margin: 0; padding: 4px 8px 4px 4px; }
+.folder.sub > .fnotes { padding: 0 0 2px 13px; }
+.fi.sm { width: 14px; height: 14px; border-radius: 4px; font-size: 8px; }
+.fhd:focus-visible, .ni:focus-visible { outline: 2px solid var(--ac); outline-offset: -2px; }
 
 /* ── Note row in sidebar ── */
 .ni {
@@ -1720,6 +1725,66 @@ function folderBadge(path, light = isLight(), fm = FM) {
 const chipColor = (key, v) => key === "type" ? tcol(v) : key === "status" ? "var(--k-green)" : "var(--k-grey)";
 const chipStyle = c => `background:color-mix(in srgb, ${esc(c)} 12%, transparent);color:${esc(c)}`;
 
+// ── Nested folder tree (pure: data in, nodes / HTML out) ──
+// Number-aware, case-insensitive ordering: "2-x" before "10-x", "a" next to "A".
+const natCmp = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: "base" })
+  || (a < b ? -1 : a > b ? 1 : 0);
+const newFolderNode = (path, name) => ({ path, name, label: folderLabel(name), folders: [], notes: [], count: 0 });
+// `sections` is vault.folders ([{folder, notes: [{path, name, type}]}], top level in the server's
+// folder_order). Returns one folder node per section; a node is {path, name, label, folders, notes, count}
+// where `path` is the vault-relative folder path (the key of the expanded state) and `count` is recursive.
+// Subfolders sort before notes, both by natCmp; the top level keeps the server's order.
+function buildTree(sections) {
+  const sortNode = node => {
+    node.folders.sort((a, b) => natCmp(a.name, b.name));
+    node.notes.sort((a, b) => natCmp(a.name, b.name) || natCmp(a.path, b.path));
+    node.folders.forEach(sortNode);
+    node.count = node.notes.length + node.folders.reduce((n, f) => n + f.count, 0);
+  };
+  return sections.map(sec => {
+    const top = newFolderNode(sec.folder, sec.folder);
+    const kids = new Map([["", top]]);
+    for (const n of sec.notes) {
+      const dirs = sec.folder === "(vault root)" ? [] : n.path.split("/").slice(1, -1);
+      let node = top, path = sec.folder;
+      for (const d of dirs) {
+        path += "/" + d;
+        let child = kids.get(path);
+        if (!child) { child = newFolderNode(path, d); kids.set(path, child); node.folders.push(child); }
+        node = child;
+      }
+      node.notes.push(n);
+    }
+    sortNode(top);
+    return top;
+  });
+}
+// Every folder path in `nodes`, to drop expanded-state entries of folders that no longer exist.
+function folderPaths(nodes, out = new Set()) {
+  nodes.forEach(n => { out.add(n.path); folderPaths(n.folders, out); });
+  return out;
+}
+const CHEVRON = `<svg class="ch" aria-hidden="true" focusable="false" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 4 10 8 6 12"/></svg>`;
+// ctx: {expanded: Set of folder paths, active: note path, light: bool}
+function folderHtml(node, depth, ctx) {
+  const open = ctx.expanded.has(node.path), b = folderBadge(node.path, ctx.light);
+  return `<div class="folder${depth ? " sub" : ""}" role="none" style="--depth:${depth}">` +
+    `<div class="fhd${open ? " open" : ""}" role="treeitem" aria-expanded="${open}" aria-level="${depth + 1}" tabindex="-1" data-fpath="${esc(node.path)}">` +
+    CHEVRON +
+    `<span class="fi${depth ? " sm" : ""}" aria-hidden="true" style="background:${esc(b.bg)};color:${esc(b.fg)}">${esc(b.letter)}</span>` +
+    `<span class="fn">${esc(node.label)}</span><span class="fc">${node.count}</span></div>` +
+    `<div class="fnotes" role="group"${open ? "" : " hidden"}>` +
+    node.folders.map(f => folderHtml(f, depth + 1, ctx)).join("") +
+    node.notes.map(n => noteRowHtml(n, depth + 1, ctx)).join("") + `</div></div>`;
+}
+function noteRowHtml(n, level, ctx) {
+  const on = ctx.active === n.path;
+  return `<div class="ni${on ? " active" : ""}" role="treeitem" aria-level="${level + 1}" aria-selected="${on}" tabindex="-1" ` +
+    `data-path="${esc(n.path)}" title="${esc(n.path)}">` +
+    `<span class="nd" data-type="${esc(n.type)}" style="background:${esc(tcol(n.type, ctx.light))}"></span>` +
+    `<span class="nn">${esc(n.name)}</span></div>`;
+}
+
 // Full-text search over {path, name, content} notes: mirrors search_notes() in viewer.py
 // (the live server answers /api/search; --export runs this over the embedded notes).
 const SEARCH_LIMIT = 50, SEARCH_MIN = 2;
@@ -2146,58 +2211,67 @@ document.addEventListener("click", e => {
 });
 
 // ── Tree ──────────────────────────────────────────────────────
-function renderTree() {
-  const tree = document.getElementById("tree");
-  if (!vault) return;
-  tree.innerHTML = "";
-
-  vault.folders.forEach(sec => {
-    const notes = sec.notes;
-
-    const fm = folderBadge(sec.folder);
-    const open = expanded.has(sec.folder);
-    const label = folderLabel(sec.folder);
-
-    const el = document.createElement("div");
-    el.className = "folder";
-
-    const hd = document.createElement("div");
-    hd.className = "fhd" + (open ? " open" : "");
-    hd.innerHTML =
-      `<svg class="ch" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 4 10 8 6 12"/></svg>` +
-      `<span class="fi" style="background:${esc(fm.bg)};color:${esc(fm.fg)}">${esc(fm.letter)}</span>` +
-      `<span class="fn">${esc(label)}</span>` +
-      `<span class="fc">${notes.length}</span>`;
-
-    const fnotes = document.createElement("div");
-    fnotes.className = "fnotes";
-    if (!open) fnotes.hidden = true;
-
-    notes.forEach(n => {
-      const ni = document.createElement("div");
-      ni.className = "ni" + (activeTab === n.path ? " active" : "");
-      ni.dataset.path = n.path;
-      ni.innerHTML =
-        `<span class="nd" data-type="${esc(n.type)}" style="background:${esc(tcol(n.type))}"></span>` +
-        `<span class="nn">${esc(n.name)}</span>`;
-      ni.addEventListener("click", () => openNote({
-        path: n.path, name: n.name, type: n.type, folder: sec.folder
-      }));
-      fnotes.appendChild(ni);
-    });
-
-    hd.addEventListener("click", () => {
-      const now = !hd.classList.contains("open");
-      hd.classList.toggle("open", now);
-      fnotes.hidden = !now;
-      now ? expanded.add(sec.folder) : expanded.delete(sec.folder);
-    });
-
-    el.appendChild(hd);
-    el.appendChild(fnotes);
-    tree.appendChild(el);
-  });
+// Expanded folders are remembered by vault-relative folder path, per vault title, in localStorage.
+const treeKey = () => "sbv-tree:" + (FLAGS.title || "");
+function loadExpanded() {
+  try {
+    const a = JSON.parse(localStorage.getItem(treeKey()) || "[]");
+    return new Set(Array.isArray(a) ? a.filter(x => typeof x === "string") : []);
+  } catch (_) { return new Set(); }
 }
+function saveExpanded() {
+  try { localStorage.setItem(treeKey(), JSON.stringify([...expanded])); } catch (_) {}
+}
+let treeRoots = [], noteEls = new Map(), folderEls = new Map(), activeEl = null;
+const treeEl = () => document.getElementById("tree");
+
+// Index the rows of whatever the sidebar shows now (tree or search results).
+function indexRows() {
+  noteEls = new Map(); folderEls = new Map(); activeEl = null;
+  treeEl().querySelectorAll(".ni").forEach(el => { noteEls.set(el.dataset.path, el); if (el.classList.contains("active")) activeEl = el; });
+  treeEl().querySelectorAll(".fhd").forEach(el => folderEls.set(el.dataset.fpath, el));
+  const first = activeEl || treeEl().querySelector(".fhd, .ni");
+  if (first) first.tabIndex = 0;                                   // roving tabindex: one stop in the tree
+}
+
+function renderTree() {
+  const tree = treeEl();
+  if (!vault) return;
+  const keep = tree.scrollTop, f = document.activeElement;
+  const focus = f && tree.contains(f) ? (f.dataset.fpath != null ? ["fpath", f.dataset.fpath] : ["path", f.dataset.path]) : null;
+  treeRoots = buildTree(vault.folders);
+  tree.setAttribute("role", "tree");
+  tree.setAttribute("aria-label", "Notes");
+  const ctx = { expanded, active: activeTab, light: isLight() };
+  tree.innerHTML = treeRoots.map(n => folderHtml(n, 0, ctx)).join("");
+  indexRows();
+  tree.scrollTop = keep;
+  if (focus) {                                                      // live reload / theme change must not drop keyboard focus
+    const el = focus[0] === "fpath" ? folderEls.get(focus[1]) : noteEls.get(focus[1]);
+    if (el) el.focus({ preventScroll: true });
+  }
+}
+
+function setFolderOpen(fpath, open) {
+  open ? expanded.add(fpath) : expanded.delete(fpath);
+  const hd = folderEls.get(fpath);
+  if (hd) {
+    hd.classList.toggle("open", open);
+    hd.setAttribute("aria-expanded", String(open));
+    hd.nextElementSibling.hidden = !open;
+  }
+  saveExpanded();
+}
+
+// One delegated handler for the whole tree (cheap for thousands of rows).
+treeEl().addEventListener("click", e => {
+  const hd = e.target.closest(".fhd");
+  if (hd) { setFolderOpen(hd.dataset.fpath, !hd.classList.contains("open")); return; }
+  const ni = e.target.closest(".ni:not(.sr)");
+  if (!ni) return;
+  const n = findNote(ni.dataset.path);
+  if (n) openNote({ path: n.path, name: n.name, type: n.type, folder: n.path.split("/")[0] });
+});
 
 // ── Tabs ──────────────────────────────────────────────────────
 function renderTabs() {
@@ -2214,13 +2288,20 @@ function renderTabs() {
 
 const switchTo = t => openNote(t);
 
+// Only the previously and the newly active row change; the tree is not re-rendered.
 function highlight() {
-  document.querySelectorAll(".ni").forEach(el =>
-    el.classList.toggle("active", el.dataset.path === activeTab));
+  if (activeEl) { activeEl.classList.remove("active"); activeEl.setAttribute("aria-selected", "false"); }
+  activeEl = activeTab ? noteEls.get(activeTab) || null : null;
+  if (activeEl) { activeEl.classList.add("active"); activeEl.setAttribute("aria-selected", "true"); }
 }
 
 // ── Open note ─────────────────────────────────────────────────
-const findNote = path => vault?.folders.flatMap(s => s.notes).find(n => n.path === path);
+let noteByPath = null;                       // rebuilt after every load()
+const findNote = path => {
+  if (!vault) return undefined;
+  if (!noteByPath) { noteByPath = new Map(); vault.folders.forEach(s => s.notes.forEach(n => noteByPath.set(n.path, n))); }
+  return noteByPath.get(path);
+};
 const hashFor = path => "#" + encodeURIComponent(path);
 
 // Opens (or switches to) a note tab. activeTab is set *before* the hash is written, so the
@@ -2340,7 +2421,13 @@ async function load() {
   try {
     const first = !vault;
     vault = await api("vault");
-    noteIdx = null; fileIdx = null;
+    noteIdx = null; fileIdx = null; noteByPath = null;
+    if (first) expanded = loadExpanded();
+    {                                                          // forget folders that no longer exist
+      const live = folderPaths(buildTree(vault.folders)), n = expanded.size;
+      expanded = new Set([...expanded].filter(p => live.has(p)));
+      if (expanded.size !== n) saveExpanded();
+    }
     if (searchQ) runSearch(); else renderTree();
     if (first) routeFromHash(); else fireVaultChange();       // plug-ins: onVaultChange
   } catch(e) {
@@ -2357,7 +2444,8 @@ function renderSearch(results) {
   lastResults = results;
   const tree = document.getElementById("tree");
   tree.innerHTML = "";
-  if (!results.length) { tree.innerHTML = `<div class="loading">No results</div>`; return; }
+  tree.setAttribute("role", "listbox");
+  if (!results.length) { tree.innerHTML = `<div class="loading">No results</div>`; indexRows(); return; }
   results.forEach(r => {
     const n = findNote(r.path) || {};
     const el = document.createElement("div");
@@ -2372,6 +2460,9 @@ function renderSearch(results) {
       path: r.path, name: r.name, type: n.type || "", folder: r.folder }));
     tree.appendChild(el);
   });
+  tree.setAttribute("role", "listbox");
+  tree.querySelectorAll(".ni").forEach(el => { el.setAttribute("role", "option"); el.tabIndex = -1; });
+  indexRows();
 }
 async function runSearch() {
   const seq = ++searchSeq, q = searchQ;
@@ -2855,7 +2946,7 @@ def render_page(mode: str = "online", data: dict = None) -> str:
     flags = {"chat": mode == "online", "watch": mode != "export", "export": mode == "export",
              # offline and export never load remote images; online follows the "remote_images" setting
              "remote_images": REMOTE_IMAGES if mode == "online" else "block",
-             "plugins": list(PLUGINS), "theme": THEME}
+             "plugins": list(PLUGINS), "theme": THEME, "title": CONFIG.get("title", VAULT.name)}
     head, libs, data_tag = "", "", ""
     if mode == "online":
         head, libs = CDN_FONTS, cdn_libs()

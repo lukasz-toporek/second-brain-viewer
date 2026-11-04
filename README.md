@@ -4,7 +4,11 @@ A lightweight local viewer for Markdown knowledge bases. Zero dependencies — P
 
 ## Features
 
-- **File tree** sidebar with folder grouping and **full-text search** (see below)
+- **Nested file tree** sidebar and **full-text search** (see below). Folders nest to any depth: sub-folders first, then notes,
+  both sorted case-insensitively and number-aware (`2-x` before `10-x`); every folder shows a chevron, its label (number prefix
+  stripped at every level) and a recursive note count, and expands on its own. `folder_order` still orders the top level and
+  `(vault root)` notes stay in their own group. Which folders are open is remembered per vault title in `localStorage`, by
+  vault-relative folder path (entries for folders that no longer exist are dropped); live reload keeps it and the active highlight.
 - **Note rendering** with Markdown and frontmatter chips
 - **Wikilink graph** (force-directed, powered by [force-graph](https://github.com/vasturiano/force-graph))
 - **Chat** with your vault via Claude, Anthropic API, or any OpenAI-compatible backend (Ollama etc.)

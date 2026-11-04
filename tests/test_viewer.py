@@ -2099,6 +2099,111 @@ class LightColourTests(unittest.TestCase):
         self.assertEqual(r["alpha"], ["#888888dd", "#4ecdc444", "var(--x)"])
 
 
+DEEP = ROOT / "tests" / "fixtures" / "vault-deep"
+
+
+class NestedTreeTests(unittest.TestCase):
+    """The sidebar tree is built in the page from notes[*].path (/api/vault is unchanged)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.s = Server(vault=DEEP)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.s.stop()
+        viewer.init_config(VAULT)
+
+    def vault_json(self):
+        st, _, body = self.s.req("GET", "/api/vault")
+        self.assertEqual(st, 200)
+        return json.loads(body)
+
+    def test_every_note_path_appears_exactly_once_in_the_tree_data(self):
+        data = self.vault_json()
+        paths = [n["path"] for sec in data["folders"] for n in sec["notes"]]
+        on_disk = sorted(p.relative_to(DEEP.resolve()).as_posix() for p in DEEP.resolve().rglob("*.md"))
+        self.assertEqual(sorted(paths), on_disk)
+        self.assertEqual(len(paths), len(set(paths)))
+        self.assertTrue(any(p.count("/") >= 3 for p in paths))                 # at least 3 folder levels
+        self.assertEqual(set(data), {"generated", "notes", "folders", "stems", "files", "file_paths"})   # API unchanged
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_build_tree_nesting_order_counts_and_labels(self):
+        data = self.vault_json()
+        r = run_page_js(f"""
+          const roots = buildTree({json.dumps(data["folders"])});
+          const strip = n => ({{path: n.path, label: n.label, count: n.count,
+            folders: n.folders.map(strip), notes: n.notes.map(x => x.name)}});
+          console.log(JSON.stringify(roots.map(strip)));""", export_data=None)
+        by = {n["path"]: n for n in r}
+        self.assertEqual([n["path"] for n in r], ["(vault root)", "00-inbox", "10-knowledge", "20-projects"])   # server order kept
+        k = by["10-knowledge"]
+        self.assertEqual(k["label"], "knowledge")                              # number prefix stripped
+        self.assertEqual(k["count"], 7)                                         # recursive
+        # sub-folders first, number-aware and case-insensitive: 2-first < 10-second < deep < żółw
+        self.assertEqual([f["path"] for f in k["folders"]],
+                         ["10-knowledge/2-first", "10-knowledge/10-second", "10-knowledge/deep", "10-knowledge/żółw"])
+        self.assertEqual([f["label"] for f in k["folders"]], ["first", "second", "deep", "żółw"])   # prefix stripped at every level
+        self.assertEqual(k["notes"], ["Alpha"])
+        deep = k["folders"][2]
+        self.assertEqual((deep["count"], deep["notes"], [f["path"] for f in deep["folders"]]),
+                         (3, ["Beta"], ["10-knowledge/deep/nested"]))
+        nested = deep["folders"][0]
+        self.assertEqual((nested["notes"], nested["count"]), (["Gamma"], 2))
+        self.assertEqual(nested["folders"][0]["path"], "10-knowledge/deep/nested/more")
+        self.assertEqual(nested["folders"][0]["notes"], ["Delta"])
+        # two notes with the same name in different sub-folders stay two distinct rows
+        p = by["20-projects"]
+        self.assertEqual([f["path"] for f in p["folders"]], ["20-projects/eta", "20-projects/Zeta"])
+        self.assertEqual(p["count"], 2)
+        self.assertEqual(by["(vault root)"]["notes"], ["Root"])                 # vault root stays its own group
+        self.assertEqual(by["(vault root)"]["folders"], [])
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_tree_html_state_aria_and_prune(self):
+        data = self.vault_json()
+        r = run_page_js(f"""
+          const roots = buildTree({json.dumps(data["folders"])});
+          const ctx = {{expanded: new Set(["10-knowledge", "10-knowledge/deep"]), active: "10-knowledge/deep/Beta.md", light: false}};
+          const html = roots.map(n => folderHtml(n, 0, ctx)).join("");
+          const live = [...folderPaths(roots)];
+          console.log(JSON.stringify({{html, live}}));""")
+        html = r["html"]
+        self.assertIn('class="fhd open" role="treeitem" aria-expanded="true" aria-level="1" tabindex="-1" data-fpath="10-knowledge"', html)
+        self.assertIn('data-fpath="10-knowledge/deep"', html)
+        self.assertRegex(html, r'class="fhd" role="treeitem" aria-expanded="false" aria-level="3" tabindex="-1" data-fpath="10-knowledge/deep/nested"')
+        self.assertIn('<div class="fnotes" role="group" hidden>', html)         # collapsed folders hide their group
+        self.assertIn('class="ni active" role="treeitem" aria-level="3" aria-selected="true"', html)
+        self.assertEqual(html.count('data-path="'), 11)                          # every note exactly once
+        self.assertEqual(html.count("aria-selected=\"true\""), 1)
+        self.assertIn('class="folder sub" role="none" style="--depth:1"', html)
+        self.assertIn("10-knowledge/deep/nested/more", r["live"])
+        self.assertNotIn("90-gone", r["live"])
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_two_thousand_notes_build_and_render_quickly(self):
+        r = run_page_js("""
+          const notes = [];
+          for (let i = 0; i < 2000; i++) notes.push({path: `${i % 5}0-top/sub${i % 20}/deeper${i % 7}/Note ${i}.md`, name: `Note ${i}`, type: i % 3 ? "x" : ""});
+          const secs = [0, 1, 2, 3, 4].map(k => ({folder: `${k}0-top`, notes: notes.filter(n => n.path.startsWith(`${k}0-top/`))}));
+          const ctx = {expanded: new Set(), active: null, light: false};
+          const t0 = Date.now();
+          const html = buildTree(secs).map(n => folderHtml(n, 0, ctx)).join("");
+          console.log(JSON.stringify({ms: Date.now() - t0, rows: (html.match(/class="ni/g) || []).length}));""")
+        self.assertEqual(r["rows"], 2000)
+        self.assertLess(r["ms"], 100)
+
+    def test_page_keeps_the_existing_class_names_and_has_the_nested_css(self):
+        html = viewer.render_page("offline")
+        css = html.split("<style>")[1].split("</style>")[0]
+        for sel in (".folder", ".fhd", ".fnotes", ".ni", ".folder.sub > .fnotes"):
+            self.assertIn(sel, css)
+        js = page_script("offline")
+        self.assertIn("sbv-tree:", js)                                           # state is kept per vault title in localStorage
+        self.assertIn('"title": "Deep Fixture"', html)
+
+
 class IndexTests(unittest.TestCase):
     def test_resolution_forms(self):
         viewer.init_config(VAULT)
