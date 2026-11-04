@@ -14,6 +14,9 @@ A lightweight local viewer for Markdown knowledge bases. Zero dependencies — P
 - **Chat** with your vault via Claude, Anthropic API, or any OpenAI-compatible backend (Ollama etc.)
 - **Live reload** — file watcher auto-refreshes the browser on vault changes
 - **Relative Markdown links** — `[text](../dir/Other%20note.md#Heading)` open the note like a wikilink (resolved against the current note's folder)
+  and, like wikilinks, become graph lines and backlinks. Frontmatter `aliases:` resolve `[[Nick]]`, names are matched Unicode-normalised
+  (NFC), and links inside code are ignored. The rules are the same for the graph, backlinks, the page, `--export` and the lint:
+  see **[docs/note-linking.md](docs/note-linking.md)** (which link forms make a graph line, and how to keep the graph connected)
 - **Attachments** — `![](pic.png)`, `![[pic.png]]`, `[doc](files/spec.pdf)` show vault images and link PDFs (see below)
 - **Obsidian syntax** — `[[wikilinks]]` (`[[A|alias]]`, `[[dir/A]]`, `[[A#Heading|x]]`), `> [!note]` callouts (foldable with `-` / `+`), `![[Note]]` embeds, a "Linked from" backlinks section
 - **Dataview inline fields** — `[state:: …] [due:: …] [link:: …]` render as chips; open tasks past their `due` date are marked overdue
@@ -278,6 +281,11 @@ cd ~/Projects/second-brain
 python3 ~/Projects/second-brain-viewer/tools/vault-lint.py
 # (accepts --vault PATH; valid types / required fields come from the optional
 #  "lint" key in viewer.json — see the template — defaults match the old built-in schema)
+
+# Opt-in structure checks ("lint": {"require_up": true, "report_groups": true} in viewer.json) and a link-group report
+python3 ~/Projects/second-brain-viewer/tools/vault-lint.py --groups
+# (every note except type: home needs an `up:` that resolves; --groups lists the separate groups of the link graph —
+#  see docs/note-linking.md)
 
 # Create today's daily note from template (90-meta/Szablony/Daily.md)
 python3 ~/Projects/second-brain-viewer/tools/daily-note.py

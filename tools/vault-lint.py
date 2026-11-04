@@ -2,6 +2,7 @@
 """Vault lint: checks frontmatter and wikilinks in the vault.
 
     python3 vault-lint.py [--vault PATH]
+    python3 vault-lint.py [--vault PATH] --groups     # only the link-group report (see report_groups)
 
 The schema comes from the optional "lint" key of the vault's viewer config
 (.viewer.json / viewer.json / vault-viewer.json, searched in the vault and up to
@@ -11,8 +12,17 @@ The schema comes from the optional "lint" key of the vault's viewer config
       "valid_types":     ["home", "wiedza", ...],
       "required_fields": {"projekt": ["status"], ...},
       "excluded_files":  ["README.md"],
-      "excluded_dirs":   [".obsidian", "Szablony"]
+      "excluded_dirs":   [".obsidian", "Szablony"],
+      "require_up":      false,
+      "report_groups":   false
     }
+
+Opt-in structure checks (docs/note-linking.md):
+  require_up     every note except type: home needs an `up:` value that resolves to a note (missing and broken are
+                 reported separately and make the exit code non-zero);
+  report_groups  after the checks, how many separate groups the link graph has and which notes are outside the
+                 largest one (up to 20 per group). Informational: it never changes the exit code. --groups prints
+                 only this report.
 """
 from __future__ import annotations
 
@@ -55,8 +65,13 @@ def load_lint_config(vault: Path) -> dict:
     return {}
 
 
+REQUIRE_UP = False
+REPORT_GROUPS = False
+GROUP_LIST_MAX = 20
+
+
 def apply_config(vault: Path) -> None:
-    global VAULT, VALID_TYPES, REQUIRED_FIELDS, EXCLUDED, EXCLUDED_DIRS, _CI_INDEX, _SHARED
+    global VAULT, VALID_TYPES, REQUIRED_FIELDS, EXCLUDED, EXCLUDED_DIRS, _CI_INDEX, _SHARED, REQUIRE_UP, REPORT_GROUPS
     VAULT = vault.resolve()
     _CI_INDEX = None
     _SHARED = None
@@ -69,6 +84,8 @@ def apply_config(vault: Path) -> None:
         EXCLUDED = set(cfg["excluded_files"])
     if "excluded_dirs" in cfg:
         EXCLUDED_DIRS = set(cfg["excluded_dirs"])
+    REQUIRE_UP = cfg.get("require_up") is True
+    REPORT_GROUPS = cfg.get("report_groups") is True
 
 
 def excluded(path: Path) -> bool:
@@ -142,11 +159,41 @@ def resolve_wikilink(link: str, source_file: Path) -> Path | None:
     return idx.get(low) or idx.get("name:" + Path(low).name)
 
 
+def up_problem(fm: dict) -> str:
+    """"" when the note's `up:` resolves to a note, "missing" when there is no value, "broken" when none resolves."""
+    v = fm.get("up")
+    items = [str(x).strip() for x in (v if isinstance(v, list) else [v] if v is not None else []) if str(x).strip()]
+    if not items:
+        return "missing"
+    idx = shared_index()
+    for item in items:
+        if any(idx.resolve(t) for t in (extract_wikilinks(item) or [item])):
+            return ""
+    return "broken"
+
+
+def groups_report() -> list[str]:
+    """Lines describing the separate groups of the link graph (informational)."""
+    shared_index()                                  # points the viewer at this vault first
+    groups = viewer.link_groups()
+    g = viewer.build_graph()
+    lines = [f"Grupy powiązań: {len(groups)} (notatek: {len(g['nodes'])}, linków: {len(g['edges'])})"]
+    if groups:
+        lines.append(f"  największa grupa: {len(groups[0])} notatek")
+    for n, grp in enumerate(groups[1:], 2):
+        shown = ", ".join(grp[:GROUP_LIST_MAX]) + (f" … i {len(grp) - GROUP_LIST_MAX} więcej" if len(grp) > GROUP_LIST_MAX else "")
+        lines.append(f"  poza największą grupą — grupa {n} ({len(grp)}): {shown}")
+    return lines
+
+
 def lint() -> int:
     if "--vault" in sys.argv:
         apply_config(Path(sys.argv[sys.argv.index("--vault") + 1]))
     else:
         apply_config(VAULT)
+    if "--groups" in sys.argv:
+        print("\n".join(groups_report()))
+        return 0                                    # informational: never a failure
     issues: list[tuple[str, str]] = []
 
     # notes whose real path is outside the vault (symlinks) are ignored, as in the viewer
@@ -174,6 +221,14 @@ def lint() -> int:
             if not _present(fm.get(field)):
                 issues.append((str(rel), f"brak wymaganego pola '{field}' dla type: {note_type}"))
 
+        # Structure: every note except type: home links "up" to a note (opt-in)
+        if REQUIRE_UP and note_type != "home":
+            problem = up_problem(fm)
+            if problem == "missing":
+                issues.append((str(rel), "brak pola up: (lint.require_up)"))
+            elif problem == "broken":
+                issues.append((str(rel), f"zepsute up: {fm_str(fm, 'up')} nie wskazuje żadnej notatki"))
+
         # Check wikilinks
         for link in extract_wikilinks(text):
             if resolve_wikilink(link, f) is None:
@@ -188,6 +243,8 @@ def lint() -> int:
 
     if not issues:
         print(f"✓ Vault OK — sprawdzono {len(md_files)} plików, brak problemów.")
+        if REPORT_GROUPS:
+            print("\n".join(groups_report()))
         return 0
 
     print(f"Vault lint: {len(issues)} problem(ów) w {len(md_files)} plikach\n")
@@ -198,6 +255,8 @@ def lint() -> int:
             current_file = path
         print(f"  • {msg}")
 
+    if REPORT_GROUPS:
+        print("\n" + "\n".join(groups_report()))
     return 1
 
 if __name__ == "__main__":

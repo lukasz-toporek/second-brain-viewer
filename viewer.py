@@ -842,6 +842,32 @@ def build_graph() -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+def link_groups() -> list[list[str]]:
+    """Connected components of the link graph (direction ignored) as lists of note paths: largest group first,
+    ties by first path, each group sorted. A note with no links is a group of its own."""
+    g = build_graph()
+    adj: dict[str, set] = {n["id"]: set() for n in g["nodes"]}
+    for e in g["edges"]:
+        adj[e["source"]].add(e["target"])
+        adj[e["target"]].add(e["source"])
+    seen: set = set()
+    groups: list[list[str]] = []
+    for start in adj:
+        if start in seen:
+            continue
+        seen.add(start)
+        stack, group = [start], []
+        while stack:
+            x = stack.pop()
+            group.append(x)
+            for y in adj[x] - seen:
+                seen.add(y)
+                stack.append(y)
+        groups.append(sorted(group))
+    groups.sort(key=lambda grp: (-len(grp), grp[0]))
+    return groups
+
+
 # ── Full-text search ────────────────────────────────────────────────────────
 
 SEARCH_LIMIT = 50

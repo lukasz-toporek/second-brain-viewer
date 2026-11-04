@@ -2753,6 +2753,81 @@ class UnicodeNameTests(LinkVaultCase):
         self.assertNotIn("zepsuty", r.stdout)
 
 
+class LintStructureTests(LinkVaultCase):
+    """lint.require_up / lint.report_groups / --groups on a vault with three known link groups."""
+    NOTES = {
+        "Home.md": "---\ntype: home\n---\n# Home\n[[Hub]]\n",
+        "Hub.md": '---\ntype: index\nup: "[[Home]]"\n---\n# Hub\n[[Alpha]]\n',
+        "Alpha.md": '---\ntype: wiedza\nup: "[[Hub]]"\n---\n# Alpha\n',
+        "Beta.md": "---\ntype: wiedza\nup:\n---\n# Beta (empty up)\n[[Hub]]\n",
+        "NoUp.md": "---\ntype: wiedza\n---\n# NoUp\n[[Hub]]\n",
+        "BadUp.md": '---\ntype: wiedza\nup: "[[Nope]]"\n---\n# BadUp\n[[Hub]]\n',
+        "PlainUp.md": "---\ntype: wiedza\nup: Hub\n---\n# PlainUp (a bare name resolves too)\n[[Hub]]\n",
+        "ListUp.md": '---\ntype: wiedza\nup:\n  - "[[Hub]]"\n  - "[[Alpha]]"\n---\n# ListUp (a list works)\n[[Hub]]\n',
+        "island/I1.md": '---\ntype: wiedza\nup: "[[I2]]"\n---\n# I1\n[[I2]]\n',
+        "island/I2.md": '---\ntype: wiedza\nup: "[[I3]]"\n---\n# I2\n[[I3]]\n',
+        "island/I3.md": '---\ntype: wiedza\nup: "[[I1]]"\n---\n# I3\n',
+        "Lone.md": '---\ntype: wiedza\nup: "[[Lone]]"\n---\n# Lone (up to itself: no edge)\n',
+    }
+
+    def lint(self, *extra, config=None):
+        if config is not None:
+            (self.root / ".viewer.json").write_text(json.dumps({"title": "L", "lint": {"valid_types": ["home", "index", "wiedza"], **config}}), encoding="utf-8")
+        return subprocess.run([sys.executable, str(ROOT / "tools" / "vault-lint.py"), "--vault", str(self.root), *extra], capture_output=True, text=True)
+
+    def test_link_groups_in_the_viewer(self):
+        groups = viewer.link_groups()
+        self.assertEqual([len(g) for g in groups], [8, 3, 1])                              # largest first
+        self.assertEqual(groups[1], ["island/I1.md", "island/I2.md", "island/I3.md"])
+        self.assertEqual(groups[2], ["Lone.md"])
+        self.assertIn("Home.md", groups[0])
+
+    def test_off_by_default_existing_runs_do_not_change(self):
+        r = self.lint(config={})
+        self.assertEqual(r.returncode, 1)                                                  # only BadUp's broken [[Nope]] wikilink
+        self.assertEqual(r.stdout.count("zepsuty wikilink"), 1)
+        for opt_in in ("brak pola up", "zepsute up", "Grupy"):
+            self.assertNotIn(opt_in, r.stdout)
+
+    def test_require_up_reports_missing_and_broken_separately(self):
+        r = self.lint(config={"require_up": True})
+        self.assertEqual(r.returncode, 1)
+        out = r.stdout
+        for missing in ("Beta.md", "NoUp.md"):
+            self.assertRegex(out, rf"{missing}\n  • brak pola up:")
+        self.assertRegex(out, r"BadUp\.md\n  • zepsute up: \[\[Nope\]\]")
+        self.assertNotIn("brak pola up", out.split("BadUp.md")[1].split("\n\n")[0])          # not reported as missing too
+        for ok in ("Home.md", "Alpha.md", "PlainUp.md", "ListUp.md", "Hub.md"):               # home is exempt; the rest resolve
+            self.assertNotRegex(out, rf"\n{re.escape(ok)}\n")
+        self.assertEqual(out.count("brak pola up"), 2)
+        self.assertEqual(out.count("zepsute up"), 1)
+
+    def test_groups_report_in_the_config_is_informational(self):
+        (self.root / "BadUp.md").unlink()                                                  # leave a vault with no real issue
+        r = self.lint(config={"report_groups": True})
+        self.assertEqual(r.returncode, 0, r.stdout)                                        # groups never change the exit code
+        self.assertIn("Grupy powiązań: 3", r.stdout)
+        self.assertIn("poza największą grupą — grupa 2 (3): island/I1.md, island/I2.md, island/I3.md", r.stdout)
+        self.assertIn("grupa 3 (1): Lone.md", r.stdout)
+
+    def test_groups_flag_prints_only_that_report(self):
+        r = self.lint("--groups", config={"require_up": True})                             # require_up would fail a normal run
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue(r.stdout.startswith("Grupy powiązań: 3 (notatek: 12, linków: "), r.stdout)
+        self.assertNotIn("brak pola up", r.stdout)
+        self.assertNotIn("Vault lint", r.stdout)
+
+    def test_more_than_twenty_notes_in_a_group_are_counted_not_listed(self):
+        for i in range(25):
+            (self.root / f"Chain{i:02d}.md").write_text(f"---\ntype: wiedza\nup: \"[[Chain{(i + 1) % 25:02d}]]\"\n---\n# C\n[[Chain{(i + 1) % 25:02d}]]\n", encoding="utf-8")
+        for i in range(30):                                       # make the main group bigger than the 25-note chain
+            (self.root / f"Main{i:02d}.md").write_text('---\ntype: wiedza\nup: "[[Hub]]"\n---\n# M\n[[Hub]]\n', encoding="utf-8")
+        r = self.lint("--groups")
+        line = next(l for l in r.stdout.splitlines() if "(25)" in l)
+        self.assertEqual(line.count(".md"), 20)
+        self.assertIn("… i 5 więcej", line)
+
+
 class IndexTests(unittest.TestCase):
     def test_resolution_forms(self):
         viewer.init_config(VAULT)
