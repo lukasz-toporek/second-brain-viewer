@@ -941,8 +941,11 @@ class LintTests(unittest.TestCase):
     def test_fixture_vault_output_is_unchanged(self):
         r = self.run_lint(VAULT)
         self.assertEqual(r.returncode, 1, r.stderr)
-        self.assertIn("3 problem(ów) w 9 plikach", r.stdout)
+        # 3 original problems + 3 broken Markdown note links (the stricter lint): Nope.md, other.md and the one above the root
+        self.assertIn("6 problem(ów) w 9 plikach", r.stdout)
         self.assertIn("zepsuty wikilink: [[Does Not Exist]]", r.stdout)
+        self.assertEqual(r.stdout.count("zepsuty link:"), 3)
+        self.assertIn("(Nope.md) — brak notatki 10-knowledge/deep/Nope.md", r.stdout)
         self.assertEqual(r.stdout.count("brak wymaganego pola 'status' dla type: projekt"), 2)
         self.assertNotIn("brak frontmattera", r.stdout)
 
