@@ -82,7 +82,14 @@ A plugin is a folder with a `plugin.json` manifest and static files:
 ## Security model
 - Plugins are trusted code, equivalent to running a script: they are **off unless listed
   and `enabled` in the vault's own config**, and the viewer prints the enabled plugin ids
-  at startup. A config found in a parent directory is where the user's trust already is.
+  at startup together with the path of the config file that enabled them (a config found in
+  a parent directory is easy to miss). Plugins run with full page privileges: they can read
+  every note the page holds and, online, call `/api/chat`.
+- To open a vault you do not trust, start with `--no-plugins` or set `"plugins_enabled": false`
+  (default `true`): the `"plugins"` key is ignored, nothing is served under `/plugins/` and
+  nothing is inlined into an export.
+- `--offline` limits where a plugin can connect (same origin only, no chat); it does not
+  sandbox it, so a plugin can still, for example, navigate the window away.
 - Plugin files are served from an allow-list; no directory listing, no path traversal
   (reuse `safe_note_path`-style `resolve()` + `is_relative_to` checks).
 - The existing CSP already limits plugins to same-origin scripts/styles and `connect-src 'self'`

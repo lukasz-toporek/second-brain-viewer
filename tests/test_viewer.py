@@ -1599,6 +1599,85 @@ class MobileSidebarTests(unittest.TestCase):
                 self.assertRegex(js, r"function openNote\(note\) \{\s*closeSidebar\(\);")
 
 
+class PluginsDisabledTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name) / "vault"
+        make_plugin_vault(self.root)
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(viewer.init_config, VAULT)
+
+    def disable_in_config(self):
+        cfgp = self.root / ".viewer.json"
+        cfg = json.loads(cfgp.read_text(encoding="utf-8"))
+        cfg["plugins_enabled"] = False
+        cfgp.write_text(json.dumps(cfg), encoding="utf-8")
+
+    def test_flag_disables_everything(self):
+        viewer.init_config(self.root, no_plugins=True)
+        self.assertEqual(viewer.PLUGINS, {})
+        srv = viewer.make_server(0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        port = srv.server_address[1]
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request("GET", "/plugins/tasks-board.js", headers={"Host": f"localhost:{port}"})
+        self.assertEqual(c.getresponse().status, 404)
+        c.close()
+        html = viewer.render_page("export", {"notes": {}})
+        self.assertNotIn("tasks-board", html)
+        self.assertNotIn("/plugins/", viewer.render_page("online"))
+        self.assertIn('"plugins": []', html)
+
+    def test_config_key_disables_everything(self):
+        self.disable_in_config()
+        s = Server(vault=self.root)
+        self.addCleanup(s.stop)
+        self.assertEqual(viewer.PLUGINS, {})
+        self.assertEqual(s.req("GET", "/plugins/tasks-board.js")[0], 404)
+        self.assertNotIn("tasks-board", viewer.render_page("export", {"notes": {}}))
+
+    def test_default_is_unchanged(self):
+        s = Server(vault=self.root)
+        self.addCleanup(s.stop)
+        self.assertEqual(list(viewer.PLUGINS), ["tasks-board"])
+        self.assertEqual(s.req("GET", "/plugins/tasks-board.js")[0], 200)
+
+    def run_cli(self, *extra):
+        out = Path(self._tmp.name) / "o.html"
+        r = subprocess.run([sys.executable, str(ROOT / "viewer.py"), "--vault", str(self.root), "--export", str(out), *extra],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout, out.read_text(encoding="utf-8")
+
+    def test_cli_flag_in_export(self):
+        stdout, html = self.run_cli("--no-plugins")
+        self.assertIn("Plug-ins disabled (--no-plugins)", stdout)
+        self.assertNotIn("Plug-in enabled", stdout)
+        self.assertNotIn("tasks-board", html)
+
+    def test_cli_config_key_in_export(self):
+        self.disable_in_config()
+        stdout, html = self.run_cli()
+        self.assertIn('Plug-ins disabled ("plugins_enabled": false)', stdout)
+        self.assertNotIn("tasks-board", html)
+
+    def test_startup_prints_the_config_path(self):
+        child = self.root / "child"               # no config of its own: the parent folder's one is in effect
+        child.mkdir()
+        with contextlib.redirect_stderr(io.StringIO()):       # its plug-in file is not under child/: a warning
+            viewer.init_config(child)
+        self.assertEqual(viewer.CONFIG_PATH, self.root / ".viewer.json")
+        viewer.init_config(self.root)
+        self.assertEqual(viewer.CONFIG_PATH, self.root / ".viewer.json")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            viewer.print_plugins()
+        self.assertIn(f"Plug-ins enabled by {self.root / '.viewer.json'}", buf.getvalue())
+        self.assertIn("Plug-in enabled: tasks-board", buf.getvalue())
+
+
 class SymlinkLeakTests(unittest.TestCase):
     """Notes whose real path is outside the vault must not reach any index, API or export."""
     MARKER = "ZXQ-LEAK-MARKER-7731"

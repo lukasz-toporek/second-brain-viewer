@@ -10,6 +10,7 @@ Usage:
     python3 viewer.py --init                 # scaffold .viewer.json + .gitignore
     python3 viewer.py --vault PATH --init    # same for a specific vault
     python3 viewer.py --serve --offline      # vendored libs, no chat, strict CSP
+    python3 viewer.py --serve --no-plugins   # ignore the vault's "plugins" config (untrusted vault)
     python3 viewer.py --export OUT.html      # one self-contained file (contains all notes!)
 """
 
@@ -42,9 +43,13 @@ OFFLINE: bool = False
 REMOTE_IMAGE_MODES = ("allow", "click", "block")
 REMOTE_IMAGES: str = "allow"             # the validated "remote_images" setting (online mode only)
 PLUGINS: dict = {}                       # enabled, validated plug-ins: id -> resolved Path of its .js file
+PLUGINS_OFF: str = ""                    # why plug-ins are disabled ("--no-plugins" / "plugins_enabled: false"), else ""
+CONFIG_PATH: "Path | None" = None        # the viewer config file in effect (None: built-in defaults)
 
 
 def load_config(vault_path: Path) -> dict:
+    global CONFIG_PATH
+    CONFIG_PATH = None
     defaults: dict = {
         "title": vault_path.name,
         "skip_dirs": [".obsidian", ".git"],
@@ -62,12 +67,13 @@ def load_config(vault_path: Path) -> dict:
             if cfg_path.exists():
                 loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
                 defaults.update(loaded)
+                CONFIG_PATH = cfg_path
                 return defaults
     return defaults
 
 
-def init_config(vault_path: Path) -> None:
-    global VAULT, OUTPUT, SKIP_NAMES, SKIP_DIRS, FOLDER_ORDER, CONFIG, REMOTE_IMAGES, PLUGINS, _INDEX_CACHE
+def init_config(vault_path: Path, no_plugins: bool = False) -> None:
+    global VAULT, OUTPUT, SKIP_NAMES, SKIP_DIRS, FOLDER_ORDER, CONFIG, REMOTE_IMAGES, PLUGINS, PLUGINS_OFF, _INDEX_CACHE
     _INDEX_CACHE = (None, None)          # the cache is keyed by vault-relative paths: drop it per vault
     VAULT = vault_path.resolve()
     CONFIG = load_config(VAULT)
@@ -80,7 +86,15 @@ def init_config(vault_path: Path) -> None:
         print(f"warning: viewer config: \"remote_images\" must be one of {', '.join(REMOTE_IMAGE_MODES)} "
               f"(got {REMOTE_IMAGES!r}); using \"block\"", file=sys.stderr)
         REMOTE_IMAGES = "block"
-    PLUGINS, problems = load_plugins(CONFIG, VAULT)
+    PLUGINS_OFF = ""
+    if no_plugins:
+        PLUGINS_OFF = "--no-plugins"
+    elif CONFIG.get("plugins_enabled", True) is False:
+        PLUGINS_OFF = '"plugins_enabled": false'
+    if PLUGINS_OFF:
+        PLUGINS, problems = {}, []                 # the "plugins" key is ignored entirely
+    else:
+        PLUGINS, problems = load_plugins(CONFIG, VAULT)
     for msg in problems:
         print(f"warning: viewer config: {msg}", file=sys.stderr)
 
@@ -164,6 +178,11 @@ def plugin_source(pid: str) -> str:
 
 
 def print_plugins() -> None:
+    if PLUGINS_OFF:
+        print(f"Plug-ins disabled ({PLUGINS_OFF})")
+        return
+    if PLUGINS:
+        print(f"Plug-ins enabled by {CONFIG_PATH}")
     for pid, full in PLUGINS.items():
         print(f"✓ Plug-in enabled: {pid} ({full.relative_to(VAULT.resolve()).as_posix()})")
 
@@ -3123,7 +3142,7 @@ def main() -> None:
     if "--vault" in args:
         vault_path = Path(args[args.index("--vault") + 1])
 
-    init_config(vault_path)
+    init_config(vault_path, no_plugins="--no-plugins" in args)
 
     if "--init" in args:
         init_vault(vault_path)
