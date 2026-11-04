@@ -125,6 +125,23 @@ Attachments in an export: images are inlined as `data:` URLs (each ≤ 2 MB, 50 
 images over a limit are left out; both show an "attachment not included in export" placeholder. `--export` prints a
 summary line (included/skipped counts and total size).
 
+### Remote images: `remote_images`
+
+By default (`"allow"`) a note with `![](https://…)` makes your browser fetch that image, which also works as a tracking
+pixel. The optional `viewer.json` key `"remote_images"` changes that for **online** mode:
+
+| value | Markdown images from `http(s)` | online CSP `img-src` |
+|---|---|---|
+| `"allow"` (default) | loaded, as before | `'self' data: https:` |
+| `"click"` | placeholder `🖼 remote image: <host>` (a link opening the URL in a new tab) plus a **Load image** button that swaps in the `<img>` for that one image | `'self' data: https:` |
+| `"block"` | the same placeholder, no button | `'self' data:` |
+
+Trade-off of `"click"`: the browser has to be allowed to load the image once you press the button, so the CSP cannot
+forbid `https:` images; only the renderer holds them back until then. Use `"block"` if you want the CSP to enforce it.
+Offline and export always behave as `"block"` (their CSPs never allowed remote images). The policy applies to every image
+rendered by the app's Markdown setup, i.e. note bodies, embedded notes and plug-in `renderMarkdown()` output. Any other
+value is reported on stderr and treated as `"block"`.
+
 ### Security notes
 
 - **Online mode** loads `marked` and `force-graph` from jsDelivr (the same URLs as `tools/fetch-vendor.py`) with
@@ -180,6 +197,7 @@ Place a `viewer.json` in the vault root (or any parent directory — the viewer 
     "meta":  "#888"
   },
   "link_deprioritise": ["90-meta/Szablony", "_Archive"],
+  "remote_images": "allow",
   "system_prompt": "You are a knowledge base assistant. Answer concisely."
 }
 ```

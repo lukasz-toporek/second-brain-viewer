@@ -913,6 +913,133 @@ class LintTests(unittest.TestCase):
         self.assertEqual(r.stdout.count("brak wymaganego"), 1)
 
 
+class RemoteImagesTests(unittest.TestCase):
+    def serve(self, cfg, offline=False):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        root = Path(d.name)
+        (root / "N.md").write_text("# N\n\n![alt](https://tracker.example/p.gif)\n", encoding="utf-8")
+        if cfg is not None:
+            (root / ".viewer.json").write_text(json.dumps(cfg), encoding="utf-8")
+        s = Server(offline=offline, vault=root)
+        self.addCleanup(viewer.init_config, VAULT)
+        self.addCleanup(s.stop)
+        return s
+
+    def csp(self, s, path="/"):
+        return s.req("GET", path)[1]["Content-Security-Policy"]
+
+    def test_csp_per_policy(self):
+        base = viewer.CSP_ONLINE
+        for cfg, img in [(None, "img-src 'self' data: https:"), ({"remote_images": "allow"}, "img-src 'self' data: https:"),
+                         ({"remote_images": "click"}, "img-src 'self' data: https:"),
+                         ({"remote_images": "block"}, "img-src 'self' data:")]:
+            with self.subTest(cfg=cfg):
+                s = self.serve(cfg)
+                for path in ("/", "/api/vault", "/api/note?path=N.md"):
+                    csp = self.csp(s, path)
+                    self.assertIn(img + ";", csp)
+                    # nothing else changes
+                    self.assertEqual(csp.replace(img, "IMG"), base.replace("img-src 'self' data: https:", "IMG"))
+                s.stop()
+                viewer.init_config(VAULT)
+
+    def test_default_is_unchanged(self):
+        s = self.serve(None)
+        self.assertEqual(self.csp(s), viewer.CSP_ONLINE)
+        self.assertEqual(viewer.REMOTE_IMAGES, "allow")
+
+    def test_offline_csp_unchanged_for_every_value(self):
+        for v in ("allow", "click", "block"):
+            with self.subTest(v=v):
+                s = self.serve({"remote_images": v}, offline=True)
+                self.assertEqual(self.csp(s), viewer.CSP_OFFLINE)
+                s.stop()
+                viewer.init_config(VAULT)
+
+    def test_client_receives_active_policy(self):
+        for v in ("allow", "click", "block"):
+            with self.subTest(v=v):
+                s = self.serve({"remote_images": v})
+                html = s.req("GET", "/")[2].decode()
+                self.assertIn(f'"remote_images": "{v}"', html)
+                s.stop()
+                viewer.init_config(VAULT)
+        # offline and export always say "block", whatever the config
+        viewer.init_config(VAULT)
+        self.assertIn('"remote_images": "block"', viewer.render_page("offline"))
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / ".viewer.json").write_text('{"remote_images": "allow"}', encoding="utf-8")
+            viewer.init_config(Path(d))
+            try:
+                self.assertIn('"remote_images": "allow"', viewer.render_page("online"))
+                self.assertIn('"remote_images": "block"', viewer.render_page("offline"))
+                self.assertIn('"remote_images": "block"', viewer.render_page("export", {"notes": {}}))
+            finally:
+                viewer.init_config(VAULT)
+        self.assertIn("remoteImagesPolicy()", page_script("online"))
+
+    def test_invalid_value_fails_closed_with_a_warning(self):
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stderr(err):
+            (Path(d) / ".viewer.json").write_text('{"remote_images": "blok"}', encoding="utf-8")
+            viewer.init_config(Path(d))
+            try:
+                self.assertEqual(viewer.REMOTE_IMAGES, "block")
+                self.assertNotIn("https:", viewer.online_csp().split("img-src")[1].split(";")[0])
+            finally:
+                viewer.init_config(VAULT)
+        self.assertIn('"remote_images" must be one of', err.getvalue())
+
+
+@unittest.skipUnless(NODE, "node not available")
+class RemoteImageRenderTests(unittest.TestCase):
+    def render(self, policy, md):
+        return run_page_js(f"FLAGS.remote_images = {json.dumps(policy)}; currentNotePath = 'N.md';"
+                           f"console.log(JSON.stringify(marked.parse({json.dumps(md)})));")
+
+    MD = '![a <b>pic</b>](https://tracker.example:8443/p.gif?x=1&y="2" "t")'
+
+    def test_allow_keeps_img(self):
+        for policy in ("allow", None):
+            html = self.render(policy, self.MD)
+            self.assertIn('<img src="https://tracker.example:8443/p.gif?x=1&amp;y=&quot;2&quot;"', html)
+            self.assertNotIn("remote-img", html)
+
+    def test_block_is_a_placeholder_with_link(self):
+        html = self.render("block", self.MD)
+        self.assertNotIn("<img", html)
+        self.assertNotIn("ri-load", html)
+        self.assertIn("🖼 remote image: tracker.example:8443", html)
+        self.assertIn('href="https://tracker.example:8443/p.gif?x=1&amp;y=&quot;2&quot;" target="_blank" rel="noopener noreferrer"', html)
+        self.assertNotIn("<b>", html)
+
+    def test_click_adds_a_load_button(self):
+        html = self.render("click", "![x](http://h.example/a.png)")
+        self.assertIn('<button type="button" class="ri-load">Load image</button>', html)
+        self.assertIn('data-src="http://h.example/a.png"', html)
+        self.assertNotIn("<img", html)
+
+    def test_other_images_and_unsafe_urls_unaffected(self):
+        for policy in ("block", "click"):
+            html = self.render(policy, "![a](pic.png) ![b](javascript:alert(1)) ![c](//evil.example/x.png)")
+            self.assertNotIn("remote-img", html)
+            self.assertNotIn("javascript", html)
+            self.assertNotIn("evil.example", html)
+
+    def test_embeds_use_the_same_renderer(self):
+        # a note embedded in a note is rendered by the same marked setup, so the policy applies there too
+        r = run_page_js("""FLAGS.remote_images = "block"; vault = {folders: [], stems: {}}; currentNotePath = "E.md"; embedsOn = true;
+          console.log(JSON.stringify(marked.parse("![](https://t.example/p.gif)")));""")
+        self.assertIn("remote-img", r)
+
+    def test_click_handler_swaps_in_one_image(self):
+        js = page_script("online")
+        self.assertIn('button.ri-load', js)
+        self.assertIn("w.replaceWith(img)", js)
+        self.assertRegex(js, r"if \(!src \|\| !/\^https\?:")           # only http(s) sources are ever loaded
+
+
 class GraphXssTests(unittest.TestCase):
     NAME = "<img src=x onerror=alert(1)>"
 

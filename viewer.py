@@ -39,6 +39,8 @@ SKIP_DIRS: set = {".obsidian"}
 FOLDER_ORDER: list = []
 CONFIG: dict = {}
 OFFLINE: bool = False
+REMOTE_IMAGE_MODES = ("allow", "click", "block")
+REMOTE_IMAGES: str = "allow"             # the validated "remote_images" setting (online mode only)
 
 
 def load_config(vault_path: Path) -> dict:
@@ -49,6 +51,7 @@ def load_config(vault_path: Path) -> dict:
         "folder_order": [],
         "folders": {},
         "link_deprioritise": [],
+        "remote_images": "allow",
         "types": {"daily": "#5b9bd5", "meta": "#888", "index": "#888"},
         "system_prompt": "You are a knowledge base assistant. Answer concisely.",
     }
@@ -63,7 +66,7 @@ def load_config(vault_path: Path) -> dict:
 
 
 def init_config(vault_path: Path) -> None:
-    global VAULT, OUTPUT, SKIP_NAMES, SKIP_DIRS, FOLDER_ORDER, CONFIG, _INDEX_CACHE
+    global VAULT, OUTPUT, SKIP_NAMES, SKIP_DIRS, FOLDER_ORDER, CONFIG, REMOTE_IMAGES, _INDEX_CACHE
     _INDEX_CACHE = (None, None)          # the cache is keyed by vault-relative paths: drop it per vault
     VAULT = vault_path.resolve()
     CONFIG = load_config(VAULT)
@@ -71,6 +74,11 @@ def init_config(vault_path: Path) -> None:
     SKIP_NAMES = set(CONFIG.get("skip_files", ["README.md", "_index.md"]))
     SKIP_DIRS = set(CONFIG.get("skip_dirs", [".obsidian"]))
     FOLDER_ORDER = CONFIG.get("folder_order", [])
+    REMOTE_IMAGES = CONFIG.get("remote_images", "allow")
+    if REMOTE_IMAGES not in REMOTE_IMAGE_MODES:
+        print(f"warning: viewer config: \"remote_images\" must be one of {', '.join(REMOTE_IMAGE_MODES)} "
+              f"(got {REMOTE_IMAGES!r}); using \"block\"", file=sys.stderr)
+        REMOTE_IMAGES = "block"
 
 # ── Init / scaffold ─────────────────────────────────────────────────────────
 
@@ -1035,6 +1043,10 @@ body {
 .md a.wl:hover { text-decoration: none; border-bottom-style: solid; }
 .md .wl.missing { color: var(--tx2); border-bottom: 1px dashed var(--tx2); cursor: help; }
 .md img { max-width: 100%; height: auto; }
+.md .remote-img { display: inline-block; font-size: 12px; padding: 2px 8px; border: 1px dashed var(--bd); border-radius: 4px; color: var(--tx2); }
+.md .remote-img a { color: var(--tx2); }
+.md .remote-img .ri-load { margin-left: 6px; font: inherit; font-size: 11px; color: var(--ac); background: none;
+  border: 1px solid var(--bd); border-radius: 4px; padding: 0 6px; cursor: pointer; }
 
 /* callouts */
 .callout {
@@ -1542,6 +1554,18 @@ function attachmentHtml(path, name, alt, title, width) {
   return `<img src="${esc(src)}" alt="${esc(alt)}"${title ? ` title="${esc(title)}"` : ""}` +
     `${width ? ` width="${esc(width)}"` : ""} loading="lazy">`;
 }
+// ── Remote images: "allow" (default) | "click" | "block" — FLAGS.remote_images, set by the server
+// from the viewer.json "remote_images" key; offline and export are always "block".
+const remoteImagesPolicy = () => (FLAGS && FLAGS.remote_images) || "allow";
+function remoteImagePlaceholder(url, alt, title) {
+  let host = "unknown host";
+  try { host = new URL(url).host || host; } catch (_) {}
+  const label = `🖼 remote image: ${esc(host)}`;
+  const tip = esc(alt || title || url);
+  const link = `<a class="ri-link" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="${tip}">${label}</a>`;
+  const btn = remoteImagesPolicy() === "click" ? ` <button type="button" class="ri-load">Load image</button>` : "";
+  return `<span class="remote-img" data-src="${esc(url)}" data-alt="${esc(alt)}">${link}${btn}</span>`;
+}
 const baseName = p => { try { return decodeURIComponent(String(p).split(/[#?]/)[0]).split(/[\\/]/).pop(); } catch (_) { return String(p); } };
 
 // ── Markdown extensions: wikilinks + callouts ──
@@ -1602,6 +1626,7 @@ if (typeof marked !== "undefined") {
           return attachmentHtml(attachmentPath(href, false), baseName(href), text, title);
         const u = safeUrl(href);
         if (u === null) return esc(text);
+        if (/^https?:/i.test(u) && remoteImagesPolicy() !== "allow") return remoteImagePlaceholder(u, text, title);
         return `<img src="${esc(u)}" alt="${esc(text)}"${title ? ` title="${esc(title)}"` : ""}>`;
       },
       blockquote(quote) {
@@ -1737,6 +1762,19 @@ async function fillEmbed(el, chain) {
     body.innerHTML = `<span class="wl missing">${esc(e && e.message || "embed failed")}</span>`;
   }
 }
+
+// "Load image" (remote_images: "click"): swaps the placeholder for the real <img>, for that one image only
+document.addEventListener("click", e => {
+  const b = e.target.closest && e.target.closest("button.ri-load");
+  if (!b) return;
+  const w = b.closest(".remote-img");
+  const src = w && w.dataset.src;
+  if (!src || !/^https?:\/\//i.test(src) || safeUrl(src) === null) return;
+  const img = document.createElement("img");
+  img.alt = w.dataset.alt || "";
+  img.src = src;
+  w.replaceWith(img);
+});
 
 // delegated click handler for wikilinks (content, backlinks, chat bubbles)
 document.addEventListener("click", e => {
@@ -2304,6 +2342,18 @@ CSP_ONLINE = ("default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn
               "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
               "img-src 'self' data: https:; connect-src 'self'")
 
+def online_csp() -> str:
+    """CSP_ONLINE; with remote_images "block" its img-src drops https: ("click" keeps it: the browser
+    has to be allowed to load the image the user asks for)."""
+    if REMOTE_IMAGES == "block":
+        return CSP_ONLINE.replace("img-src 'self' data: https:", "img-src 'self' data:")
+    return CSP_ONLINE
+
+
+def current_csp() -> str:
+    return CSP_OFFLINE if OFFLINE else online_csp()
+
+
 VENDOR_DIR: Path = Path(__file__).resolve().parent / "vendor"
 VENDOR_FILES = ("marked.min.js", "force-graph.min.js")
 # Same jsDelivr URLs as tools/fetch-vendor.py, so the files in vendor/ are byte-identical to what
@@ -2362,7 +2412,9 @@ def js_json(obj) -> str:
 
 def render_page(mode: str = "online", data: dict = None) -> str:
     """mode: 'online' (CDN libs, chat) | 'offline' (vendored, no chat) | 'export' (single file)."""
-    flags = {"chat": mode == "online", "watch": mode != "export", "export": mode == "export"}
+    flags = {"chat": mode == "online", "watch": mode != "export", "export": mode == "export",
+             # offline and export never load remote images; online follows the "remote_images" setting
+             "remote_images": REMOTE_IMAGES if mode == "online" else "block"}
     head, libs, data_tag = "", "", ""
     if mode == "online":
         head, libs = CDN_FONTS, cdn_libs()
@@ -2514,7 +2566,7 @@ class VaultHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("Content-Security-Policy", CSP_OFFLINE if OFFLINE else CSP_ONLINE)
+            self.send_header("Content-Security-Policy", current_csp())
             self.end_headers()
             last = vault_snapshot()
             ticks = 0
@@ -2751,7 +2803,7 @@ class VaultHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", len(body))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", csp or (CSP_OFFLINE if OFFLINE else CSP_ONLINE))
+        self.send_header("Content-Security-Policy", csp or current_csp())
         if not cache:
             self.send_header("Cache-Control", "no-cache")
         self.end_headers()
