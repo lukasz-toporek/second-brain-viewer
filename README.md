@@ -9,6 +9,7 @@ A lightweight local viewer for Markdown knowledge bases. Zero dependencies — P
 - **Wikilink graph** (force-directed, powered by [force-graph](https://github.com/vasturiano/force-graph))
 - **Chat** with your vault via Claude, Anthropic API, or any OpenAI-compatible backend (Ollama etc.)
 - **Live reload** — file watcher auto-refreshes the browser on vault changes
+- **Relative Markdown links** — `[text](../dir/Other%20note.md#Heading)` open the note like a wikilink (resolved against the current note's folder; other relative links such as images are left as they are)
 - **Obsidian syntax** — `[[wikilinks]]` (`[[A|alias]]`, `[[dir/A]]`, `[[A#Heading|x]]`), `> [!note]` callouts, a "Linked from" backlinks section
 - **Dataview inline fields** — `[state:: …] [due:: …] [link:: …]` render as chips; open tasks past their `due` date are marked overdue
 - **Mobile layout** — below 580 px a ☰ button at the left of the tab row opens the sidebar as an overlay with a backdrop (closes when a note opens, on Escape, or on a backdrop click)
@@ -83,6 +84,11 @@ It needs no server or network and opens from `file://` (CSP `connect-src 'none'`
 
 ### Security notes
 
+- **Online mode** loads `marked` and `force-graph` from jsDelivr (the same URLs as `tools/fetch-vendor.py`) with
+  Subresource Integrity: `integrity="sha384-…"` is computed at startup from the files in `vendor/`, so it cannot drift
+  from the pins (if `vendor/` is missing, one warning is printed and the tags are emitted without `integrity`).
+  Online pages also carry `Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self'`.
+- Note names are escaped before force-graph inserts graph hover labels as HTML.
 - The server binds to `127.0.0.1` only and rejects any `Host` other than `localhost:<port>` / `127.0.0.1:<port>` (DNS-rebinding protection).
 - `POST /api/chat` requires `Content-Type: application/json` and the `X-Vault-Viewer: 1` header (sent by the page), and bodies over 1 MB are refused.
 - `/api/note` resolves paths and refuses anything outside the vault, skipped files/folders and non-`.md` files.
