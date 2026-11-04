@@ -553,10 +553,78 @@ def scan_vault() -> dict:
 _WIKILINK_RE = re.compile(r'!?\[\[([^\]\n]+?)\]\]')
 
 
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_FM_HEAD_RE = re.compile(r"\ufeff?---[ \t]*\r?\n(?:.*?\r?\n)?---[ \t]*(?:\r?\n|\Z)", re.S)
+_BLANK_LINE_RE = re.compile(r"\n[ \t]*\r?\n")
+
+
+def _blank(s: str) -> str:
+    return re.sub(r"[^\n\r]", " ", s)
+
+
+def _blank_inline_code(text: str) -> str:
+    """Inline code spans (a run of n backticks up to the next run of exactly n, within one paragraph) as spaces."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if text[i] != "`" or (i and text[i - 1] == "\\" and (len(text[:i]) - len(text[:i].rstrip("\\"))) % 2):
+            out.append(text[i])
+            i += 1
+            continue
+        j = i
+        while j < n and text[j] == "`":
+            j += 1
+        run = j - i
+        m = _BLANK_LINE_RE.search(text, j)
+        stop = m.start() if m else n                   # a code span never crosses a blank line
+        k, end = j, -1
+        while k < stop:
+            if text[k] == "`":
+                e = k
+                while e < n and text[e] == "`":
+                    e += 1
+                if e - k == run:
+                    end = k
+                    break
+                k = e
+            else:
+                k += 1
+        if end < 0:
+            out.append(text[i:j])                      # no closing run: literal backticks
+            i = j
+        else:
+            out.append(_blank(text[i:end + run]))
+            i = end + run
+    return "".join(out)
+
+
+def blank_code(text: str) -> str:
+    """`text` with fenced code blocks (``` and ~~~, an unclosed one runs to the end of the note) and inline code
+    spans replaced by spaces, so links in code are not links and offsets stay the same. The frontmatter is left
+    alone. Indented code blocks are not recognised: telling them from list continuation needs a full parser."""
+    m = _FM_HEAD_RE.match(text)
+    head, body = (text[:m.end()], text[m.end():]) if m else ("", text)
+    lines, fence, out = body.split("\n"), None, []
+    for line in lines:
+        if fence is None:
+            o = _FENCE_OPEN_RE.match(line.rstrip("\r"))
+            if o and not (o.group(1)[0] == "`" and "`" in o.group(2)):
+                fence = (o.group(1)[0], len(o.group(1)))
+                out.append(_blank(line))
+            else:
+                out.append(line)
+        else:
+            out.append(_blank(line))
+            c = _FENCE_OPEN_RE.match(line.rstrip("\r"))
+            if c and c.group(1)[0] == fence[0] and len(c.group(1)) >= fence[1] and not c.group(2).strip():
+                fence = None
+    # inline code only in what the fences left (fenced lines are blank by now)
+    return head + _blank_inline_code("\n".join(out))
+
+
 def extract_wikilinks(text: str) -> list[str]:
-    """Targets of [[target#heading|label]] (also ![[embeds]] and [[a\\|b]] inside tables)."""
+    """Targets of [[target#heading|label]] (also ![[embeds]] and [[a\\|b]] inside tables); code is ignored."""
     out = []
-    for m in _WIKILINK_RE.finditer(text):
+    for m in _WIKILINK_RE.finditer(blank_code(text)):
         target = re.split(r'\\?\||#', m.group(1), maxsplit=1)[0].strip()
         if target:
             out.append(target)
@@ -571,9 +639,9 @@ _MDLINK_RE = re.compile(
 
 
 def extract_md_links(text: str) -> list[str]:
-    """Raw targets of Markdown links ``[text](target)`` (images excluded)."""
+    """Raw targets of Markdown links ``[text](target)`` (images and code excluded)."""
     return [m.group(1) if m.group(1) is not None else m.group(2)
-            for m in _MDLINK_RE.finditer(text) if not m.group(0).startswith("[[")]      # [[w]](x) is a wikilink, then text
+            for m in _MDLINK_RE.finditer(blank_code(text)) if not m.group(0).startswith("[[")]      # [[w]](x) is a wikilink, then text
 
 
 def rel_link_path(base: str, href: str, ext: str = ".md"):

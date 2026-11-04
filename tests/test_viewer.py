@@ -2564,6 +2564,47 @@ class MarkdownLinkEdgeTests(LinkVaultCase):
         self.assertNotIn("zepsuty", r.stdout)
 
 
+class CodeBlankingTests(LinkVaultCase):
+    NOTES = {
+        "Target.md": "# Target\n",
+        "Other.md": "# Other\n",
+        "Fenced.md": "# Fenced\n```\n[[Target]]\n[md](Target.md)\n```\n",
+        "Unclosed.md": "# Unclosed\ntext\n~~~md\n[[Target]]\nstill code [md](Target.md)\n",
+        "Inline.md": "# Inline\n`[[Target]]` and ``[x](Target.md) ` ``\n",
+        "Real.md": "---\nrelated: \"[[Target]]\"\n---\n# Real\nreal [[Other]] and `[[Target]]`\n```\n[[Target]]\n```\nafter [md](Other.md)\n",
+        "Fm.md": "---\nup: \"[[Other]]\"\nnote: \"```\"\n---\n# Fm\n[[Target]]\n",
+    }
+
+    def test_blank_code_keeps_offsets_and_frontmatter(self):
+        t = "---\nt: \"`[[FM]]`\"\n---\nA [[a]] `[[b]]` ``x ` [[c]] ``  [[d]]\n```\n[[e]]\n```\n[[f]]\n~~~md\n[[g]]\n```\nstill [[h]]\n~~~\n[[i]]\n````\n```\n[[j]]\n````\n[[k]]\n```js\n[[unclosed]]\n"
+        self.assertEqual(len(viewer.blank_code(t)), len(t))
+        self.assertEqual(viewer.extract_wikilinks(t), ["FM", "a", "d", "f", "i", "k"])
+        self.assertEqual(viewer.extract_wikilinks("`a\n\n[[x]]` \\`[[y]]\\` [[z]]"), ["x", "y", "z"])   # no span across a blank line; escaped ticks
+        self.assertEqual(viewer.extract_wikilinks("```a`b\n[[x]]"), ["x"])                            # ``` with a backtick in its info string is inline
+        self.assertEqual(viewer.extract_wikilinks("```\r\n[[x]]\r\n```\r\n[[y]]\r\n"), ["y"])         # CRLF
+
+    def test_links_in_fences_unclosed_fences_and_inline_code_add_no_edge(self):
+        e = self.edges()
+        for note in ("Fenced.md", "Unclosed.md", "Inline.md"):
+            with self.subTest(note=note):
+                self.assertFalse(any(note in pair for pair in e), f"{note} has an edge: {e}")
+                self.assertEqual(self.backlinks("Target.md").count(note), 0)
+
+    def test_real_links_around_code_still_count_and_frontmatter_is_scanned(self):
+        self.assertEqual(self.edges(), {("Real.md", "Target.md"), ("Other.md", "Real.md"), ("Fm.md", "Other.md"), ("Fm.md", "Target.md")})
+        self.assertEqual(sorted(self.backlinks("Target.md")), ["Fm.md", "Real.md"])
+        self.assertEqual(sorted(self.backlinks("Other.md")), ["Fm.md", "Real.md"])             # Real: the [[Other]] and the md link
+
+    def test_export_graph_matches_the_api(self):
+        self.assert_export_matches_api()
+
+    def test_lint_ignores_links_in_code(self):
+        (self.root / "Broken.md").write_text("---\ntype: wiedza\n---\n# Broken\n`[[Nope]]`\n```\n[[Nope2]]\n```\n[[Real Missing]]\n", encoding="utf-8")
+        r = subprocess.run([sys.executable, str(ROOT / "tools" / "vault-lint.py"), "--vault", str(self.root)], capture_output=True, text=True)
+        self.assertIn("[[Real Missing]]", r.stdout)
+        self.assertNotIn("Nope", r.stdout)
+
+
 class IndexTests(unittest.TestCase):
     def test_resolution_forms(self):
         viewer.init_config(VAULT)

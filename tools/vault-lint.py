@@ -23,7 +23,8 @@ from pathlib import Path
 
 # One frontmatter parser for the viewer and the lint: viewer.py sits next to tools/
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from viewer import fm_str, frontmatter_block, parse_frontmatter as _parse_frontmatter, real_file_in  # noqa: E402
+from viewer import (extract_wikilinks, fm_str, frontmatter_block,  # noqa: E402
+                    parse_frontmatter as _parse_frontmatter, real_file_in)
 
 VAULT = Path.cwd()
 
@@ -87,8 +88,7 @@ def _present(value) -> bool:
     return bool(str(value or "").strip())
 
 
-def extract_wikilinks(text: str) -> list[str]:
-    return [m.rstrip("\\").strip() for m in re.findall(r"\[\[([^\]|#\n]+)", text)]
+# extract_wikilinks() is the viewer's: the same link forms (and no links inside code) for graph, backlinks and lint
 
 _CI_INDEX: dict | None = None
 
