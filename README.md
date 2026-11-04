@@ -142,6 +142,32 @@ Offline and export always behave as `"block"` (their CSPs never allowed remote i
 rendered by the app's Markdown setup, i.e. note bodies, embedded notes and plug-in `renderMarkdown()` output. Any other
 value is reported on stderr and treated as `"block"`.
 
+### Plug-ins (frontend, v1)
+
+A vault can add its own toolbar views without forking `viewer.py`. List the scripts in the vault's `viewer.json`:
+
+```json
+"plugins": [{"id": "tasks-board", "file": ".viewer/plugins/tasks-board.js", "enabled": true}]
+```
+
+- `id` must match `^[a-z0-9][a-z0-9-]{0,40}$`; `file` is vault-relative, ends in `.js` and must resolve (symlinks
+  included) **inside the vault**. It is deliberately **not** subject to `skip_dirs`/`skip_files`, so it can live in a
+  folder like `.viewer/` that the note scanner skips. Only entries with `"enabled": true` load; the enabled ids and files
+  are printed at startup, and a bad entry prints a warning and is skipped (the viewer still starts).
+- Each enabled plug-in is served at `/plugins/<id>.js` from an exact allow-list built from the config (no directory
+  listing, no other path) and added as `<script src>` after the app script; `--export` inlines it instead. The CSPs are
+  unchanged, so a plug-in cannot add remote origins (the export keeps `connect-src 'none'`).
+- **A plug-in is trusted code** with full access to the page and the notes: enable only scripts you wrote or read.
+- Host API 1: `window.VaultViewer.register({id, title, api: 1, mount(el, host), unmount?()})` (refused with a console
+  warning if `api` is greater than 1 or the `id` is not enabled). `host` gives `api(kind, arg)` (the app's own data
+  access, so it works in an export), `openNote(path)`, `notes()` (`[{path, name, type, folder}]`), `esc(s)`,
+  `renderMarkdown(md, basePath)` (the app's escaping Markdown, including the remote-images policy) and
+  `onVaultChange(cb)` (after live reload / refresh; returns an unsubscribe function). Every registered plug-in gets a
+  toolbar button next to **Graph** that opens an overlay (Escape closes it, `unmount` is called).
+- `examples/plugins/tasks-board.js` lists every open task with a past `due` date: copy it into your vault and enable it.
+
+See `docs/plugins.md` for the design and what is still future work (Python data providers).
+
 ### Security notes
 
 - **Online mode** loads `marked` and `force-graph` from jsDelivr (the same URLs as `tools/fetch-vendor.py`) with
@@ -151,6 +177,7 @@ value is reported on stderr and treated as `"block"`.
 - Note names are escaped before force-graph inserts graph hover labels as HTML.
 - The server binds to `127.0.0.1` only and rejects any `Host` other than `localhost:<port>` / `127.0.0.1:<port>` (DNS-rebinding protection).
 - `POST /api/chat` requires `Content-Type: application/json` and the `X-Vault-Viewer: 1` header (sent by the page), and bodies over 1 MB are refused.
+- `/plugins/<id>.js` only serves the plug-ins enabled in the vault's config (see Plug-ins).
 - `/api/note` resolves paths and refuses anything outside the vault, skipped files/folders and non-`.md` files; `/api/file` does the same for the allow-listed attachment types.
 - Note content is never trusted: raw HTML in Markdown is shown as text, and links/images only allow `http(s)`, `mailto`, `#` and relative URLs. Everything inserted via `innerHTML` is escaped.
 - Chat still sends the current note to your configured backend; use `--offline` if that is not acceptable.
@@ -198,6 +225,7 @@ Place a `viewer.json` in the vault root (or any parent directory — the viewer 
   },
   "link_deprioritise": ["90-meta/Szablony", "_Archive"],
   "remote_images": "allow",
+  "plugins": [],
   "system_prompt": "You are a knowledge base assistant. Answer concisely."
 }
 ```

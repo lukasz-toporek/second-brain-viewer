@@ -1040,6 +1040,410 @@ class RemoteImageRenderTests(unittest.TestCase):
         self.assertRegex(js, r"if \(!src \|\| !/\^https\?:")           # only http(s) sources are ever loaded
 
 
+EXAMPLE_PLUGIN = ROOT / "examples" / "plugins" / "tasks-board.js"
+
+
+def make_plugin_vault(root: Path, plugins=None, plugin_src=None):
+    """Temp copy of the fixture vault with the example plug-in under .viewer/plugins/ (a folder the
+    viewer config would normally skip) and a .viewer.json listing `plugins`."""
+    shutil.copytree(VAULT, root)
+    (root / ".viewer" / "plugins").mkdir(parents=True)
+    (root / ".viewer" / "plugins" / "tasks-board.js").write_text(
+        plugin_src if plugin_src is not None else EXAMPLE_PLUGIN.read_text(encoding="utf-8"), encoding="utf-8")
+    (root / ".viewer" / "plugins" / "other.js").write_text("window.__other = 1;", encoding="utf-8")
+    if plugins is None:
+        plugins = [{"id": "tasks-board", "file": ".viewer/plugins/tasks-board.js", "enabled": True}]
+    (root / ".viewer.json").write_text(json.dumps({"skip_dirs": [".obsidian", ".git", ".viewer"], "plugins": plugins}),
+                                       encoding="utf-8")
+
+
+class LoadPluginsTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name) / "vault"
+        make_plugin_vault(self.root)
+        self.addCleanup(self._tmp.cleanup)
+
+    def load(self, plugins):
+        return viewer.load_plugins({"plugins": plugins}, self.root)
+
+    def entry(self, **kw):
+        e = {"id": "tasks-board", "file": ".viewer/plugins/tasks-board.js", "enabled": True}
+        e.update(kw)
+        return e
+
+    def test_valid_entry(self):
+        found, problems = self.load([self.entry()])
+        self.assertEqual(problems, [])
+        self.assertEqual(found, {"tasks-board": (self.root / ".viewer/plugins/tasks-board.js").resolve()})
+
+    def test_not_subject_to_skip_dirs(self):
+        # .viewer is in skip_dirs in make_plugin_vault, yet the plug-in file loads
+        viewer.init_config(self.root)
+        try:
+            self.assertIn(".viewer", viewer.SKIP_DIRS)
+            self.assertIn("tasks-board", viewer.PLUGINS)
+        finally:
+            viewer.init_config(VAULT)
+
+    def test_no_key_or_disabled_means_nothing_loads(self):
+        self.assertEqual(viewer.load_plugins({}, self.root), ({}, []))
+        for enabled in (False, None, "true", 1, "yes"):
+            with self.subTest(enabled=enabled):
+                found, problems = self.load([self.entry(enabled=enabled)])
+                self.assertEqual((found, problems), ({}, []))
+        found, _ = self.load([{"id": "tasks-board", "file": ".viewer/plugins/tasks-board.js"}])
+        self.assertEqual(found, {})
+
+    def test_bad_entries_warn_and_are_skipped(self):
+        outside = self.root.parent / "evil.js"
+        outside.write_text("x", encoding="utf-8")
+        link = self.root / ".viewer" / "plugins" / "link.js"
+        try:
+            link.symlink_to(outside)
+            symlink_case = [self.entry(id="linked", file=".viewer/plugins/link.js")]
+        except OSError:
+            symlink_case = []
+        cases = [
+            self.entry(id="Tasks"), self.entry(id="-tasks"), self.entry(id="a" * 42), self.entry(id=""), self.entry(id=5),
+            self.entry(id=None), self.entry(id="has space"), self.entry(id="a/b"), self.entry(id="a_b"),
+            self.entry(file="x.txt"), self.entry(file=".viewer/plugins/tasks-board.js.map"), self.entry(file=5),
+            self.entry(file=None), self.entry(file=".viewer/plugins/missing.js"), self.entry(file=".viewer/plugins"),
+            self.entry(file="../evil.js"), self.entry(file=str(outside)), self.entry(file="/etc/passwd.js"),
+            self.entry(file=".viewer/../../evil.js"), self.entry(file=".viewer/plugins/tasks-board.js\0.js"),
+            "just a string", 5, None, ["list"],
+        ] + symlink_case
+        for c in cases:
+            with self.subTest(entry=c):
+                found, problems = self.load([c])
+                self.assertEqual(found, {})
+                self.assertEqual(len(problems), 1)
+
+    def test_valid_ids_at_the_edges(self):
+        for pid in ("a", "0", "a-b-c", "a" * 41, "9lives"):
+            with self.subTest(pid=pid):
+                self.assertIn(pid, self.load([self.entry(id=pid)])[0])
+
+    def test_duplicate_id_keeps_the_first(self):
+        found, problems = self.load([self.entry(), self.entry(file=".viewer/plugins/other.js")])
+        self.assertEqual(found["tasks-board"].name, "tasks-board.js")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("duplicate", problems[0])
+
+    def test_one_bad_entry_does_not_hide_the_good_one(self):
+        found, problems = self.load([self.entry(id="BAD"), self.entry(id="ok", file=".viewer/plugins/other.js")])
+        self.assertEqual(list(found), ["ok"])
+        self.assertEqual(len(problems), 1)
+
+    def test_plugins_not_a_list(self):
+        for bad in ({"id": "x"}, "x", 5):
+            found, problems = viewer.load_plugins({"plugins": bad}, self.root)
+            self.assertEqual((found, len(problems)), ({}, 1))
+
+    def test_too_big_file_rejected(self):
+        old = viewer.PLUGIN_MAX_BYTES
+        viewer.PLUGIN_MAX_BYTES = 5
+        try:
+            found, problems = self.load([self.entry()])
+        finally:
+            viewer.PLUGIN_MAX_BYTES = old
+        self.assertEqual((found, len(problems)), ({}, 1))
+
+    def test_init_config_prints_warnings_and_never_crashes(self):
+        (self.root / ".viewer.json").write_text(json.dumps({"plugins": [self.entry(file="../evil.js"), 7]}), encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            viewer.init_config(self.root)
+        try:
+            self.assertEqual(viewer.PLUGINS, {})
+            self.assertEqual(err.getvalue().count("warning: viewer config:"), 2)
+        finally:
+            viewer.init_config(VAULT)
+
+
+class PluginServingTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name) / "vault"
+        make_plugin_vault(self.root, plugins=[
+            {"id": "tasks-board", "file": ".viewer/plugins/tasks-board.js", "enabled": True},
+            {"id": "off", "file": ".viewer/plugins/other.js", "enabled": False},
+        ])
+        (self.root.parent / "secret.js").write_text("SECRET", encoding="utf-8")
+        self.addCleanup(self._tmp.cleanup)
+
+    def serve(self, offline=False):
+        s = Server(offline=offline, vault=self.root)
+        self.addCleanup(viewer.init_config, VAULT)
+        self.addCleanup(s.stop)
+        return s
+
+    def test_enabled_plugin_is_served(self):
+        s = self.serve()
+        st, h, body = s.req("GET", "/plugins/tasks-board.js")
+        self.assertEqual(st, 200)
+        self.assertEqual(body, EXAMPLE_PLUGIN.read_bytes())
+        self.assertEqual(h["Content-Type"], "application/javascript; charset=utf-8")
+        self.assertEqual(h["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(h["Content-Security-Policy"], viewer.CSP_ONLINE)       # plug-ins get no extra origins
+
+    def test_allow_list_is_exact(self):
+        s = self.serve()
+        for path in ["/plugins/off.js",                       # present on disk, listed but disabled
+                     "/plugins/other.js",                     # on disk, not listed at all
+                     "/plugins/nope.js", "/plugins/", "/plugins", "/plugins/tasks-board", "/plugins/tasks-board.js/",
+                     "/plugins/tasks-board.js/x", "/plugins/TASKS-BOARD.js", "/plugins/../viewer.json",
+                     "/plugins/..%2fsecret.js", "/plugins/%2e%2e/secret.js", "/plugins/tasks-board.js%00.png",
+                     "/plugins/.viewer/plugins/tasks-board.js", "/plugins//tasks-board.js", "/plugins/tasks-board.JS",
+                     "/plugins/-x.js", "/plugins/" + "a" * 60 + ".js"]:
+            with self.subTest(path=path):
+                st, _, body = s.req("GET", path)
+                self.assertIn(st, (404, 403))
+                self.assertNotIn(b"SECRET", body)
+                self.assertNotIn(b"__other", body)
+                self.assertNotIn(b"VaultViewer.register", body)
+
+    def test_host_guard_applies(self):
+        s = self.serve()
+        self.assertEqual(s.req("GET", "/plugins/tasks-board.js", host="evil.example")[0], 403)
+
+    def test_script_tag_only_for_enabled_plugins(self):
+        for offline in (False, True):
+            with self.subTest(offline=offline):
+                s = self.serve(offline=offline)
+                html = s.req("GET", "/")[2].decode()
+                self.assertEqual(html.count('<script src="/plugins/'), 1)
+                self.assertIn('<script src="/plugins/tasks-board.js"></script>', html)
+                self.assertNotIn("off.js", html)
+                self.assertNotIn("/plugins/other", html)
+                self.assertIn('"plugins": ["tasks-board"]', html)
+                # after the app script, so window.VaultViewer exists when the plug-in runs
+                self.assertGreater(html.index('<script src="/plugins/tasks-board.js">'), html.index("window.VaultViewer = "))
+                s.stop()
+                viewer.init_config(VAULT)
+
+    def test_no_plugins_no_tags_and_no_change(self):
+        viewer.init_config(VAULT)
+        html = viewer.render_page("online")
+        self.assertNotIn("/plugins/", html.replace("/plugins/<id>", ""))
+        self.assertIn('"plugins": []', html)
+
+    def test_edits_to_an_enabled_plugin_show_without_restart(self):
+        s = self.serve()
+        (self.root / ".viewer" / "plugins" / "tasks-board.js").write_text("// v2", encoding="utf-8")
+        self.assertEqual(s.req("GET", "/plugins/tasks-board.js")[2], b"// v2")
+
+    def test_plugin_replaced_by_symlink_out_of_vault_is_refused(self):
+        s = self.serve()
+        f = self.root / ".viewer" / "plugins" / "tasks-board.js"
+        f.unlink()
+        try:
+            f.symlink_to(self.root.parent / "secret.js")
+        except OSError:
+            self.skipTest("symlinks not supported")
+        st, _, body = s.req("GET", "/plugins/tasks-board.js")
+        self.assertEqual(st, 404)
+        self.assertNotIn(b"SECRET", body)
+
+
+class PluginExportTests(unittest.TestCase):
+    def test_export_inlines_plugin_and_escapes_closing_tags(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "vault"
+            src = EXAMPLE_PLUGIN.read_text(encoding="utf-8") + '\nwindow.__x = "</script><b>"; var y = "</SCRIPT>";\n'
+            make_plugin_vault(root, plugin_src=src)
+            out = Path(d) / "out.html"
+            r = subprocess.run([sys.executable, str(ROOT / "viewer.py"), "--vault", str(root), "--export", str(out)],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            html = out.read_text(encoding="utf-8")
+        self.assertIn("Plug-in enabled: tasks-board (.viewer/plugins/tasks-board.js)", r.stdout)
+        self.assertIn('id: "tasks-board"', html)                              # inlined
+        self.assertNotRegex(html, r'<script[^>]+src=')                         # nothing external
+        self.assertNotIn('src="/plugins/', html)
+        self.assertNotIn("__other", html)                                      # the unlisted file is not included
+        self.assertIn('window.__x = "<\\/script><b>"', html)
+        self.assertIn('var y = "<\\/SCRIPT>"', html)
+        # marked, force-graph, data, app, plug-in: the plug-in's own "</script" strings did not close anything early
+        self.assertEqual(len(re.findall(r"</script>", html, re.I)), 5)
+        self.assertIn("connect-src 'none'", html)
+        self.assertIn('"plugins": ["tasks-board"]', html)
+        self.assertLess(html.index("window.VaultViewer = "), html.index('id: "tasks-board"'))
+
+    def test_export_without_plugins_is_unchanged(self):
+        viewer.init_config(VAULT)
+        html = viewer.render_page("export", {"notes": {}})
+        self.assertNotIn("tasks-board", html)
+
+
+@unittest.skipUnless(NODE, "node not available")
+class PluginHostTests(unittest.TestCase):
+    def test_register_validation(self):
+        r = run_page_js("""
+          FLAGS.plugins = ["good", "future", "nomount"];
+          console.warn = () => {};
+          const ok = { id: "good", title: "Good", api: 1, mount() {} };
+          const results = {
+            good: window.VaultViewer.register(ok),
+            again: window.VaultViewer.register({ ...ok }),                               // duplicate
+            future: window.VaultViewer.register({ ...ok, id: "future", api: 2 }),         // api > 1
+            noapi: window.VaultViewer.register({ id: "future", title: "x", mount() {} }),
+            zero: window.VaultViewer.register({ id: "future", title: "x", api: 0, mount() {} }),
+            notEnabled: window.VaultViewer.register({ ...ok, id: "evil" }),
+            badId: window.VaultViewer.register({ ...ok, id: "../x" }),
+            nomount: window.VaultViewer.register({ id: "nomount", title: "x", api: 1 }),
+            notitle: window.VaultViewer.register({ id: "nomount", api: 1, mount() {} }),
+            notObj: window.VaultViewer.register(null),
+            str: window.VaultViewer.register("good"),
+          };
+          let replaced = true;
+          try { "use strict"; window.VaultViewer.register = () => 1; replaced = window.VaultViewer.register(null) === 1; } catch (_) { replaced = false; }
+          console.log(JSON.stringify({ results, version: window.VaultViewer.apiVersion, registered: [...pluginRegistry.keys()], replaced }));""")
+        self.assertEqual(r["results"], {"good": True, "again": False, "future": False, "noapi": False, "zero": False,
+                                        "notEnabled": False, "badId": False, "nomount": False, "notitle": False,
+                                        "notObj": False, "str": False})
+        self.assertEqual(r["version"], 1)
+        self.assertEqual(r["registered"], ["good"])
+        self.assertFalse(r["replaced"])                                  # the host object is frozen
+
+    def test_refusals_are_logged_with_a_reason(self):
+        r = run_page_js("""
+          FLAGS.plugins = ["p"]; const logs = []; console.warn = (...a) => logs.push(a.join(" "));
+          window.VaultViewer.register({ id: "p", title: "t", api: 2, mount() {} });
+          window.VaultViewer.register({ id: "q", title: "t", api: 1, mount() {} });
+          console.log(JSON.stringify(logs));""")
+        self.assertIn("needs host API 2", r[0])
+        self.assertIn("not enabled", r[1])
+
+    def test_host_object(self):
+        r = run_page_js("""
+          FLAGS.remote_images = "block";
+          vault = { folders: [{ folder: "10-k", notes: [{ path: "10-k/A.md", name: "A", type: "wiedza" }, { path: "B.md", name: "B" }] }], stems: {} };
+          currentNotePath = "outer.md";
+          const host = makeHost();
+          const html = host.renderMarkdown("<b>raw</b> ![](https://t.example/p.gif) ![[Nope]] [x](javascript:alert(1))", "10-k/A.md");
+          const hits = []; const off = host.onVaultChange(() => hits.push(1));
+          fireVaultChange(); off(); fireVaultChange();
+          vaultChangeCbs.add(() => { throw new Error("boom"); }); console.warn = () => {}; fireVaultChange();
+          console.log(JSON.stringify({ html, version: host.apiVersion, notes: host.notes(), esc: host.esc("<&>\\"'"),
+            frozen: Object.isFrozen(host), hits: hits.length, restored: currentNotePath, embeds: embedsOn,
+            apiIsFn: typeof host.api, openNote: typeof host.openNote }));""")
+        self.assertIn("&lt;b&gt;raw&lt;/b&gt;", r["html"])
+        self.assertIn("remote-img", r["html"])                           # the remote-images policy applies
+        self.assertNotIn("<img", r["html"])
+        self.assertNotIn("javascript:", r["html"])
+        self.assertEqual(r["notes"], [{"path": "10-k/A.md", "name": "A", "type": "wiedza", "folder": "10-k"},
+                                      {"path": "B.md", "name": "B", "type": "", "folder": "10-k"}])
+        self.assertEqual(r["esc"], "&lt;&amp;&gt;&quot;&#39;")
+        self.assertEqual((r["version"], r["frozen"], r["hits"]), (1, True, 1))   # unsubscribed after the first fire
+        self.assertEqual((r["restored"], r["embeds"]), ("outer.md", False))
+        self.assertEqual((r["apiIsFn"], r["openNote"]), ("function", "function"))
+
+    def test_render_markdown_resolves_relative_to_base_path(self):
+        r = run_page_js("""
+          vault = { folders: [{ folder: "x", notes: [{ path: "d/Other.md", name: "Other" }] }], stems: {} };
+          console.log(JSON.stringify(makeHost().renderMarkdown("[o](Other.md)", "d/Here.md")));""")
+        self.assertIn('data-path="d/Other.md"', r)
+
+    def test_host_api_is_the_app_api(self):
+        r = run_page_js("""
+          const notes = {"A.md": {path: "A.md", name: "A", content: "x"}};
+          Promise.all([makeHost().api("note", "A.md"), makeHost().api("search", "hell")]).then(v => console.log(JSON.stringify(v)));""",
+                        export_data={"notes": {"A.md": {"path": "A.md", "name": "A", "content": "hello"}}})
+        self.assertEqual(r[0]["content"], "hello")
+        self.assertEqual(r[1][0]["path"], "A.md")                        # search runs client-side in an export
+
+    def test_page_has_overlay_button_slot_and_escape(self):
+        js = page_script("online")
+        html = viewer.render_page("online")
+        self.assertIn('id="plugin-wrap" hidden', html)
+        self.assertIn('id="plugin-mount"', html)
+        self.assertIn('anchor.after(btn)', js)
+        self.assertIn('document.getElementById("graph-btn")', js)
+        self.assertRegex(js, r'if \(e\.key === "Escape"\) \{\s*if \(activePlugin\) closePlugin\(\);')
+        self.assertRegex(js, r"function openNote\(note\) \{\s*closeSidebar\(\);\s*if \(graphMode\) closeGraph\(\);\s*closePlugin\(\);")
+        self.assertIn("rec.def.mount(mount, makeHost())", js)
+        self.assertIn("rec.def.unmount()", js)
+        self.assertIn("fireVaultChange()", js)
+
+
+@unittest.skipUnless(NODE, "node not available")
+class ExamplePluginTests(unittest.TestCase):
+    """Runs examples/plugins/tasks-board.js under node against a fake host fed with the fixture vault."""
+
+    def run_plugin(self, extra_notes=None, search_override=None):
+        viewer.init_config(VAULT)
+        notes = {n["path"]: {"path": n["path"], "name": n["name"], "content": n["text"]} for n in viewer.get_index().notes}
+        notes.update(extra_notes or {})
+        script = f"""
+          const src = require("fs").readFileSync({json.dumps(str(EXAMPLE_PLUGIN))}, "utf8");
+          const notes = {json.dumps(notes)}; let searchResult = {json.dumps(search_override)};
+          const win = {{ VaultViewer: {{ register(d) {{ win.def = d; return true; }} }} }};
+          new Function("window", src)(win);
+          const log = {{ opened: [], subs: 0, unsubs: 0, calls: [] }};
+          const host = {{
+            esc: s => String(s ?? "").replace(/[&<>"']/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}}[c])),
+            api: async (kind, arg) => {{ log.calls.push(kind); if (kind === "search") return searchResult || Object.values(notes).filter(n => n.content.includes(arg)).map(n => ({{path: n.path}}));
+              return notes[arg]; }},
+            notes: () => Object.values(notes).map(n => ({{path: n.path}})),
+            openNote: p => log.opened.push(p),
+            onVaultChange: cb => {{ log.subs++; return () => log.unsubs++; }},
+          }};
+          const el = {{ innerHTML: "", onclick: null }};
+          (async () => {{
+            await win.def.mount(el, host);
+            const html = el.innerHTML;
+            el.onclick({{ target: {{ closest: () => ({{ dataset: {{ path: "20-projects/Tasks.md" }} }}) }}, preventDefault() {{}} }});
+            el.onclick({{ target: {{ closest: () => null }}, preventDefault() {{}} }});
+            win.def.unmount();
+            console.log(JSON.stringify({{ meta: [win.def.id, win.def.title, win.def.api], html, log }}));
+          }})();"""
+        return self._node(script)
+
+    def _node(self, script):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "t.js"
+            f.write_text(script, encoding="utf-8")
+            r = subprocess.run([NODE, str(f)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        viewer.init_config(VAULT)
+        return json.loads(r.stdout)
+
+    def test_lists_only_open_overdue_tasks(self):
+        r = self.run_plugin()
+        self.assertEqual(r["meta"], ["tasks-board", "Overdue", 1])
+        h = r["html"]
+        self.assertIn("Overdue job", h)
+        self.assertIn("2020-01-01", h)
+        self.assertIn("in progress", h)
+        self.assertIn('data-path="20-projects/Tasks.md"', h)
+        self.assertIn("1 overdue", h)
+        for absent in ("Future job", "Finished job", "Waived job", "Missed job", "Verify job", "Bad link"):
+            self.assertNotIn(absent, h)
+        self.assertNotIn("[due::", h)                                     # inline fields are stripped from the row text
+
+    def test_links_open_through_the_host_and_unmount_unsubscribes(self):
+        r = self.run_plugin()
+        self.assertEqual(r["log"]["opened"], ["20-projects/Tasks.md"])    # the click on a non-link did nothing
+        self.assertEqual((r["log"]["subs"], r["log"]["unsubs"]), (1, 1))
+
+    def test_hostile_text_is_escaped_and_code_fences_ignored(self):
+        md = ("- [ ] <img src=x onerror=alert(1)> [due:: 2001-02-03]\n```\n- [ ] in fence [due:: 2001-01-01]\n```\n"
+              "- [ ] closed by state [state:: Done] [due:: 2001-01-01]\n")
+        r = self.run_plugin({"X <b>.md": {"path": "X <b>.md", "name": "X <b>", "content": md}})
+        self.assertNotIn("<img", r["html"])
+        self.assertNotIn("<b>", r["html"])
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", r["html"])
+        self.assertIn("X &lt;b&gt;", r["html"])
+        self.assertNotIn("in fence", r["html"])
+        self.assertNotIn("closed by state", r["html"])
+
+    def test_scans_all_notes_when_search_is_cut_off(self):
+        cut = [{"path": "01-daily/2025-01-01.md"}] * 50                    # a full page: results may be missing
+        r = self.run_plugin(search_override=cut)
+        self.assertIn("Overdue job", r["html"])                           # found by scanning host.notes()
+
+
 class GraphXssTests(unittest.TestCase):
     NAME = "<img src=x onerror=alert(1)>"
 

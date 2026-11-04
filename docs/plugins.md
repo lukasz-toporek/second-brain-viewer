@@ -1,6 +1,7 @@
 # Design note: vault-specific dashboards ("plugins")
 
-Status: proposal, no code. Goal: let a vault add its own views (e.g. an overdue-tasks
+Status: **v1 (frontend layer) is implemented**; the Python data-provider layer below is still a proposal.
+See the README ("Plug-ins") for how to use it and `examples/plugins/tasks-board.js` for an example. Goal: let a vault add its own views (e.g. an overdue-tasks
 board, a course tracker) without forking `viewer.py` or breaking its constraints
 (stdlib only, one runnable file, no build step, local-only, safe against hostile notes).
 
@@ -11,7 +12,26 @@ board, a course tracker) without forking `viewer.py` or breaking its constraints
   put there and explicitly enabled.
 - Works in `--offline` and `--export` (no network, no server-side calls from exports).
 
-## Proposed shape
+## Implemented in v1
+Following the answer to the last open question below, v1 has **no manifest and no Python**: a plug-in is one `.js` file.
+
+```json
+"plugins": [
+  {"id": "tasks-board", "file": ".viewer/plugins/tasks-board.js", "enabled": true}
+]
+```
+
+- `id` matches `^[a-z0-9][a-z0-9-]{0,40}$`; `file` is vault-relative, ends in `.js`, is resolved with
+  `resolve()` + `is_relative_to(vault)` and is **not** subject to `skip()` (otherwise `.viewer/` would be skipped).
+  Only `"enabled": true` entries load; invalid ones print a warning and are skipped; enabled ids are printed at startup.
+- Served at `/plugins/<id>.js` from an exact allow-list built at startup (also re-checked per request); inlined
+  (with `</script` escaped) by `--export`. CSPs are unchanged.
+- `window.VaultViewer = {apiVersion: 1, register(def)}` with `def = {id, title, api: 1, mount(el, host), unmount?()}`;
+  `host = {api, openNote, notes, esc, renderMarkdown, onVaultChange}` (the other extension points listed below stay reserved).
+  One toolbar button per plug-in next to *Graph*, opening an overlay like the graph's.
+- Not in v1: manifests, styles/`style` files, Python providers, extra `marked` extensions, chip renderers, sidebar sections.
+
+## Proposed shape (full design; only part of it is implemented)
 Config in `viewer.json` (new, optional key):
 
 ```json
@@ -82,3 +102,4 @@ supports and logs why, instead of failing silently.
   index as read-only; the cache invalidation (mtime snapshot) already exists.
 - Is a manifest worth it for a single-file tool, or is `"plugins": ["path/to/file.js"]` enough
   for v1? Start with the file list and add the manifest when a second capability (data provider) lands.
+  **Decision (v1):** file list, no manifest. The manifest and the Python provider layer are future work.

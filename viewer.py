@@ -41,6 +41,7 @@ CONFIG: dict = {}
 OFFLINE: bool = False
 REMOTE_IMAGE_MODES = ("allow", "click", "block")
 REMOTE_IMAGES: str = "allow"             # the validated "remote_images" setting (online mode only)
+PLUGINS: dict = {}                       # enabled, validated plug-ins: id -> resolved Path of its .js file
 
 
 def load_config(vault_path: Path) -> dict:
@@ -66,7 +67,7 @@ def load_config(vault_path: Path) -> dict:
 
 
 def init_config(vault_path: Path) -> None:
-    global VAULT, OUTPUT, SKIP_NAMES, SKIP_DIRS, FOLDER_ORDER, CONFIG, REMOTE_IMAGES, _INDEX_CACHE
+    global VAULT, OUTPUT, SKIP_NAMES, SKIP_DIRS, FOLDER_ORDER, CONFIG, REMOTE_IMAGES, PLUGINS, _INDEX_CACHE
     _INDEX_CACHE = (None, None)          # the cache is keyed by vault-relative paths: drop it per vault
     VAULT = vault_path.resolve()
     CONFIG = load_config(VAULT)
@@ -79,6 +80,93 @@ def init_config(vault_path: Path) -> None:
         print(f"warning: viewer config: \"remote_images\" must be one of {', '.join(REMOTE_IMAGE_MODES)} "
               f"(got {REMOTE_IMAGES!r}); using \"block\"", file=sys.stderr)
         REMOTE_IMAGES = "block"
+    PLUGINS, problems = load_plugins(CONFIG, VAULT)
+    for msg in problems:
+        print(f"warning: viewer config: {msg}", file=sys.stderr)
+
+
+# ── Plug-ins (frontend, v1) ─────────────────────────────────────────────────
+
+PLUGIN_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,40}")
+PLUGIN_MAX_BYTES = 1_000_000
+
+
+def load_plugins(cfg: dict, vault: Path) -> tuple:
+    """Validate the optional ``"plugins"`` config key -> ``({id: resolved Path}, [warning, ...])``.
+
+    Each entry is ``{"id": "tasks-board", "file": ".viewer/plugins/tasks-board.js", "enabled": true}``.
+    Only entries with ``"enabled": true`` load. ``file`` is vault-relative, must end in ``.js`` and, after
+    ``resolve()``, stay inside the vault. It is deliberately *not* subject to skip(): ``.viewer/`` would
+    usually be a skipped folder. A bad entry produces a warning and is skipped; nothing raises.
+    """
+    raw = cfg.get("plugins")
+    if raw is None:
+        return {}, []
+    if not isinstance(raw, list):
+        return {}, ['"plugins" must be a list; ignoring it']
+    found: dict = {}
+    problems: list = []
+    root = vault.resolve()
+    for n, entry in enumerate(raw):
+        where = f"plugins[{n}]"
+        if not isinstance(entry, dict):
+            problems.append(f"{where}: must be an object; skipped")
+            continue
+        if entry.get("enabled") is not True:
+            continue                                        # disabled (or not explicitly enabled): not loaded
+        pid, rel = entry.get("id"), entry.get("file")
+        if not isinstance(pid, str) or not PLUGIN_ID_RE.fullmatch(pid):
+            problems.append(f"{where}: invalid id {pid!r} (must match [a-z0-9][a-z0-9-]{{0,40}}); skipped")
+            continue
+        where = f"plugin {pid!r}"
+        if pid in found:
+            problems.append(f"{where}: duplicate id; the later entry is skipped")
+            continue
+        if not isinstance(rel, str) or not rel.endswith(".js") or "\0" in rel:
+            problems.append(f"{where}: \"file\" must be a vault-relative path ending in .js; skipped")
+            continue
+        try:
+            full = (root / rel).resolve()
+            inside = full.is_relative_to(root)
+        except (OSError, ValueError):
+            inside = False
+        if not inside:
+            problems.append(f"{where}: file {rel!r} is outside the vault; skipped")
+        elif not full.is_file():
+            problems.append(f"{where}: file {rel!r} not found; skipped")
+        elif full.stat().st_size > PLUGIN_MAX_BYTES:
+            problems.append(f"{where}: file {rel!r} is larger than {PLUGIN_MAX_BYTES} bytes; skipped")
+        else:
+            found[pid] = full
+    return found, problems
+
+
+def plugin_file(pid: str):
+    """Path of the enabled plug-in `pid` (re-checked: still a file inside the vault), else None."""
+    full = PLUGINS.get(pid)
+    if full is None:
+        return None
+    try:
+        root = VAULT.resolve()
+        full = full.resolve()
+        if full.is_relative_to(root) and full.is_file() and full.stat().st_size <= PLUGIN_MAX_BYTES:
+            return full
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def plugin_source(pid: str) -> str:
+    """Plug-in code safe to inline in a <script> element (a closing tag cannot occur in it)."""
+    f = plugin_file(pid)
+    text = f.read_text(encoding="utf-8") if f else ""
+    return re.sub(r"</(script)", r"<\\/\1", text, flags=re.I)
+
+
+def print_plugins() -> None:
+    for pid, full in PLUGINS.items():
+        print(f"✓ Plug-in enabled: {pid} ({full.relative_to(VAULT.resolve()).as_posix()})")
+
 
 # ── Init / scaffold ─────────────────────────────────────────────────────────
 
@@ -731,6 +819,15 @@ body {
 }
 #graph-wrap[hidden] { display: none; }
 
+/* plug-in overlay: same place as the graph */
+#plugin-wrap { position: absolute; top: 36px; left: 0; right: 0; bottom: 0; background: var(--bg);
+  overflow: auto; z-index: 5; }
+#plugin-wrap[hidden] { display: none; }
+.plugin-head { display: flex; align-items: center; justify-content: space-between; padding: 6px 16px;
+  background: var(--sb); border-bottom: 1px solid var(--bd); position: sticky; top: 0; z-index: 1;
+  font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--tx2); }
+#plugin-mount { padding: 20px 28px 60px; }
+
 .graph-hint {
   position: absolute;
   bottom: 16px;
@@ -1378,6 +1475,10 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
     <div id="fg-mount" style="width:100%;height:100%"></div>
     <div class="graph-hint">scroll = zoom · drag = pan · click node to open note</div>
   </div>
+  <div id="plugin-wrap" hidden>
+    <div class="plugin-head"><span id="plugin-title"></span><button class="chat-close" id="plugin-close" title="Close (Esc)">×</button></div>
+    <div id="plugin-mount"></div>
+  </div>
 </div>
 
 <div class="chat-panel" id="chat-panel" hidden>
@@ -1763,6 +1864,67 @@ async function fillEmbed(el, chain) {
   }
 }
 
+// ── Plug-ins, host API v1 (frontend only) ──
+// A plug-in is a vault-owned script listed and enabled in viewer.json; the server tells us which ids are
+// enabled (FLAGS.plugins). It calls window.VaultViewer.register({id, title, api: 1, mount(el, host), unmount?()}).
+const PLUGIN_API = 1, PLUGIN_ID_RE = /^[a-z0-9][a-z0-9-]{0,40}$/;
+const pluginRegistry = new Map();       // id -> {def, btn}
+const vaultChangeCbs = new Set();
+let pluginUi = null;                    // set below, once the DOM-facing helpers exist
+// Why `def` cannot be registered (a string), or null if it can.
+function pluginProblem(def, enabled, registered) {
+  if (!def || typeof def !== "object") return "the definition must be an object";
+  if (typeof def.id !== "string" || !PLUGIN_ID_RE.test(def.id)) return "invalid id";
+  if (!enabled.includes(def.id)) return `"${def.id}" is not enabled in the vault's viewer.json`;
+  if (registered.has(def.id)) return `"${def.id}" is already registered`;
+  if (!Number.isInteger(def.api) || def.api < 1) return `"${def.id}" must declare api: ${PLUGIN_API}`;
+  if (def.api > PLUGIN_API) return `"${def.id}" needs host API ${def.api}; this viewer supports ${PLUGIN_API}`;
+  if (typeof def.title !== "string" || !def.title.trim()) return `"${def.id}" needs a title`;
+  if (typeof def.mount !== "function") return `"${def.id}" needs a mount(el, host) function`;
+  return null;
+}
+// The object a plug-in receives in mount(el, host).
+function makeHost() {
+  return Object.freeze({
+    apiVersion: PLUGIN_API,
+    api: (kind, arg) => api(kind, arg),            // live server or the embedded export data, like the app
+    openNote(path) {
+      const n = findNote(String(path));
+      if (n) openNote({ path: n.path, name: n.name, type: n.type, folder: n.path.split("/")[0] });
+    },
+    notes: () => (vault ? vault.folders.flatMap(sec => sec.notes.map(n =>
+      ({ path: n.path, name: n.name, type: n.type || "", folder: sec.folder }))) : []),
+    esc,
+    // Markdown -> HTML through the app's own marked setup: raw HTML is escaped, URLs are filtered, the
+    // remote-images policy applies. basePath is the note that relative links/attachments resolve against.
+    renderMarkdown(md, basePath) {
+      if (typeof marked === "undefined") return esc(md);
+      const prevPath = currentNotePath, prevOn = embedsOn;
+      currentNotePath = String(basePath || ""); embedsOn = false;
+      try { return marked.parse(String(md ?? "")); } finally { currentNotePath = prevPath; embedsOn = prevOn; }
+    },
+    onVaultChange(cb) {
+      if (typeof cb !== "function") return () => {};
+      vaultChangeCbs.add(cb);
+      return () => vaultChangeCbs.delete(cb);
+    },
+  });
+}
+function fireVaultChange() {
+  vaultChangeCbs.forEach(cb => { try { cb(); } catch (e) { console.warn("[VaultViewer] onVaultChange callback failed:", e); } });
+}
+window.VaultViewer = Object.freeze({
+  apiVersion: PLUGIN_API,
+  register(def) {
+    const why = pluginProblem(def, (typeof FLAGS !== "undefined" && FLAGS.plugins) || [], pluginRegistry);
+    if (why) { console.warn("[VaultViewer] plug-in refused:", why); return false; }
+    const rec = { def, btn: null };
+    pluginRegistry.set(def.id, rec);
+    if (pluginUi) pluginUi.add(rec);
+    return true;
+  },
+});
+
 // "Load image" (remote_images: "click"): swaps the placeholder for the real <img>, for that one image only
 document.addEventListener("click", e => {
   const b = e.target.closest && e.target.closest("button.ri-load");
@@ -1868,6 +2030,7 @@ const hashFor = path => "#" + encodeURIComponent(path);
 function openNote(note) {
   closeSidebar();
   if (graphMode) closeGraph();
+  closePlugin();
   if (!tabs.find(t => t.path === note.path)) {
     tabs.push(note);
     if (tabs.length > 8) tabs.shift();
@@ -1982,7 +2145,7 @@ async function load() {
     vault = await api("vault");
     noteIdx = null; fileIdx = null;
     if (searchQ) runSearch(); else renderTree();
-    if (first) routeFromHash();
+    if (first) routeFromHash(); else fireVaultChange();       // plug-ins: onVaultChange
   } catch(e) {
     document.getElementById("tree").innerHTML = `<div class="err">${esc(e.message)}</div>`;
   } finally {
@@ -2046,7 +2209,8 @@ document.addEventListener("keydown", e => {
   if (e.key === "r" && !e.ctrlKey && !e.metaKey) load();
   if (e.key === "/") { e.preventDefault(); document.getElementById("srch").focus(); }
   if (e.key === "Escape") {
-    if (graphMode) closeGraph();
+    if (activePlugin) closePlugin();
+    else if (graphMode) closeGraph();
     else if (FLAGS.chat && chatOpen) closeChat();
     else document.getElementById("srch").blur();
   }
@@ -2060,6 +2224,7 @@ let graphData = null;
 let fgInstance = null;
 
 async function openGraph() {
+  closePlugin();
   graphMode = true;
   document.getElementById("graph-btn").classList.add("active");
   const wrap = document.getElementById("graph-wrap");
@@ -2150,6 +2315,56 @@ function renderGraph() {
 document.getElementById("graph-btn").addEventListener("click", () => {
   graphMode ? closeGraph() : openGraph();
 });
+
+// ── Plug-in overlay + toolbar buttons (next to Graph) ─────────────────────────
+let activePlugin = null;
+function openPlugin(id) {
+  const rec = pluginRegistry.get(id);
+  if (!rec) return;
+  if (activePlugin === id) { closePlugin(); return; }
+  closePlugin();
+  if (graphMode) closeGraph();
+  activePlugin = id;
+  if (rec.btn) rec.btn.classList.add("active");
+  const wrap = document.getElementById("plugin-wrap"), mount = document.getElementById("plugin-mount");
+  document.getElementById("plugin-title").textContent = rec.def.title;
+  mount.innerHTML = "";
+  wrap.hidden = false;
+  try {
+    Promise.resolve(rec.def.mount(mount, makeHost())).catch(e => pluginError(mount, e));
+  } catch (e) { pluginError(mount, e); }
+}
+function pluginError(mount, e) {
+  console.warn("[VaultViewer] plug-in failed:", e);
+  mount.innerHTML = `<div class="err">Plug-in error: ${esc(e && e.message || e)}</div>`;
+}
+function closePlugin() {
+  if (!activePlugin) return;
+  const rec = pluginRegistry.get(activePlugin);
+  activePlugin = null;
+  if (rec) {
+    if (rec.btn) rec.btn.classList.remove("active");
+    try { if (typeof rec.def.unmount === "function") rec.def.unmount(); }
+    catch (e) { console.warn("[VaultViewer] plug-in unmount failed:", e); }
+  }
+  document.getElementById("plugin-mount").innerHTML = "";
+  document.getElementById("plugin-wrap").hidden = true;
+}
+pluginUi = {
+  add(rec) {
+    const btn = document.createElement("button");
+    btn.className = "toolbar-btn";
+    btn.dataset.plugin = rec.def.id;
+    btn.textContent = rec.def.title;
+    btn.addEventListener("click", () => openPlugin(rec.def.id));
+    const anchor = [...document.querySelectorAll(".toolbar-btn[data-plugin]")].pop() || document.getElementById("graph-btn");
+    anchor.after(btn);                                  // right after Graph, in registration order
+    rec.btn = btn;
+  },
+};
+document.getElementById("plugin-close").addEventListener("click", closePlugin);
+// plug-ins that registered before this point (none can: they load after this script) get their button now
+pluginRegistry.forEach(rec => { if (!rec.btn) pluginUi.add(rec); });
 
 // ── Chat ──────────────────────────────────────────────────────────────────────
 let chatHistory = [];
@@ -2330,6 +2545,7 @@ load();
   };
 })();
 </script>
+__PLUGINS__
 </body>
 </html>"""
 
@@ -2414,7 +2630,8 @@ def render_page(mode: str = "online", data: dict = None) -> str:
     """mode: 'online' (CDN libs, chat) | 'offline' (vendored, no chat) | 'export' (single file)."""
     flags = {"chat": mode == "online", "watch": mode != "export", "export": mode == "export",
              # offline and export never load remote images; online follows the "remote_images" setting
-             "remote_images": REMOTE_IMAGES if mode == "online" else "block"}
+             "remote_images": REMOTE_IMAGES if mode == "online" else "block",
+             "plugins": list(PLUGINS)}
     head, libs, data_tag = "", "", ""
     if mode == "online":
         head, libs = CDN_FONTS, cdn_libs()
@@ -2428,15 +2645,19 @@ def render_page(mode: str = "online", data: dict = None) -> str:
             "<script>" + (VENDOR_DIR / f).read_text(encoding="utf-8").replace("</script", "<\\/script") + "</script>"
             for f in VENDOR_FILES)
         data_tag = "<script>window.__EXPORT__ = " + js_json(data) + ";</script>"
+    if mode == "export":
+        plug = "\n".join(f"<script>{plugin_source(pid)}</script>" for pid in PLUGINS)
+    else:
+        plug = "\n".join(f'<script src="/plugins/{pid}.js"></script>' for pid in PLUGINS)
     repl = {
         "FM": js_json(CONFIG.get("folders", {})),
         "TC": js_json(CONFIG.get("types", {})),
         "TITLE": html_escape(CONFIG.get("title", VAULT.name)),
         "FLAGS": js_json(flags),
-        "HEAD": head, "LIBS": libs, "DATA": data_tag,
+        "HEAD": head, "LIBS": libs, "DATA": data_tag, "PLUGINS": plug,
     }
     # single pass, so substituted content is never re-scanned for placeholders
-    return re.sub(r"__(FM|TC|TITLE|FLAGS|HEAD|LIBS|DATA)__", lambda m: repl[m.group(1)], VIEWER_HTML)
+    return re.sub(r"__(FM|TC|TITLE|FLAGS|HEAD|LIBS|DATA|PLUGINS)__", lambda m: repl[m.group(1)], VIEWER_HTML)
 
 
 BIND_HOST = "127.0.0.1"
@@ -2508,6 +2729,14 @@ class VaultHandler(BaseHTTPRequestHandler):
                 self._respond(404, "text/plain", b"Not found")
                 return
             self._respond(200, "application/javascript; charset=utf-8", (VENDOR_DIR / name).read_bytes())
+
+        elif parsed.path.startswith("/plugins/"):
+            m = re.fullmatch(r"/plugins/([a-z0-9][a-z0-9-]{0,40})\.js", parsed.path)
+            f = plugin_file(m.group(1)) if m else None      # exact allow-list: only enabled ids, nothing else
+            if f is None:
+                self._respond(404, "text/plain", b"Not found")
+                return
+            self._respond(200, "application/javascript; charset=utf-8", f.read_bytes(), cache=False)
 
         elif parsed.path == "/api/vault":
             body = json.dumps(vault_payload(), ensure_ascii=False).encode("utf-8")
@@ -2897,6 +3126,7 @@ def main() -> None:
         if i + 1 >= len(args) or args[i + 1].startswith("--"):
             sys.exit("error: --export needs an output file, e.g. --export vault.html")
         check_vendor()
+        print_plugins()
         export_html(Path(args[i + 1]))
         return
 
@@ -2908,6 +3138,7 @@ def main() -> None:
         vendor_sri()                      # warn once at startup if online mode can't pin the CDN files
 
     if "--serve" in args:
+        print_plugins()
         port = 5001
         if "--port" in args:
             port = int(args[args.index("--port") + 1])
