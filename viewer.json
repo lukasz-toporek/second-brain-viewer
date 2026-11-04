@@ -6,19 +6,25 @@
     "00-inbox", "01-daily", "10-knowledge", "20-projects", "30-learning", "90-meta"
   ],
   "folders": {
-    "00-inbox":     {"bg": "#1e1e1e", "fg": "#777",    "letter": "I"},
-    "01-daily":     {"bg": "#102030", "fg": "#5b9bd5", "letter": "D"},
-    "10-knowledge": {"bg": "#0a2020", "fg": "#4ecdc4", "letter": "K"},
-    "20-projects":  {"bg": "#201008", "fg": "#e07050", "letter": "P"},
-    "30-learning":  {"bg": "#1c1608", "fg": "#c8980a", "letter": "L"},
-    "90-meta":      {"bg": "#181818", "fg": "#555",    "letter": "M"},
-    "(vault root)": {"bg": "#201008", "fg": "#e07050", "letter": "~"}
+    "00-inbox":     {"bg": "#1e1e1e", "fg": "#777",    "letter": "I", "bg_light": "#e4e4e0", "fg_light": "#555555"},
+    "01-daily":     {"bg": "#102030", "fg": "#5b9bd5", "letter": "D", "bg_light": "#dbe8f5", "fg_light": "#1f63a6"},
+    "10-knowledge": {"bg": "#0a2020", "fg": "#4ecdc4", "letter": "K", "bg_light": "#d8efec", "fg_light": "#086860"},
+    "20-projects":  {"bg": "#201008", "fg": "#e07050", "letter": "P", "bg_light": "#f6e1d8", "fg_light": "#b43f1c"},
+    "30-learning":  {"bg": "#1c1608", "fg": "#c8980a", "letter": "L", "bg_light": "#f3e8c8", "fg_light": "#865f00"},
+    "90-meta":      {"bg": "#181818", "fg": "#555",    "letter": "M", "bg_light": "#e4e4e0", "fg_light": "#595959"},
+    "(vault root)": {"bg": "#201008", "fg": "#e07050", "letter": "~", "bg_light": "#f6e1d8", "fg_light": "#b43f1c"}
   },
   "types": {
     "daily":   "#5b9bd5",
     "meta":    "#888",
     "index":   "#888",
     "home":    "#e07050"
+  },
+  "types_light": {
+    "daily":   "#1f63a6",
+    "meta":    "#595959",
+    "index":   "#595959",
+    "home":    "#b43f1c"
   },
   "link_deprioritise": ["90-meta/Szablony", "_Archive"],
   "remote_images": "allow",

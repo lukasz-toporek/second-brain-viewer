@@ -4,16 +4,34 @@ A lightweight local viewer for Markdown knowledge bases. Zero dependencies — P
 
 ## Features
 
-- **File tree** sidebar with folder grouping and **full-text search** (see below)
+- **Nested file tree** sidebar and **full-text search** (see below). Folders nest to any depth: sub-folders first, then notes,
+  both sorted case-insensitively and number-aware (`2-x` before `10-x`); every folder shows a chevron, its label (number prefix
+  stripped at every level) and a recursive note count, and expands on its own. `folder_order` still orders the top level and
+  `(vault root)` notes stay in their own group. Which folders are open is remembered per vault title in `localStorage`, by
+  vault-relative folder path (entries for folders that no longer exist are dropped); live reload keeps it and the active highlight.
 - **Note rendering** with Markdown and frontmatter chips
 - **Wikilink graph** (force-directed, powered by [force-graph](https://github.com/vasturiano/force-graph))
 - **Chat** with your vault via Claude, Anthropic API, or any OpenAI-compatible backend (Ollama etc.)
 - **Live reload** — file watcher auto-refreshes the browser on vault changes
 - **Relative Markdown links** — `[text](../dir/Other%20note.md#Heading)` open the note like a wikilink (resolved against the current note's folder)
+  and, like wikilinks, become graph lines and backlinks. Frontmatter `aliases:` resolve `[[Nick]]`, names are matched Unicode-normalised
+  (NFC), and links inside code are ignored. The rules are the same for the graph, backlinks, the page, `--export` and the lint:
+  see **[docs/note-linking.md](docs/note-linking.md)** (which link forms make a graph line, and how to keep the graph connected)
 - **Attachments** — `![](pic.png)`, `![[pic.png]]`, `[doc](files/spec.pdf)` show vault images and link PDFs (see below)
 - **Obsidian syntax** — `[[wikilinks]]` (`[[A|alias]]`, `[[dir/A]]`, `[[A#Heading|x]]`), `> [!note]` callouts (foldable with `-` / `+`), `![[Note]]` embeds, a "Linked from" backlinks section
 - **Dataview inline fields** — `[state:: …] [due:: …] [link:: …]` render as chips; open tasks past their `due` date are marked overdue
 - **Mobile layout** — below 580 px a ☰ button at the left of the tab row opens the sidebar as an overlay with a backdrop (closes when a note opens, on Escape, or on a backdrop click)
+- **Frontmatter links** — in the chips above a note, `[[Note]]` values (also list items, `[[Note|label]]`, `[[Note#Heading]]`) are
+  clickable wikilinks like in the body, with the dashed "missing" style when the note does not exist; all other values stay escaped text.
+- **Navigation** — opening a note from anywhere (tree, link, URL hash, Back/Forward, search, graph, backlinks, plug-in)
+  expands its folders in the tree, highlights it and scrolls it into view without taking focus from the search box. The
+  breadcrumb shows the whole folder path (`knowledge / deep / nested / Gamma`, number prefixes stripped); clicking a folder
+  segment reveals and opens that folder in the tree (and opens the sidebar overlay on a phone). The Explorer header has
+  **Collapse all** and **Reveal active note** buttons next to Refresh.
+- **Tabs** — every tab has a **×** (on hover, always on the active tab and on touch devices; `aria-label="Close tab"`);
+  middle-click or **Delete** on a focused tab closes it too. Closing the active tab activates its neighbour (or shows the empty
+  start screen) and updates the URL hash. At 8 tabs the **least recently used** tab that is not active is dropped. A tab's tooltip is the
+  note's full vault path; when the tabs don't fit the bar scrolls sideways (also with the mouse wheel) and keeps the active tab in view.
 - **Deep links** — `#<note path>` in the URL; Back/Forward work
 - **Offline mode** and **single-file export** (see below)
 
@@ -147,8 +165,48 @@ value is reported on stderr and treated as `"block"`.
 The viewer follows the operating system's appearance setting (`prefers-color-scheme`), and switches live when the OS
 setting changes, including an open graph. The optional `"theme"` key in `viewer.json` is `"system"` (default),
 `"dark"` or `"light"`; the last two force a theme. Any other value prints a warning and falls back to `"system"`.
-It works the same in online, `--offline` and `--export` and needs no network access. Colours from `"types"` and
-`"folders"` stay as configured. Plug-ins should use the theme CSS variables (list in `docs/plugins.md`).
+It works the same in online, `--offline` and `--export` and needs no network access. Plug-ins should use the theme
+CSS variables (list in `docs/plugins.md`).
+
+Colours in `"folders"` and `"types"` are written for the dark theme, which uses them exactly as configured. In the
+light theme:
+
+- **Folder badges.** Add optional `"bg_light"` and `"fg_light"` to a `"folders"` entry and they are used instead.
+  Without them the badge is derived from the configured colour: a 15% tint of it over the light sidebar colour, with
+  the letter darkened (hue kept) until it reaches **4.5:1** contrast against that tint.
+- **Type colours.** An optional top-level `"types_light": {"<type>": "#rrggbb"}` map is used for the types it lists. For
+  any other type the configured colour is darkened (hue kept) until it reaches **3:1** against the page background,
+  which is enough for dots, graph nodes and chip text.
+- Switching the OS theme while the page is open re-colours the tree, tabs, chips and an open graph without a reload.
+
+```json
+"folders": {"10-knowledge": {"bg": "#0a2020", "fg": "#4ecdc4", "letter": "K", "bg_light": "#d8efec", "fg_light": "#086860"}},
+"types": {"wiedza": "#4ecdc4"},
+"types_light": {"wiedza": "#086860"}
+```
+
+### Keyboard and accessibility
+
+| Where | Keys |
+|---|---|
+| anywhere (not in a text box) | `/` focus search · `r` refresh · `Esc` close sidebar overlay / plug-in / graph / chat |
+| search box | `↓` steps into the tree (or the result list) |
+| file tree (`role="tree"`, one tab stop) | `↑` `↓` move between visible rows · `Home` `End` first/last · `→` open a folder, or step into it · `←` close a folder, or go to its parent · `Enter` / `Space` open a note or toggle a folder |
+| a focused tab | `Enter` / `Space` switch · `Delete` close (middle-click and the × also close) |
+
+Folders are `treeitem`s with `aria-expanded`, the active note has `aria-selected="true"`, and opening a note never moves focus.
+Graph, Chat and plug-in buttons have a `title`, an `aria-label` and `aria-pressed` while active; every SVG icon is
+`aria-hidden`. No icon or glyph (menu, ×, chevrons, send) is a font glyph: they are inline SVG, so the `--offline` page,
+which loads no web font, looks the same.
+
+### Default folder badges and type colours
+
+Without a `"folders"` entry a folder gets a **generated badge**: its first letter or digit (Unicode-aware, upper-cased, after the
+number prefix is dropped: `10-knowledge` → `K`, `żółw` → `Ż`, `(vault root)` → `~`) on a colour picked from a small palette by
+hashing the folder's vault-relative path, so a folder always has the same colour. It works at every tree level (sub-folders get
+a smaller badge) and in both themes (the light theme derives a readable badge as above). Configured `"folders"` entries still win.
+A note type that `"types"` does not list gets a stable colour from the same palette, hashed from the type name (an empty type
+stays grey; configured types win; the light theme darkens it to 3:1 like any other).
 
 ### Plug-ins (frontend, v1)
 
@@ -204,7 +262,15 @@ See `docs/plugins.md` for the design and what is still future work (Python data 
 ### Tests
 
 ```bash
-python3 -m unittest discover tests     # uses the fake vault in tests/fixtures/vault
+python3 -m unittest discover tests     # uses the fake vaults in tests/fixtures/
+```
+
+The viewer works with resolved paths, so tests compare resolved paths too. To check that nothing depends on the temp
+folder being a plain path (macOS reaches it through a symlink), run the suite with a symlinked `TMPDIR`:
+
+```bash
+B=$(mktemp -d); mkdir "$B/real"; ln -s "$B/real" "$B/link"
+TMPDIR="$B/link" python3 -m unittest discover tests
 ```
 
 ### Tools
@@ -215,6 +281,11 @@ cd ~/Projects/second-brain
 python3 ~/Projects/second-brain-viewer/tools/vault-lint.py
 # (accepts --vault PATH; valid types / required fields come from the optional
 #  "lint" key in viewer.json — see the template — defaults match the old built-in schema)
+
+# Opt-in structure checks ("lint": {"require_up": true, "report_groups": true} in viewer.json) and a link-group report
+python3 ~/Projects/second-brain-viewer/tools/vault-lint.py --groups
+# (every note except type: home needs an `up:` that resolves; --groups lists the separate groups of the link graph —
+#  see docs/note-linking.md)
 
 # Create today's daily note from template (90-meta/Szablony/Daily.md)
 python3 ~/Projects/second-brain-viewer/tools/daily-note.py
@@ -231,7 +302,7 @@ Place a `viewer.json` in the vault root (or any parent directory — the viewer 
   "skip_files": ["README.md", "_index.md"],
   "folder_order": ["00-inbox", "01-daily", "10-knowledge", "20-projects", "30-learning", "90-meta"],
   "folders": {
-    "00-inbox":     {"bg": "#1e1e1e", "fg": "#777",    "letter": "I"},
+    "00-inbox":     {"bg": "#1e1e1e", "fg": "#777",    "letter": "I", "bg_light": "#e4e4e0", "fg_light": "#555555"},
     "01-daily":     {"bg": "#102030", "fg": "#5b9bd5", "letter": "D"},
     "10-knowledge": {"bg": "#0a2020", "fg": "#4ecdc4", "letter": "K"},
     "20-projects":  {"bg": "#201008", "fg": "#e07050", "letter": "P"},
@@ -242,6 +313,7 @@ Place a `viewer.json` in the vault root (or any parent directory — the viewer 
     "daily": "#5b9bd5",
     "meta":  "#888"
   },
+  "types_light": {"daily": "#1f63a6", "meta": "#595959"},
   "link_deprioritise": ["90-meta/Szablony", "_Archive"],
   "remote_images": "allow",
   "theme": "system",

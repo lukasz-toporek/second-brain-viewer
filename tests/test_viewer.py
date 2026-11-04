@@ -1,4 +1,13 @@
-"""Tests for viewer.py (stdlib unittest). Run: python3 -m unittest discover tests"""
+"""Tests for viewer.py (stdlib unittest). Run: python3 -m unittest discover tests
+
+Paths rule: the viewer works with RESOLVED paths (VAULT, CONFIG_PATH, PLUGINS, ... are
+all .resolve()d, the symlink safety checks depend on it). On macOS the temp folder is
+reached through a symlink (/var -> /private/var), so a test must compare resolved
+paths: `self.root.resolve() / "x"`, never `self.root / "x"`, against a viewer path.
+Simulate that on any OS:
+    B=$(mktemp -d); mkdir $B/real; ln -s $B/real $B/link
+    TMPDIR=$B/link python3 -m unittest discover tests
+"""
 import base64
 import contextlib
 import io
@@ -8,11 +17,14 @@ import importlib.util
 import json
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import unicodedata
 import unittest
+import urllib.parse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,7 +48,7 @@ def run_page_js(snippet: str, mode="offline", export_data=None):
     document.addEventListener, which is stubbed. `snippet` runs after it and prints JSON.
     """
     js = page_script(mode)
-    a = js.index("// Only http(s), mailto")
+    a = js.index("const FM = ")
     b = js.index("// delegated click handler for wikilinks")
     prelude = (
         f"global.window = {{__EXPORT__: {json.dumps(export_data)}}}; global.document = {{addEventListener(){{}}}};\n"
@@ -148,7 +160,7 @@ class OnlineTests(unittest.TestCase):
     def test_backlinks(self):
         _, _, b = self.note("10-knowledge/Beta.md")
         names = {x["name"] for x in json.loads(b)["backlinks"]}
-        self.assertEqual(names, {"Alpha", "Gamma", "Home"})   # Gamma via path form too
+        self.assertEqual(names, {"Alpha", "Gamma", "Home", "Links"})   # Gamma via path form too; Links via a Markdown link
         _, _, b = self.note("20-projects/Tasks.md")
         names = {x["name"] for x in json.loads(b)["backlinks"]}
         self.assertEqual(names, {"Gamma", "Home"})            # Gamma: frontmatter-only link
@@ -1543,7 +1555,7 @@ class CliTests(unittest.TestCase):
         payload = json.loads(data.replace("<\\/", "</").replace("<\\u0021--", "<!--"))
         self.assertEqual(len(payload["notes"]), 9)
         self.assertEqual({b["name"] for b in payload["notes"]["10-knowledge/Beta.md"]["backlinks"]},
-                         {"Alpha", "Gamma", "Home"})
+                         {"Alpha", "Gamma", "Home", "Links"})        # Links: a Markdown link
         self.assertNotIn("SECRET", html)
 
     def test_offline_without_vendor_fails_clearly(self):
@@ -1710,13 +1722,14 @@ class PluginsDisabledTests(unittest.TestCase):
         child.mkdir()
         with contextlib.redirect_stderr(io.StringIO()):       # its plug-in file is not under child/: a warning
             viewer.init_config(child)
-        self.assertEqual(viewer.CONFIG_PATH, self.root / ".viewer.json")
+        real_cfg = self.root.resolve() / ".viewer.json"       # the viewer works with resolved paths
+        self.assertEqual(viewer.CONFIG_PATH, real_cfg)
         viewer.init_config(self.root)
-        self.assertEqual(viewer.CONFIG_PATH, self.root / ".viewer.json")
+        self.assertEqual(viewer.CONFIG_PATH, real_cfg)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             viewer.print_plugins()
-        self.assertIn(f"Plug-ins enabled by {self.root / '.viewer.json'}", buf.getvalue())
+        self.assertIn(f"Plug-ins enabled by {real_cfg}", buf.getvalue())
         self.assertIn("Plug-in enabled: tasks-board", buf.getvalue())
 
 
@@ -1941,6 +1954,878 @@ class ThemeTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn('"theme" must be one of', r.stderr)
             self.assertIn('<html lang="pl">', out.read_text(encoding="utf-8"))
+
+
+# ── Light-theme colours: a Python mirror of the page's colour maths (keep it parallel to darkenTo() etc.) ──
+LIGHT_BG, LIGHT_SH = "#fbfbfa", "#e9e9e5"
+
+
+def hex_rgb(h):
+    m = re.fullmatch(r"#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})", h.strip())
+    if not m:
+        return None
+    s = m.group(1)
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    return [int(s[i:i + 2], 16) for i in (0, 2, 4)]
+
+
+def js_round(x):                       # Math.round: halves go up (Python's round() goes to even)
+    return int(x + 0.5)
+
+
+def rgb_hex(c):
+    return "#" + "".join(f"{max(0, min(255, js_round(v))):02x}" for v in c)
+
+
+def contrast_rgb(a, b):
+    def lum(c):
+        ch = [v / 255 for v in c]
+        ch = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in ch]
+        return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2]
+    x, y = lum(a), lum(b)
+    return (max(x, y) + 0.05) / (min(x, y) + 0.05)
+
+
+def darken_to(hex_, bg_hex, minimum):
+    c, bg = hex_rgb(hex_), hex_rgb(bg_hex)
+    if c is None or bg is None:
+        return hex_
+    for i in range(51):
+        t = [js_round(v * (1 - i * 0.02)) for v in c]
+        if contrast_rgb(t, bg) >= minimum:
+            return rgb_hex(t)
+    return "#000000"
+
+
+PALETTE = ["#5b9bd5", "#4ecdc4", "#e07050", "#c8980a", "#9b8bdb", "#68b068", "#d4709a", "#7fa6c9"]
+
+
+def fnv1a(s):                                # mirror of hash32() on the page (UTF-16 code units)
+    h = 0x811c9dc5
+    for u in struct.unpack(f"<{len(s.encode('utf-16-le')) // 2}H", s.encode("utf-16-le")):
+        h = ((h ^ u) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def derived_light_badge(base):
+    c = hex_rgb(base)
+    bg = rgb_hex([v * 0.15 + w * 0.85 for v, w in zip(c, hex_rgb(LIGHT_SH))])
+    return bg, darken_to(base, bg, 4.5)
+
+
+class LightColourTests(unittest.TestCase):
+    """bg_light / fg_light / types_light: config reaches the page, and the derived colours are readable."""
+    CFG = {"folders": {"k": {"bg": "#0a2020", "fg": "#4ecdc4", "letter": "K", "bg_light": "#d8efec", "fg_light": "#086860"}},
+           "types": {"wiedza": "#4ecdc4", "x": "#888"}, "types_light": {"wiedza": "#086860"}}
+
+    def tearDown(self):
+        viewer.init_config(VAULT)
+
+    def test_light_config_reaches_the_page_in_all_modes(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "v"
+            shutil.copytree(VAULT, root)
+            (root / ".viewer.json").write_text(json.dumps(self.CFG), encoding="utf-8")
+            viewer.init_config(root)
+            for mode in ("online", "offline", "export"):
+                with self.subTest(mode=mode):
+                    html = viewer.render_page(mode, {"notes": {}})
+                    self.assertIn('"bg_light": "#d8efec"', html)
+                    self.assertIn('"fg_light": "#086860"', html)
+                    self.assertIn('const TCL = {"wiedza": "#086860"}', html)
+                    self.assertNotIn("__TCL__", html)
+
+    def test_types_light_defaults_to_empty_and_ignores_garbage(self):
+        viewer.init_config(VAULT)
+        self.assertIn("const TCL = {};", viewer.render_page("offline"))
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "v"
+            shutil.copytree(VAULT, root)
+            (root / ".viewer.json").write_text(json.dumps({"types_light": ["no"]}), encoding="utf-8")
+            viewer.init_config(root)
+            self.assertIn("const TCL = {};", viewer.render_page("offline"))
+
+    def test_repo_viewer_json_light_values_are_readable(self):
+        cfg = json.loads((ROOT / "viewer.json").read_text(encoding="utf-8"))
+        for name, f in cfg["folders"].items():
+            with self.subTest(folder=name, kind="explicit"):
+                self.assertGreaterEqual(contrast_rgb(hex_rgb(f["fg_light"]), hex_rgb(f["bg_light"])), 4.5)
+            with self.subTest(folder=name, kind="derived"):     # what the page derives when bg_light/fg_light are absent
+                bg, fg = derived_light_badge(f["fg"] if f["fg"].startswith("#") else f["bg"])
+                self.assertGreaterEqual(contrast_rgb(hex_rgb(fg), hex_rgb(bg)), 4.5)
+        for t, col in cfg["types_light"].items():
+            with self.subTest(type=t):
+                self.assertGreaterEqual(contrast_rgb(hex_rgb(col), hex_rgb(LIGHT_BG)), 3)
+        for t, col in cfg["types"].items():
+            with self.subTest(type=t, kind="darkened fallback"):
+                self.assertGreaterEqual(contrast_rgb(hex_rgb(darken_to(col, LIGHT_BG, 3)), hex_rgb(LIGHT_BG)), 3)
+        self.assertGreaterEqual(contrast_rgb(hex_rgb(darken_to("#888", LIGHT_BG, 3)), hex_rgb(LIGHT_BG)), 3)
+
+    def test_page_constants_match_the_css_palette(self):
+        _, light, _, _ = css_blocks()
+        js = page_script("offline")
+        self.assertIn(f'LIGHT_BG = "{light["--bg"]}"', js)
+        self.assertIn(f'LIGHT_SH = "{light["--sh"]}"', js)
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_js_matches_the_python_mirror(self):
+        colours = ["#888", "#888888", "#4ecdc4", "#5b9bd5", "#e07050", "#c8980a", "#9b8bdb", "#68b068", "#fff", "#000", "#777", "#555", "#d4709a"]
+        out = run_page_js(f"""
+          const cols = {json.dumps(colours)};
+          console.log(JSON.stringify({{
+            dark: cols.map(c => darkenTo(c, LIGHT_BG, 3)),
+            badge: cols.map(c => derivedLightBadge(c)),
+          }}));""")
+        self.assertEqual(out["dark"], [darken_to(c, LIGHT_BG, 3) for c in colours])
+        self.assertEqual([[b["bg"], b["fg"]] for b in out["badge"]], [list(derived_light_badge(c)) for c in colours])
+        for c in colours:
+            bg, fg = derived_light_badge(c)
+            self.assertGreaterEqual(contrast_rgb(hex_rgb(fg), hex_rgb(bg)), 4.5, c)
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_dark_theme_is_untouched_and_light_theme_uses_the_new_keys(self):
+        r = run_page_js("""
+          const fm = {k: {bg: "#0a2020", fg: "#4ecdc4", letter: "K", bg_light: "#d8efec", fg_light: "#086860"},
+                      plain: {bg: "#102030", fg: "#5b9bd5", letter: "D"}, onlybg: {bg: "#181818", letter: "M"}};
+          const tc = {wiedza: "#4ecdc4", grey: "#888"}, tcl = {wiedza: "#086860"};
+          console.log(JSON.stringify({
+            darkK: folderBadge("k", false, fm), lightK: folderBadge("k", true, fm),
+            darkPlain: folderBadge("plain", false, fm), lightPlain: folderBadge("plain", true, fm),
+            lightOnlyBg: folderBadge("onlybg", true, fm),
+            darkMissing: folderBadge("zzz", false, fm), lightMissing: folderBadge("zzz", true, fm),
+            tDark: [tcol("wiedza", false, tc, tcl), tcol("grey", false, tc, tcl), tcol("", false, tc, tcl)],
+            tLight: [tcol("wiedza", true, tc, tcl), tcol("grey", true, tc, tcl), tcol("", true, tc, tcl)],
+            alpha: [hexAlpha("#888", "dd"), hexAlpha("#4ecdc4", "44"), hexAlpha("var(--x)", "44")],
+          }));""")
+        self.assertEqual(r["darkK"], {"bg": "#0a2020", "fg": "#4ecdc4", "letter": "K"})           # exactly as configured
+        self.assertEqual(r["lightK"], {"bg": "#d8efec", "fg": "#086860", "letter": "K"})
+        self.assertEqual(r["darkPlain"], {"bg": "#102030", "fg": "#5b9bd5", "letter": "D"})
+        bg, fg = derived_light_badge("#5b9bd5")
+        self.assertEqual(r["lightPlain"], {"bg": bg, "fg": fg, "letter": "D"})
+        self.assertNotEqual(r["lightPlain"]["bg"], "#102030")                                  # no dark square in light mode
+        acc = PALETTE[fnv1a("zzz") % len(PALETTE)]                                                # generated for unconfigured folders
+        self.assertEqual(r["darkMissing"], {"bg": rgb_hex([v * 0.2 + w * 0.8 for v, w in zip(hex_rgb(acc), hex_rgb("#191919"))]),
+                                            "fg": acc, "letter": "Z"})
+        bg, fg = derived_light_badge(acc)
+        self.assertEqual(r["lightMissing"], {"bg": bg, "fg": fg, "letter": "Z"})
+        self.assertEqual(r["tDark"], ["#4ecdc4", "#888", "#888"])
+        self.assertEqual(r["tLight"][0], "#086860")                                              # types_light wins
+        self.assertEqual(r["tLight"][1], darken_to("#888", LIGHT_BG, 3))                          # kept, darkened to >= 3:1
+        self.assertEqual(r["alpha"], ["#888888dd", "#4ecdc444", "var(--x)"])
+
+
+DEEP = ROOT / "tests" / "fixtures" / "vault-deep"
+
+
+class NestedTreeTests(unittest.TestCase):
+    """The sidebar tree is built in the page from notes[*].path (/api/vault is unchanged)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.s = Server(vault=DEEP)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.s.stop()
+        viewer.init_config(VAULT)
+
+    def vault_json(self):
+        st, _, body = self.s.req("GET", "/api/vault")
+        self.assertEqual(st, 200)
+        return json.loads(body)
+
+    def test_every_note_path_appears_exactly_once_in_the_tree_data(self):
+        data = self.vault_json()
+        paths = [n["path"] for sec in data["folders"] for n in sec["notes"]]
+        on_disk = sorted(p.relative_to(DEEP.resolve()).as_posix() for p in DEEP.resolve().rglob("*.md"))
+        self.assertEqual(sorted(paths), on_disk)
+        self.assertEqual(len(paths), len(set(paths)))
+        self.assertTrue(any(p.count("/") >= 3 for p in paths))                 # at least 3 folder levels
+        self.assertEqual(set(data), {"generated", "notes", "folders", "stems", "files", "file_paths"})   # API unchanged
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_build_tree_nesting_order_counts_and_labels(self):
+        data = self.vault_json()
+        r = run_page_js(f"""
+          const roots = buildTree({json.dumps(data["folders"])});
+          const strip = n => ({{path: n.path, label: n.label, count: n.count,
+            folders: n.folders.map(strip), notes: n.notes.map(x => x.name)}});
+          console.log(JSON.stringify(roots.map(strip)));""", export_data=None)
+        by = {n["path"]: n for n in r}
+        self.assertEqual([n["path"] for n in r], ["(vault root)", "00-inbox", "10-knowledge", "20-projects"])   # server order kept
+        k = by["10-knowledge"]
+        self.assertEqual(k["label"], "knowledge")                              # number prefix stripped
+        self.assertEqual(k["count"], 7)                                         # recursive
+        # sub-folders first, number-aware and case-insensitive: 2-first < 10-second < deep < żółw
+        self.assertEqual([f["path"] for f in k["folders"]],
+                         ["10-knowledge/2-first", "10-knowledge/10-second", "10-knowledge/deep", "10-knowledge/żółw"])
+        self.assertEqual([f["label"] for f in k["folders"]], ["first", "second", "deep", "żółw"])   # prefix stripped at every level
+        self.assertEqual(k["notes"], ["Alpha"])
+        deep = k["folders"][2]
+        self.assertEqual((deep["count"], deep["notes"], [f["path"] for f in deep["folders"]]),
+                         (3, ["Beta"], ["10-knowledge/deep/nested"]))
+        nested = deep["folders"][0]
+        self.assertEqual((nested["notes"], nested["count"]), (["Gamma"], 2))
+        self.assertEqual(nested["folders"][0]["path"], "10-knowledge/deep/nested/more")
+        self.assertEqual(nested["folders"][0]["notes"], ["Delta"])
+        # two notes with the same name in different sub-folders stay two distinct rows
+        p = by["20-projects"]
+        self.assertEqual([f["path"] for f in p["folders"]], ["20-projects/eta", "20-projects/Zeta"])
+        self.assertEqual(p["count"], 2)
+        self.assertEqual(by["(vault root)"]["notes"], ["Root"])                 # vault root stays its own group
+        self.assertEqual(by["(vault root)"]["folders"], [])
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_tree_html_state_aria_and_prune(self):
+        data = self.vault_json()
+        r = run_page_js(f"""
+          const roots = buildTree({json.dumps(data["folders"])});
+          const ctx = {{expanded: new Set(["10-knowledge", "10-knowledge/deep"]), active: "10-knowledge/deep/Beta.md", light: false}};
+          const html = roots.map(n => folderHtml(n, 0, ctx)).join("");
+          const live = [...folderPaths(roots)];
+          console.log(JSON.stringify({{html, live}}));""")
+        html = r["html"]
+        self.assertIn('class="fhd open" role="treeitem" aria-expanded="true" aria-level="1" tabindex="-1" data-fpath="10-knowledge"', html)
+        self.assertIn('data-fpath="10-knowledge/deep"', html)
+        self.assertRegex(html, r'class="fhd" role="treeitem" aria-expanded="false" aria-level="3" tabindex="-1" data-fpath="10-knowledge/deep/nested"')
+        self.assertIn('<div class="fnotes" role="group" hidden>', html)         # collapsed folders hide their group
+        self.assertIn('class="ni active" role="treeitem" aria-level="3" aria-selected="true"', html)
+        self.assertEqual(html.count('data-path="'), 11)                          # every note exactly once
+        self.assertEqual(html.count("aria-selected=\"true\""), 1)
+        self.assertIn('class="folder sub" role="none" style="--depth:1"', html)
+        self.assertIn("10-knowledge/deep/nested/more", r["live"])
+        self.assertNotIn("90-gone", r["live"])
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_two_thousand_notes_build_and_render_quickly(self):
+        r = run_page_js("""
+          const notes = [];
+          for (let i = 0; i < 2000; i++) notes.push({path: `${i % 5}0-top/sub${i % 20}/deeper${i % 7}/Note ${i}.md`, name: `Note ${i}`, type: i % 3 ? "x" : ""});
+          const secs = [0, 1, 2, 3, 4].map(k => ({folder: `${k}0-top`, notes: notes.filter(n => n.path.startsWith(`${k}0-top/`))}));
+          const ctx = {expanded: new Set(), active: null, light: false};
+          const t0 = Date.now();
+          const html = buildTree(secs).map(n => folderHtml(n, 0, ctx)).join("");
+          console.log(JSON.stringify({ms: Date.now() - t0, rows: (html.match(/class="ni/g) || []).length}));""")
+        self.assertEqual(r["rows"], 2000)
+        self.assertLess(r["ms"], 100)
+
+    def test_page_keeps_the_existing_class_names_and_has_the_nested_css(self):
+        html = viewer.render_page("offline")
+        css = html.split("<style>")[1].split("</style>")[0]
+        for sel in (".folder", ".fhd", ".fnotes", ".ni", ".folder.sub > .fnotes"):
+            self.assertIn(sel, css)
+        js = page_script("offline")
+        self.assertIn("sbv-tree:", js)                                           # state is kept per vault title in localStorage
+        self.assertIn('"title": "Deep Fixture"', html)
+
+
+class DefaultBadgeTests(unittest.TestCase):
+    """Unconfigured folders and types get generated, stable badges and colours (instead of grey "?" / #888)."""
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_letter_is_unicode_aware_and_ignores_the_number_prefix(self):
+        names = ["10-knowledge", "01 daily", "żółw", "ćma", "2024", "10-", "Ünï", "(vault root)", "99-ñandú", "---"]
+        r = run_page_js(f"console.log(JSON.stringify({json.dumps(names)}.map(n => folderBadge(n, false, {{}}).letter)));")
+        self.assertEqual(r, ["K", "D", "Ż", "Ć", "2", "1", "Ü", "~", "Ñ", "?"])
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_vault_root_gets_its_tilde_and_colour_is_stable_per_path(self):
+        r = run_page_js("""
+          const a = folderBadge("10-knowledge", false, {}), b = folderBadge("10-knowledge", false, {});
+          const sub = folderBadge("10-knowledge/deep", false, {}), sub2 = folderBadge("10-knowledge/deep", false, {});
+          const paths = Array.from({length: 40}, (_, i) => "folder-" + i);
+          console.log(JSON.stringify({a, b, sub, sub2, root: folderBadge("(vault root)", true, {}),
+            fgs: paths.map(p => folderBadge(p, false, {}).fg)}));""")
+        self.assertEqual(r["a"], r["b"])
+        self.assertEqual(r["sub"], r["sub2"])
+        self.assertEqual(r["root"]["letter"], "~")
+        self.assertEqual(r["a"]["fg"], PALETTE[fnv1a("10-knowledge") % 8])          # same hash as the Python mirror
+        self.assertEqual(r["sub"]["fg"], PALETTE[fnv1a("10-knowledge/deep") % 8])
+        self.assertGreater(len(set(r["fgs"])), 4)                                   # the palette really varies
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_configured_folder_entries_still_win(self):
+        r = run_page_js("""
+          const fm = {"10-knowledge": {bg: "#0a2020", fg: "#4ecdc4", letter: "K"}};
+          console.log(JSON.stringify({d: folderBadge("10-knowledge", false, fm), partial: folderBadge("x", false, {x: {letter: "Q"}})}));""")
+        self.assertEqual(r["d"], {"bg": "#0a2020", "fg": "#4ecdc4", "letter": "K"})
+        self.assertEqual(r["partial"]["letter"], "Q")
+        self.assertEqual(r["partial"]["fg"], PALETTE[fnv1a("x") % 8])
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_unknown_types_are_coloured_stably_and_readable_in_light(self):
+        types = ["wiedza", "projekt", "person", "meeting", "weekly", "zażółć", "a", "b", "c", "d"]
+        r = run_page_js(f"""
+          const ts = {json.dumps(types)};
+          console.log(JSON.stringify({{dark: ts.map(t => tcol(t, false, {{}}, {{}})), again: ts.map(t => tcol(t, false, {{}}, {{}})),
+            light: ts.map(t => tcol(t, true, {{}}, {{}})), cfgd: tcol("meta", false, {{meta: "#888"}}, {{}}), empty: tcol("", false, {{}}, {{}}),
+            proto: tcol("constructor", false, {{}}, {{}})}}));""")
+        self.assertEqual(r["dark"], r["again"])
+        for t, col in zip(types, r["dark"]):
+            self.assertEqual(col, PALETTE[fnv1a(t) % 8], t)
+            c = hex_rgb(col)
+            self.assertFalse(c[0] == c[1] == c[2], f"{t} is grey")                 # not grey
+        self.assertGreater(len(set(r["dark"])), 3)
+        for col in r["light"]:
+            self.assertGreaterEqual(contrast_rgb(hex_rgb(col), hex_rgb(LIGHT_BG)), 3, col)
+        self.assertEqual(r["cfgd"], "#888")                                          # configured types win
+        self.assertEqual(r["empty"], "#888")                                         # an empty type stays grey
+        self.assertEqual(r["proto"], PALETTE[fnv1a("constructor") % 8])              # prototype keys are not config entries
+
+    def test_palette_light_variants_meet_the_threshold(self):
+        for col in PALETTE:
+            with self.subTest(col=col):
+                self.assertGreaterEqual(contrast_rgb(hex_rgb(darken_to(col, LIGHT_BG, 3)), hex_rgb(LIGHT_BG)), 3)
+                bg, fg = derived_light_badge(col)
+                self.assertGreaterEqual(contrast_rgb(hex_rgb(fg), hex_rgb(bg)), 4.5)
+        self.assertIn("const PALETTE = " + json.dumps(PALETTE), page_script("offline"))
+
+
+class TabTests(unittest.TestCase):
+    @unittest.skipUnless(NODE, "node not available")
+    def test_lru_eviction_never_drops_the_active_tab_or_just_the_oldest(self):
+        r = run_page_js("""
+          const mk = n => ({path: n + ".md", name: n});
+          const nine = "abcdefghi".split("").map(mk);               // 9 tabs: one over the limit
+          const used = new Map();
+          // a..h were opened in order (a is the oldest), then a was used again, then i opened
+          "abcdefgh".split("").forEach((n, i) => used.set(n + ".md", i + 1));
+          used.set("a.md", 9); used.set("i.md", 10);
+          const lru = tabToEvict(nine, used, "i.md");
+          // the oldest tab is active: it must survive, the next least recently used goes
+          const used2 = new Map(used); used2.set("a.md", 0);
+          const keepsActive = tabToEvict(nine, used2, "a.md");
+          const unknown = tabToEvict([mk("x"), mk("y")], new Map([["y.md", 5]]), "y.md");   // never-used tab goes first
+          console.log(JSON.stringify({lru: lru.path, keepsActive: keepsActive.path, unknown: unknown.path,
+            only: tabToEvict([mk("z")], new Map(), "z.md"), limit: TAB_LIMIT}));""")
+        self.assertEqual(r["lru"], "b.md")                                     # not "a.md", the oldest opened
+        self.assertEqual(r["keepsActive"], "b.md")
+        self.assertEqual(r["unknown"], "x.md")
+        self.assertIsNone(r["only"])
+        self.assertEqual(r["limit"], 8)
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_closing_a_tab_picks_the_neighbour(self):
+        r = run_page_js("""
+          const mk = n => ({path: n, name: n});
+          const t = ["a", "b", "c", "d"].map(mk);
+          const c = (path, active) => { const r = closeTabResult(t, path, active); return [r.tabs.map(x => x.path).join(""), r.next === undefined ? "same" : r.next && r.next.path]; };
+          console.log(JSON.stringify({middle: c("b", "b"), last: c("d", "d"), first: c("a", "a"), other: c("c", "a"),
+            missing: c("zz", "a"), single: (() => { const r = closeTabResult([mk("a")], "a", "a"); return [r.tabs.length, r.next]; })()}));""")
+        self.assertEqual(r["middle"], ["acd", "c"])        # right neighbour
+        self.assertEqual(r["last"], ["abc", "c"])          # no right one: the left neighbour
+        self.assertEqual(r["first"], ["bcd", "b"])
+        self.assertEqual(r["other"], ["abd", "same"])      # closing an inactive tab keeps the active one
+        self.assertEqual(r["missing"], ["abcd", "same"])
+        self.assertEqual(r["single"], [0, None])           # none left: the start screen
+
+    def test_tab_markup_and_handlers(self):
+        js = page_script("offline")
+        self.assertIn('aria-label="Close tab"', js)
+        self.assertIn('title="${esc(t.path)}"', js)                              # tooltip: the full vault path
+        self.assertIn('addEventListener("auxclick"', js)                         # middle click closes
+        self.assertIn('scrollIntoView({ block: "nearest", inline: "nearest" })', js)   # active tab stays in view
+        css = viewer.render_page("offline").split("<style>")[1].split("</style>")[0]
+        self.assertRegex(css, r"\.tab:hover \.tab-x, \.tab\.active \.tab-x")     # shown on hover and on the active tab
+        self.assertRegex(css, r"@media \(hover: none\) \{ \.tab-x \{ opacity: 1; \} \}")   # always on touch devices
+        self.assertNotIn("tabs.shift()", js)                                     # no silent dropping of the oldest
+
+
+class RevealAndBreadcrumbTests(unittest.TestCase):
+    @unittest.skipUnless(NODE, "node not available")
+    def test_ancestor_folders_and_breadcrumb(self):
+        r = run_page_js("""
+          console.log(JSON.stringify({
+            note: ancestorFolders("10-knowledge/deep/nested/Gamma.md"), top: ancestorFolders("10-knowledge/Alpha.md"),
+            root: ancestorFolders("Root.md"), folder: ancestorFolders("10-knowledge/deep/x"),
+            bc: breadcrumbHtml("10-knowledge/deep/nested/Gamma.md", "Gamma"), bcRoot: breadcrumbHtml("Root.md", "Root"),
+            bcEsc: breadcrumbHtml('1-<b>/x.md', "x"),
+          }));""")
+        self.assertEqual(r["note"], ["10-knowledge", "10-knowledge/deep", "10-knowledge/deep/nested"])
+        self.assertEqual(r["top"], ["10-knowledge"])
+        self.assertEqual(r["root"], ["(vault root)"])
+        self.assertEqual(r["folder"], ["10-knowledge", "10-knowledge/deep"])
+        links = re.findall(r'<a class="bc-f" href="#" data-fpath="([^"]*)"[^>]*>([^<]*)</a>', r["bc"])
+        self.assertEqual(links, [("10-knowledge", "knowledge"), ("10-knowledge/deep", "deep"), ("10-knowledge/deep/nested", "nested")])
+        self.assertTrue(r["bc"].endswith("<span>Gamma</span>"))
+        self.assertEqual(r["bc"].count('<span class="sep">/</span>'), 3)                 # knowledge / deep / nested / Gamma
+        self.assertEqual(r["bcRoot"], "<span>Root</span>")
+        self.assertNotIn("<b>", r["bcEsc"])                                               # folder names are escaped
+
+    def test_explorer_buttons_reveal_and_no_focus_stealing(self):
+        html = viewer.render_page("offline")
+        for ident, title in (("collapse-btn", "Collapse all folders"), ("reveal-btn", "Reveal the active note in the file tree")):
+            self.assertRegex(html, rf'<button class="icon-btn" id="{ident}" title="{title}" aria-label="{title}">')
+        self.assertLess(html.index('id="collapse-btn"'), html.index('id="rbtn"'))          # next to Refresh
+        js = page_script("offline")
+        self.assertRegex(js, r"function openNote\(note\) \{[\s\S]*?highlight\(\);\s*revealNote\(note\.path\);")
+        reveal = js[js.index("function revealNote"):js.index("// Breadcrumb click")]
+        self.assertIn('scrollIntoView({ block: "nearest" })', reveal)
+        self.assertNotIn(".focus(", reveal)                                                 # never steals focus from the search box
+
+
+class FrontmatterLinkChipTests(unittest.TestCase):
+    """[[...]] inside frontmatter chips render as the same a.wl links as in the body; everything else is escaped."""
+
+    def run_chips(self, fm):
+        return run_page_js(f"""
+          vault = {{folders: [{{folder: "k", notes: [{{path: "k/Beta.md", name: "Beta", type: ""}}, {{path: "k/Zażółć.md", name: "Zażółć", type: ""}}]}}],
+                    stems: {{beta: "k/Beta.md", "zażółć": "k/Zażółć.md"}}}};
+          console.log(JSON.stringify(chipsHtml({json.dumps(fm)})));""") if NODE else None
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_wikilinks_in_chips_are_links_and_missing_ones_are_styled(self):
+        html = self.run_chips({"related": "[[Beta]]", "up": "[[Nope]]", "alias": "[[Beta|the beta]]", "h": "[[Beta#Intro]]"})
+        self.assertIn('<a class="wl" href="#" data-path="k/Beta.md">Beta</a>', html)
+        self.assertNotIn("[[", re.sub(r' data-v="[^"]*"', "", html))                        # no raw brackets left in the visible text
+        self.assertIn('<span class="wl missing" title="Note not found">Nope</span>', html)
+        self.assertIn('data-path="k/Beta.md">the beta</a>', html)
+        self.assertIn("Beta › Intro</a>", html)
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_list_items_and_mixed_text(self):
+        html = self.run_chips({"related": ["[[Beta]]", "[[Zażółć]]", "plain <b>x</b>"], "note": "see [[Beta]] & more"})
+        self.assertEqual(html.count('<a class="wl"'), 3)
+        self.assertIn('data-path="k/Zażółć.md">Zażółć</a>, plain &lt;b&gt;x&lt;/b&gt;', html)          # items joined, others escaped
+        self.assertIn("see <a class=\"wl\" href=\"#\" data-path=\"k/Beta.md\">Beta</a> &amp; more", html)
+        self.assertNotIn("<b>", html)
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_other_values_stay_escaped_text_and_empty_ones_are_dropped(self):
+        html = self.run_chips({"title": "T", "status": "done", "tags": [], "x": "a [b] <i>"})
+        self.assertNotIn("title:", html)
+        self.assertIn("status: done", html)
+        self.assertNotIn("tags:", html)
+        self.assertIn("x: a [b] &lt;i&gt;", html)
+        self.assertNotIn("<a ", html)
+
+    def test_css_styles_links_inside_chips(self):
+        css = viewer.render_page("offline").split("<style>")[1].split("</style>")[0]
+        self.assertIn(".chip a.wl", css)
+        self.assertIn(".chip .wl.missing", css)
+
+
+class AccessibilityTests(unittest.TestCase):
+    """Static checks; keyboard behaviour needs a browser (see the report)."""
+
+    def tearDown(self):
+        viewer.init_config(VAULT)
+
+    def test_every_svg_icon_is_hidden_from_assistive_tech(self):
+        viewer.init_config(VAULT)
+        for mode in ("online", "offline", "export"):
+            html = viewer.render_page(mode, {"notes": {}})
+            svgs = re.findall(r"<svg\b[^>]*>", html.split("<script>")[0] + "".join(re.findall(r"<script>(.*?)</script>", html, re.S)[-1:]))
+            self.assertGreaterEqual(len(svgs), 10)
+            for tag in svgs:
+                with self.subTest(mode=mode, tag=tag[:50]):
+                    self.assertIn('aria-hidden="true"', tag)
+
+    def test_toolbar_buttons_have_names_and_pressed_state(self):
+        html = viewer.render_page("online")
+        for ident, name in (("graph-btn", "Graph"), ("chat-toggle-btn", "Chat")):
+            self.assertRegex(html, rf'<button class="toolbar-btn" id="{ident}" title="{name}" aria-label="{name}" aria-pressed="false">')
+        js = page_script("online")
+        for pressed in ('"graph-btn").setAttribute("aria-pressed", "true")', '"graph-btn").setAttribute("aria-pressed", "false")',
+                        '"chat-toggle-btn").setAttribute("aria-pressed", "true")', '"chat-toggle-btn").setAttribute("aria-pressed", "false")',
+                        'rec.btn.setAttribute("aria-pressed", "true")', 'rec.btn.setAttribute("aria-pressed", "false")'):
+            self.assertIn(pressed, js)
+        self.assertIn('btn.setAttribute("aria-label", rec.def.title)', js)       # plug-in buttons
+        self.assertIn("btn.title = rec.def.title", js)
+        for ident in ("chat-close", "plugin-close", "chat-send", "menu-btn", "srch"):
+            self.assertRegex(html, rf'id="{ident}"[^>]*aria-label="')
+
+    def test_tree_roles_and_keyboard_handlers_are_in_the_page(self):
+        js = page_script("offline")
+        self.assertIn('tree.setAttribute("role", "tree")', js)
+        self.assertIn('role="treeitem" aria-expanded=', js)
+        self.assertIn('aria-selected=', js)
+        self.assertIn('setAttribute("aria-selected", "true")', js)               # the active row follows highlight()
+        for key in ("ArrowDown", "ArrowUp", "ArrowRight", "ArrowLeft", "Enter", "Home", "End"):
+            self.assertIn(f'case "{key}"', js)
+
+    def test_no_icon_depends_on_a_web_font(self):
+        html = viewer.render_page("offline")
+        self.assertNotIn("fonts.googleapis.com", html)                           # offline loads no web font at all
+        for glyph in ("&#9776;", "☰", ">×<", "&times;"):
+            self.assertNotIn(glyph, html)                                        # ☰ and × are inline SVG now
+        css = html.split("<style>")[1].split("</style>")[0]
+        for decl in re.findall(r"font-family:\s*([^;]+);", css):
+            if decl.strip() != "inherit":
+                self.assertRegex(decl.strip(), r"(sans-serif|monospace)$", decl)  # every stack ends in a system family
+
+
+# ── Link resolution: Markdown links, aliases, code, Unicode, lint structure checks ──
+def write_notes(root: Path, notes: dict, config=None) -> Path:
+    """notes: {"rel/path.md": text}; a title-only config stops the config lookup from walking up to the repo."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ".viewer.json").write_text(json.dumps(config if config is not None else {"title": "L"}), encoding="utf-8")
+    for rel, text in notes.items():
+        f = root / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text, encoding="utf-8")
+    return root
+
+
+def edge_set(graph) -> set:
+    return {tuple(sorted((e["source"], e["target"]))) for e in graph["edges"]}
+
+
+class LinkVaultCase(unittest.TestCase):
+    """Base: a temp vault, the viewer pointed at it, helpers for graph / backlinks / stems / export / lint."""
+    NOTES: dict = {}
+    CONFIG = None
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = write_notes(Path(self._tmp.name) / "v", self.NOTES, self.CONFIG)
+        viewer.init_config(self.root)
+        self.addCleanup(viewer.init_config, VAULT)
+
+    def edges(self):
+        return edge_set(viewer.build_graph())
+
+    def backlinks(self, rel):
+        return [b["path"] for b in viewer.get_index().backlinks_for(rel)]
+
+    def exported(self):
+        out = Path(self._tmp.name) / "out.html"
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            viewer.export_html(out)
+        m = re.search(r"window\.__EXPORT__ = (.*?);</script>", out.read_text(encoding="utf-8"), re.S)
+        return json.loads(m.group(1).replace("<\\/", "</"))
+
+    def api(self, path):
+        srv = Server(vault=self.root)
+        try:
+            st, _, body = srv.req("GET", path)
+        finally:
+            srv.stop()
+        self.assertEqual(st, 200)
+        return json.loads(body)
+
+    def assert_export_matches_api(self):
+        self.assertEqual(edge_set(self.exported()["graph"]), edge_set(self.api("/api/graph")))
+
+
+class MarkdownLinkEdgeTests(LinkVaultCase):
+    NOTES = {
+        "Home.md": "# Home\n",
+        "sub/Alpha.md": ("# Alpha\n[same](Beta.md) [up](../Home.md) [enc](Space%20Note.md#Heading) [q](Beta.md?x=1)\n"
+                         "[above](../../../Home.md) [angle](<Space Note.md>) [img](pic.png) ![e](Beta.md)\n"
+                         "[web](https://example.com/Gamma.md) [frag](#top) [bare](Gamma) [nowhere](Gamma.md)\n"
+                         "[bad%](Beta.md%zz) [abs](/Home.md)\n"),
+        "sub/Beta.md": "# Beta\n",
+        "sub/Space Note.md": "# Space\n",
+        "Gamma.md": "# Gamma (elsewhere: a bare or missing sub/Gamma.md must not fall back to it)\n",
+        "sub/pic.png": "x",
+    }
+
+    def test_python_mirror_of_rel_link_path(self):
+        f = viewer.rel_link_path
+        self.assertEqual(f("a/b/N.md", "Other.md"), "a/b/Other.md")                       # same folder
+        self.assertEqual(f("a/b/N.md", "../c/Note%20x.md#H"), "a/c/Note x.md")              # ../, %20, #heading
+        self.assertEqual(f("N.md", "../../../Home.md"), "Home.md")                          # clamped at the vault root
+        self.assertEqual(f("a/N.md", "/top/A.md"), "top/A.md")
+        self.assertEqual(f("a/N.md", "./b/./C.MD?x=1"), "a/b/C.MD")
+        for none in ("http://x/y.md", "mailto:a@b.c", "#x", "pic.png", "%zz.md", "//host/a.md", "", "a.md.txt"):
+            self.assertIsNone(f("a/N.md", none), none)
+        self.assertEqual(viewer.extract_md_links("![i](x.md) [a](y.md) [![i](a.png)](z.md) [[w]](q.md)"), ["y.md", "z.md"])
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_js_rel_link_path_matches_the_python_mirror(self):
+        cases = [("a/b/N.md", "Other.md"), ("a/b/N.md", "../c/Note%20x.md#H"), ("N.md", "../../../Home.md"), ("a/N.md", "/top/A.md"),
+                 ("a/N.md", "./b/./C.MD?x=1"), ("a/N.md", "http://x/y.md"), ("a/N.md", "mailto:a@b.c"), ("a/N.md", "#x"),
+                 ("a/N.md", "pic.png"), ("a/N.md", "%zz.md"), ("a/N.md", "//host/a.md"), ("a/N.md", ""), ("a/N.md", "a.md.txt"),
+                 ("a/N.md", "..\\up\\X.md"), ("a/N.md", "sp ace/%C5%BCo%C5%82w.md"), ("a/N.md", "%E0%A4%A.md"), ("", "Top.md"),
+                 ("a/b/c/N.md", "../../../../x/Y.md"), ("a/N.md", "dir//double///S.md"), ("a/N.md", "  Padded.md  ")]
+        js = run_page_js(f"console.log(JSON.stringify({json.dumps(cases)}.map(([b, h]) => relLinkPath(b, h))));")
+        self.assertEqual(js, [viewer.rel_link_path(b, h) for b, h in cases])
+
+    def test_graph_edges_backlinks_and_by_path_only_resolution(self):
+        self.assertEqual(self.edges(), {("sub/Alpha.md", "sub/Beta.md"), ("Home.md", "sub/Alpha.md"),
+                                        ("sub/Alpha.md", "sub/Space Note.md")})
+        # positive: Beta, Home (../ and clamped and absolute), Space Note (%20 and <angle>); negative: pic, http, #frag,
+        # [bare](Gamma) (no .md), and [nowhere](Gamma.md) -> sub/Gamma.md does not exist, so no fall-back to Gamma.md
+        self.assertNotIn("Gamma.md", {x for e in self.edges() for x in e})
+        self.assertEqual(self.backlinks("sub/Beta.md"), ["sub/Alpha.md"])
+        self.assertEqual(self.backlinks("Home.md"), ["sub/Alpha.md"])
+        self.assertEqual(self.backlinks("Gamma.md"), [])
+        self.assertEqual(self.api("/api/note?path=sub/Beta.md")["backlinks"], [{"path": "sub/Alpha.md", "name": "Alpha"}])
+
+    def test_stems_are_unaffected_and_export_graph_matches_the_api(self):
+        self.assertEqual(self.api("/api/vault")["stems"]["beta"], "sub/Beta.md")
+        self.assert_export_matches_api()
+        self.assertEqual(len(self.exported()["graph"]["edges"]), 3)
+
+    def test_lint_resolves_with_the_shared_rules(self):
+        # a Markdown link adds no lint problem and the lint output for plain notes is unchanged
+        r = subprocess.run([sys.executable, str(ROOT / "tools" / "vault-lint.py"), "--vault", str(self.root)], capture_output=True, text=True)
+        self.assertNotIn("zepsuty", r.stdout)
+
+
+class CodeBlankingTests(LinkVaultCase):
+    NOTES = {
+        "Target.md": "# Target\n",
+        "Other.md": "# Other\n",
+        "Fenced.md": "# Fenced\n```\n[[Target]]\n[md](Target.md)\n```\n",
+        "Unclosed.md": "# Unclosed\ntext\n~~~md\n[[Target]]\nstill code [md](Target.md)\n",
+        "Inline.md": "# Inline\n`[[Target]]` and ``[x](Target.md) ` ``\n",
+        "Real.md": "---\nrelated: \"[[Target]]\"\n---\n# Real\nreal [[Other]] and `[[Target]]`\n```\n[[Target]]\n```\nafter [md](Other.md)\n",
+        "Fm.md": "---\nup: \"[[Other]]\"\nnote: \"```\"\n---\n# Fm\n[[Target]]\n",
+    }
+
+    def test_blank_code_keeps_offsets_and_frontmatter(self):
+        t = "---\nt: \"`[[FM]]`\"\n---\nA [[a]] `[[b]]` ``x ` [[c]] ``  [[d]]\n```\n[[e]]\n```\n[[f]]\n~~~md\n[[g]]\n```\nstill [[h]]\n~~~\n[[i]]\n````\n```\n[[j]]\n````\n[[k]]\n```js\n[[unclosed]]\n"
+        self.assertEqual(len(viewer.blank_code(t)), len(t))
+        self.assertEqual(viewer.extract_wikilinks(t), ["FM", "a", "d", "f", "i", "k"])
+        self.assertEqual(viewer.extract_wikilinks("`a\n\n[[x]]` \\`[[y]]\\` [[z]]"), ["x", "y", "z"])   # no span across a blank line; escaped ticks
+        self.assertEqual(viewer.extract_wikilinks("```a`b\n[[x]]"), ["x"])                            # ``` with a backtick in its info string is inline
+        self.assertEqual(viewer.extract_wikilinks("```\r\n[[x]]\r\n```\r\n[[y]]\r\n"), ["y"])         # CRLF
+
+    def test_links_in_fences_unclosed_fences_and_inline_code_add_no_edge(self):
+        e = self.edges()
+        for note in ("Fenced.md", "Unclosed.md", "Inline.md"):
+            with self.subTest(note=note):
+                self.assertFalse(any(note in pair for pair in e), f"{note} has an edge: {e}")
+                self.assertEqual(self.backlinks("Target.md").count(note), 0)
+
+    def test_real_links_around_code_still_count_and_frontmatter_is_scanned(self):
+        self.assertEqual(self.edges(), {("Real.md", "Target.md"), ("Other.md", "Real.md"), ("Fm.md", "Other.md"), ("Fm.md", "Target.md")})
+        self.assertEqual(sorted(self.backlinks("Target.md")), ["Fm.md", "Real.md"])
+        self.assertEqual(sorted(self.backlinks("Other.md")), ["Fm.md", "Real.md"])             # Real: the [[Other]] and the md link
+
+    def test_export_graph_matches_the_api(self):
+        self.assert_export_matches_api()
+
+    def test_lint_ignores_links_in_code(self):
+        (self.root / "Broken.md").write_text("---\ntype: wiedza\n---\n# Broken\n`[[Nope]]`\n```\n[[Nope2]]\n```\n[[Real Missing]]\n", encoding="utf-8")
+        r = subprocess.run([sys.executable, str(ROOT / "tools" / "vault-lint.py"), "--vault", str(self.root)], capture_output=True, text=True)
+        self.assertIn("[[Real Missing]]", r.stdout)
+        self.assertNotIn("Nope", r.stdout)
+
+
+class AliasTests(LinkVaultCase):
+    CONFIG = {"title": "A", "link_deprioritise": ["Archive"], "lint": {"valid_types": ["wiedza"]}}
+    NOTES = {
+        "People/Robert.md": '---\ntype: wiedza\naliases: [Bob, "Robert Smith"]\n---\n# Robert\n',
+        "Bob.md": "---\ntype: wiedza\n---\n# Bob (a real file named like Robert's alias)\n",
+        "Zeta.md": "---\ntype: wiedza\n---\n# Zeta\n[[Robert Smith]] and [[robert smith]]\n",
+        "Yankee.md": "---\ntype: wiedza\n---\n# Yankee\n[[Bob]]\n",
+        "Dup1.md": "---\ntype: wiedza\naliases:\n  - Twin\n  - Solo\n---\n# Dup1\n",
+        "Dup2.md": "---\ntype: wiedza\naliases: [Twin]\n---\n# Dup2\n",
+        "Archive/Old.md": "---\ntype: wiedza\nalias: Shared\n---\n# Old\n",
+        "Live.md": "---\ntype: wiedza\naliases: Shared\n---\n# Live\n",
+        "Reader.md": "---\ntype: wiedza\n---\n# Reader\n[[Twin]] [[Solo]] [[Shared]] [[Unknown Alias]] [[Dup1]]\n",
+        "Body.md": "---\ntype: wiedza\n---\n# Body\naliases: [Ghost]\n[[Ghost]]\n",
+    }
+
+    def test_alias_resolves_and_stems_carry_it(self):
+        idx = viewer.get_index()
+        self.assertEqual(idx.resolve("Robert Smith"), "People/Robert.md")
+        self.assertEqual(idx.resolve("robert smith"), "People/Robert.md")
+        self.assertIsNone(idx.resolve("Unknown Alias"))
+        self.assertIsNone(idx.resolve("Ghost"))                                    # only frontmatter aliases count
+        stems = self.api("/api/vault")["stems"]
+        self.assertEqual(stems["robert smith"], "People/Robert.md")
+        self.assertEqual(stems["solo"], "Dup1.md")                                 # block list
+        self.assertEqual(stems["shared"], "Live.md")                               # singular "alias:" and a scalar "aliases:"
+
+    def test_real_file_name_wins_over_an_alias(self):
+        self.assertEqual(viewer.get_index().resolve("Bob"), "Bob.md")
+        self.assertEqual(self.api("/api/vault")["stems"]["bob"], "Bob.md")
+        self.assertIn(("name", "Bob", "Bob.md", "People/Robert.md"), viewer.get_index().alias_issues)
+        self.assertIn(("Bob.md", "Yankee.md"), self.edges())
+        self.assertNotIn(("People/Robert.md", "Yankee.md"), self.edges())
+
+    def test_two_notes_with_the_same_alias_use_the_usual_tie_breaking(self):
+        idx = viewer.get_index()
+        self.assertEqual(idx.resolve("Twin"), "Dup1.md")                           # vault order
+        self.assertEqual(idx.resolve("Shared"), "Live.md")                         # outside link_deprioritise beats Archive/ (first in order)
+        self.assertIn(("alias", "Twin", "Dup1.md", "Dup2.md"), idx.alias_issues)
+        self.assertIn(("alias", "Shared", "Live.md", "Archive/Old.md"), idx.alias_issues)
+
+    def test_graph_backlinks_and_export(self):
+        e = self.edges()
+        self.assertIn(("People/Robert.md", "Zeta.md"), e)
+        self.assertTrue({("Dup1.md", "Reader.md"), ("Live.md", "Reader.md")} <= e)
+        self.assertFalse(any("Unknown" in x or "Ghost" in x for pair in e for x in pair))
+        self.assertEqual(self.backlinks("People/Robert.md"), ["Zeta.md"])
+        self.assertEqual(self.backlinks("Dup2.md"), [])
+        self.assert_export_matches_api()
+        self.assertEqual(self.exported()["vault"]["stems"]["robert smith"], "People/Robert.md")
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_the_page_resolves_aliases_from_the_servers_stems_map(self):
+        payload = self.api("/api/vault")
+        r = run_page_js(f"""vault = {json.dumps(payload)};
+          const p = t => { '{' }const n = resolveNote(t); return n && n.path; {'}'};
+          console.log(JSON.stringify(["Robert Smith", "Bob", "Twin", "Shared", "Ghost"].map(p)));""")
+        self.assertEqual(r, ["People/Robert.md", "Bob.md", "Dup1.md", "Live.md", None])
+
+    def test_lint_accepts_aliases_and_warns_about_clashes(self):
+        r = subprocess.run([sys.executable, str(ROOT / "tools" / "vault-lint.py"), "--vault", str(self.root)], capture_output=True, text=True)
+        self.assertNotIn("[[Robert Smith]]", r.stdout)                              # an alias is not a broken link
+        self.assertNotIn("[[Twin]]", r.stdout)
+        self.assertIn("[[Unknown Alias]]", r.stdout)
+        self.assertIn("alias 'Bob' ignorowany: nazwa pliku Bob.md", r.stdout)       # alias vs real name
+        self.assertIn("alias 'Twin' jest też w Dup1.md", r.stdout)                  # two notes, one alias
+        self.assertEqual(r.returncode, 1)
+
+
+class UnicodeNameTests(LinkVaultCase):
+    NFC_NAME = "Zażółć"                                       # as typed in a link
+    NFD_NAME = unicodedata.normalize("NFD", "Zażółć")         # as some sync tools / macOS apps save the file
+    OTHER_NFC = "Gęślą"
+    OTHER_NFD = unicodedata.normalize("NFD", "Gęślą")
+
+    @property
+    def NOTES(self):                                           # noqa: N802 (built from the class constants above)
+        return {
+            f"{self.NFD_NAME}.md": "---\naliases: [" + unicodedata.normalize("NFD", "Żółw") + "]\n---\n# NFD file\n",
+            f"dir/{self.NFD_NAME}.md": "# NFD file in dir\n",
+            f"{self.OTHER_NFC}.md": "# NFC file\n",
+            f"{self.NFD_NAME}.png": "x",
+            "A.md": f"# A\n[[{self.NFC_NAME}]] [[dir/{self.NFC_NAME}]] [[Żółw]] [md](dir/{self.NFC_NAME}.md) ![[{self.NFC_NAME}.png]]\n",
+            "B.md": f"# B\n[[{self.OTHER_NFD}]]\n",
+            "C.md": f"# C\n[[{self.NFC_NAME.upper()}]]\n",
+        }
+
+    def setUp(self):
+        super().setUp()
+        names = {p.name for p in self.root.iterdir()}
+        if f"{self.NFD_NAME}.md" not in names:
+            self.skipTest("this filesystem normalises file names")
+
+    def test_nfd_file_is_reached_by_an_nfc_link_and_the_reverse(self):
+        idx = viewer.get_index()
+        nfd_path = f"{self.NFD_NAME}.md"
+        self.assertEqual(idx.resolve(self.NFC_NAME), nfd_path)                      # NFD file, NFC link
+        self.assertEqual(idx.resolve(self.NFD_NAME), nfd_path)
+        self.assertEqual(idx.resolve(f"dir/{self.NFC_NAME}"), f"dir/{self.NFD_NAME}.md")
+        self.assertEqual(idx.resolve(self.OTHER_NFD), f"{self.OTHER_NFC}.md")       # NFC file, NFD link
+        self.assertEqual(idx.resolve(self.OTHER_NFC), f"{self.OTHER_NFC}.md")
+        self.assertEqual(idx.resolve("Żółw"), nfd_path)                              # an NFD alias, linked in NFC
+        self.assertEqual(idx.resolve(self.NFC_NAME.upper()), nfd_path)               # still case-insensitive
+
+    def test_edges_backlinks_and_paths_as_on_disk(self):
+        e = self.edges()
+        nfd_path = f"{self.NFD_NAME}.md"
+        self.assertIn(("A.md", nfd_path) if "A.md" < nfd_path else (nfd_path, "A.md"), e)
+        self.assertIn(tuple(sorted(("A.md", f"dir/{self.NFD_NAME}.md"))), e)         # path link and Markdown link
+        self.assertIn(tuple(sorted(("B.md", f"{self.OTHER_NFC}.md"))), e)
+        self.assertIn(tuple(sorted(("C.md", nfd_path))), e)
+        self.assertEqual(self.backlinks(nfd_path), ["A.md", "C.md"])
+        nodes = {n["id"] for n in viewer.build_graph()["nodes"]}
+        self.assertIn(nfd_path, nodes)                                              # paths are not normalised in the output
+        self.assertNotIn(f"{self.NFC_NAME}.md", nodes)
+        self.assert_export_matches_api()
+
+    def test_note_api_opens_the_real_file_and_attachments_resolve(self):
+        note = self.api("/api/note?path=" + urllib.parse.quote(f"{self.NFD_NAME}.md"))
+        self.assertEqual(note["path"], f"{self.NFD_NAME}.md")
+        payload = self.api("/api/vault")
+        key = unicodedata.normalize("NFC", f"{self.NFC_NAME}.png").lower()                  # keys are NFC, values as on disk
+        self.assertEqual(payload["files"][key], f"{self.NFD_NAME}.png")
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_the_page_normalises_the_target_before_lookup(self):
+        payload = self.api("/api/vault")
+        r = run_page_js(f"""vault = {json.dumps(payload)};
+          const p = t => {{ const n = resolveNote(t); return n && n.path; }};
+          console.log(JSON.stringify({{
+            nfcToNfd: p({json.dumps(self.NFC_NAME)}), nfdToNfd: p({json.dumps(self.NFD_NAME)}),
+            nfdToNfc: p({json.dumps(self.OTHER_NFD)}), alias: p("Żółw"), pathOnly: resolveNote({json.dumps("dir/" + self.NFC_NAME)}, true).path,
+            att: attachmentPath({json.dumps(self.NFC_NAME + ".png")}, true), attNfd: attachmentPath({json.dumps(self.NFD_NAME + ".png")}, true),
+            attRel: (currentNotePath = "A.md", attachmentPath({json.dumps(urllib.parse.quote(self.NFC_NAME) + ".png")}, false)),
+          }}));""")
+        self.assertEqual(r["nfcToNfd"], f"{self.NFD_NAME}.md")
+        self.assertEqual(r["nfdToNfd"], f"{self.NFD_NAME}.md")
+        self.assertEqual(r["nfdToNfc"], f"{self.OTHER_NFC}.md")
+        self.assertEqual(r["alias"], f"{self.NFD_NAME}.md")
+        self.assertEqual(r["pathOnly"], f"dir/{self.NFD_NAME}.md")
+        self.assertEqual((r["att"], r["attNfd"], r["attRel"]), (f"{self.NFD_NAME}.png",) * 3)
+
+    def test_lint_does_not_report_normalisation_differences_as_broken(self):
+        r = subprocess.run([sys.executable, str(ROOT / "tools" / "vault-lint.py"), "--vault", str(self.root)], capture_output=True, text=True)
+        self.assertNotIn("zepsuty", r.stdout)
+
+
+class LintStructureTests(LinkVaultCase):
+    """lint.require_up / lint.report_groups / --groups on a vault with three known link groups."""
+    NOTES = {
+        "Home.md": "---\ntype: home\n---\n# Home\n[[Hub]]\n",
+        "Hub.md": '---\ntype: index\nup: "[[Home]]"\n---\n# Hub\n[[Alpha]]\n',
+        "Alpha.md": '---\ntype: wiedza\nup: "[[Hub]]"\n---\n# Alpha\n',
+        "Beta.md": "---\ntype: wiedza\nup:\n---\n# Beta (empty up)\n[[Hub]]\n",
+        "NoUp.md": "---\ntype: wiedza\n---\n# NoUp\n[[Hub]]\n",
+        "BadUp.md": '---\ntype: wiedza\nup: "[[Nope]]"\n---\n# BadUp\n[[Hub]]\n',
+        "PlainUp.md": "---\ntype: wiedza\nup: Hub\n---\n# PlainUp (a bare name resolves too)\n[[Hub]]\n",
+        "ListUp.md": '---\ntype: wiedza\nup:\n  - "[[Hub]]"\n  - "[[Alpha]]"\n---\n# ListUp (a list works)\n[[Hub]]\n',
+        "island/I1.md": '---\ntype: wiedza\nup: "[[I2]]"\n---\n# I1\n[[I2]]\n',
+        "island/I2.md": '---\ntype: wiedza\nup: "[[I3]]"\n---\n# I2\n[[I3]]\n',
+        "island/I3.md": '---\ntype: wiedza\nup: "[[I1]]"\n---\n# I3\n',
+        "Lone.md": '---\ntype: wiedza\nup: "[[Lone]]"\n---\n# Lone (up to itself: no edge)\n',
+    }
+
+    def lint(self, *extra, config=None):
+        if config is not None:
+            (self.root / ".viewer.json").write_text(json.dumps({"title": "L", "lint": {"valid_types": ["home", "index", "wiedza"], **config}}), encoding="utf-8")
+        return subprocess.run([sys.executable, str(ROOT / "tools" / "vault-lint.py"), "--vault", str(self.root), *extra], capture_output=True, text=True)
+
+    def test_link_groups_in_the_viewer(self):
+        groups = viewer.link_groups()
+        self.assertEqual([len(g) for g in groups], [8, 3, 1])                              # largest first
+        self.assertEqual(groups[1], ["island/I1.md", "island/I2.md", "island/I3.md"])
+        self.assertEqual(groups[2], ["Lone.md"])
+        self.assertIn("Home.md", groups[0])
+
+    def test_off_by_default_existing_runs_do_not_change(self):
+        r = self.lint(config={})
+        self.assertEqual(r.returncode, 1)                                                  # only BadUp's broken [[Nope]] wikilink
+        self.assertEqual(r.stdout.count("zepsuty wikilink"), 1)
+        for opt_in in ("brak pola up", "zepsute up", "Grupy"):
+            self.assertNotIn(opt_in, r.stdout)
+
+    def test_require_up_reports_missing_and_broken_separately(self):
+        r = self.lint(config={"require_up": True})
+        self.assertEqual(r.returncode, 1)
+        out = r.stdout
+        for missing in ("Beta.md", "NoUp.md"):
+            self.assertRegex(out, rf"{missing}\n  • brak pola up:")
+        self.assertRegex(out, r"BadUp\.md\n  • zepsute up: \[\[Nope\]\]")
+        self.assertNotIn("brak pola up", out.split("BadUp.md")[1].split("\n\n")[0])          # not reported as missing too
+        for ok in ("Home.md", "Alpha.md", "PlainUp.md", "ListUp.md", "Hub.md"):               # home is exempt; the rest resolve
+            self.assertNotRegex(out, rf"\n{re.escape(ok)}\n")
+        self.assertEqual(out.count("brak pola up"), 2)
+        self.assertEqual(out.count("zepsute up"), 1)
+
+    def test_groups_report_in_the_config_is_informational(self):
+        (self.root / "BadUp.md").unlink()                                                  # leave a vault with no real issue
+        r = self.lint(config={"report_groups": True})
+        self.assertEqual(r.returncode, 0, r.stdout)                                        # groups never change the exit code
+        self.assertIn("Grupy powiązań: 3", r.stdout)
+        self.assertIn("poza największą grupą — grupa 2 (3): island/I1.md, island/I2.md, island/I3.md", r.stdout)
+        self.assertIn("grupa 3 (1): Lone.md", r.stdout)
+
+    def test_groups_flag_prints_only_that_report(self):
+        r = self.lint("--groups", config={"require_up": True})                             # require_up would fail a normal run
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue(r.stdout.startswith("Grupy powiązań: 3 (notatek: 12, linków: "), r.stdout)
+        self.assertNotIn("brak pola up", r.stdout)
+        self.assertNotIn("Vault lint", r.stdout)
+
+    def test_more_than_twenty_notes_in_a_group_are_counted_not_listed(self):
+        for i in range(25):
+            (self.root / f"Chain{i:02d}.md").write_text(f"---\ntype: wiedza\nup: \"[[Chain{(i + 1) % 25:02d}]]\"\n---\n# C\n[[Chain{(i + 1) % 25:02d}]]\n", encoding="utf-8")
+        for i in range(30):                                       # make the main group bigger than the 25-note chain
+            (self.root / f"Main{i:02d}.md").write_text('---\ntype: wiedza\nup: "[[Hub]]"\n---\n# M\n[[Hub]]\n', encoding="utf-8")
+        r = self.lint("--groups")
+        line = next(l for l in r.stdout.splitlines() if "(25)" in l)
+        self.assertEqual(line.count(".md"), 20)
+        self.assertIn("… i 5 więcej", line)
 
 
 class IndexTests(unittest.TestCase):

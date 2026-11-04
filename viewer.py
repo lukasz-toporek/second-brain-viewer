@@ -23,12 +23,13 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 import webbrowser
 from datetime import date
 from html import escape as html_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
@@ -553,22 +554,152 @@ def scan_vault() -> dict:
 _WIKILINK_RE = re.compile(r'!?\[\[([^\]\n]+?)\]\]')
 
 
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_FM_HEAD_RE = re.compile(r"\ufeff?---[ \t]*\r?\n(?:.*?\r?\n)?---[ \t]*(?:\r?\n|\Z)", re.S)
+_BLANK_LINE_RE = re.compile(r"\n[ \t]*\r?\n")
+
+
+def _blank(s: str) -> str:
+    return re.sub(r"[^\n\r]", " ", s)
+
+
+def _blank_inline_code(text: str) -> str:
+    """Inline code spans (a run of n backticks up to the next run of exactly n, within one paragraph) as spaces."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if text[i] != "`" or (i and text[i - 1] == "\\" and (len(text[:i]) - len(text[:i].rstrip("\\"))) % 2):
+            out.append(text[i])
+            i += 1
+            continue
+        j = i
+        while j < n and text[j] == "`":
+            j += 1
+        run = j - i
+        m = _BLANK_LINE_RE.search(text, j)
+        stop = m.start() if m else n                   # a code span never crosses a blank line
+        k, end = j, -1
+        while k < stop:
+            if text[k] == "`":
+                e = k
+                while e < n and text[e] == "`":
+                    e += 1
+                if e - k == run:
+                    end = k
+                    break
+                k = e
+            else:
+                k += 1
+        if end < 0:
+            out.append(text[i:j])                      # no closing run: literal backticks
+            i = j
+        else:
+            out.append(_blank(text[i:end + run]))
+            i = end + run
+    return "".join(out)
+
+
+def blank_code(text: str) -> str:
+    """`text` with fenced code blocks (``` and ~~~, an unclosed one runs to the end of the note) and inline code
+    spans replaced by spaces, so links in code are not links and offsets stay the same. The frontmatter is left
+    alone. Indented code blocks are not recognised: telling them from list continuation needs a full parser."""
+    m = _FM_HEAD_RE.match(text)
+    head, body = (text[:m.end()], text[m.end():]) if m else ("", text)
+    lines, fence, out = body.split("\n"), None, []
+    for line in lines:
+        if fence is None:
+            o = _FENCE_OPEN_RE.match(line.rstrip("\r"))
+            if o and not (o.group(1)[0] == "`" and "`" in o.group(2)):
+                fence = (o.group(1)[0], len(o.group(1)))
+                out.append(_blank(line))
+            else:
+                out.append(line)
+        else:
+            out.append(_blank(line))
+            c = _FENCE_OPEN_RE.match(line.rstrip("\r"))
+            if c and c.group(1)[0] == fence[0] and len(c.group(1)) >= fence[1] and not c.group(2).strip():
+                fence = None
+    # inline code only in what the fences left (fenced lines are blank by now)
+    return head + _blank_inline_code("\n".join(out))
+
+
 def extract_wikilinks(text: str) -> list[str]:
-    """Targets of [[target#heading|label]] (also ![[embeds]] and [[a\\|b]] inside tables)."""
+    """Targets of [[target#heading|label]] (also ![[embeds]] and [[a\\|b]] inside tables); code is ignored."""
     out = []
-    for m in _WIKILINK_RE.finditer(text):
+    for m in _WIKILINK_RE.finditer(blank_code(text)):
         target = re.split(r'\\?\||#', m.group(1), maxsplit=1)[0].strip()
         if target:
             out.append(target)
     return out
 
 
+# [text](target "title"), also with one level of brackets inside the text (a linked image). A leading ! makes
+# it an image, which is never a note link. The target is <...>-wrapped or has no spaces.
+_MDLINK_RE = re.compile(
+    r'(?<!!)\[(?:[^\[\]\n]|\[[^\[\]\n]*\])*\]\(\s*(?:<([^<>\n]*)>|([^()\s]*(?:\([^()\s]*\)[^()\s]*)*))'
+    r'(?:\s+(?:"[^"\n]*"|\'[^\'\n]*\'))?\s*\)')
+
+
+def extract_md_links(text: str) -> list[str]:
+    """Raw targets of Markdown links ``[text](target)`` (images and code excluded)."""
+    return [m.group(1) if m.group(1) is not None else m.group(2)
+            for m in _MDLINK_RE.finditer(blank_code(text)) if not m.group(0).startswith("[[")]      # [[w]](x) is a wikilink, then text
+
+
+def rel_link_path(base: str, href: str, ext: str = ".md"):
+    """Vault-relative path a scheme-less, non-# link points to, resolved against the folder of `base`
+    (``.`` and ``..`` normalised, never above the vault root); None if it is not a link ending in `ext`.
+    Mirror of ``relLinkPath()`` in the page: keep the two visibly parallel."""
+    u = href.strip()
+    if not u or u[0] == "#" or re.match(r"[a-z][a-z0-9+.-]*:", u, re.I) or re.match(r"[\\/]{2}", u):
+        return None
+    p = re.split(r"[#?]", u)[0]
+    if re.search(r"%(?![0-9a-fA-F]{2})", p):           # decodeURIComponent would throw
+        return None
+    try:
+        p = unquote(p, errors="strict")
+    except UnicodeDecodeError:
+        return None
+    p = p.replace("\\", "/")
+    if not p.lower().endswith(ext):
+        return None
+    parts = [] if p.startswith("/") else base.split("/")[:-1]
+    for seg in p.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if parts:
+                parts.pop()
+        else:
+            parts.append(seg)
+    return "/".join(parts)
+
+
+def note_aliases(fm: dict) -> list[str]:
+    """Names a note answers to, from the frontmatter keys ``aliases`` (a list or a single value) and ``alias``."""
+    out: list[str] = []
+    for key in ("aliases", "alias"):
+        v = fm.get(key)
+        for item in v if isinstance(v, list) else [v] if isinstance(v, str) else []:
+            item = item.strip()
+            if item and item not in out:
+                out.append(item)
+    return out
+
+
+def nfc(s: str) -> str:
+    """Unicode NFC. Every name and link target is normalised before it is lower-cased and looked up, so a file
+    saved in decomposed form (NFD: some sync tools, macOS apps) matches a link typed normally, and the reverse.
+    Only the lookup *keys* are normalised: paths returned by the API stay as they are on disk."""
+    return unicodedata.normalize("NFC", s)
+
+
 def link_deprioritise_prefixes() -> list:
-    """Lower-cased vault-relative folder prefixes from the optional "link_deprioritise" config key."""
+    """Lower-cased (NFC) vault-relative folder prefixes from the optional "link_deprioritise" config key."""
     raw = CONFIG.get("link_deprioritise") or []
     if not isinstance(raw, list):
         return []
-    return [p.strip().strip("/").replace("\\", "/").lower() for p in raw if isinstance(p, str) and p.strip().strip("/")]
+    return [nfc(p.strip().strip("/").replace("\\", "/")).lower()
+            for p in raw if isinstance(p, str) and p.strip().strip("/")]
 
 
 class VaultIndex:
@@ -592,23 +723,27 @@ class VaultIndex:
             rel = path.relative_to(VAULT).as_posix()
             if path.suffix != ".md":
                 self.file_paths.append(rel)
-                cur = self.files.get(path.name.lower())
+                key = nfc(path.name).lower()
+                cur = self.files.get(key)
                 if cur is None or (self.is_deprioritised(cur) and not self.is_deprioritised(rel)):
-                    self.files[path.name.lower()] = rel
+                    self.files[key] = rel
                 continue
             text = path.read_text(encoding="utf-8")
             fm = parse_frontmatter(text)
             self.notes.append({
                 "path": rel, "name": path.stem, "type": fm_str(fm, "type"),
                 "folder": rel.split("/")[0] if "/" in rel else "(vault root)", "text": text,
+                "aliases": note_aliases(fm),
             })
-            low = rel.lower()
+            low = nfc(rel).lower()
             self.by_path[low] = rel
             self.by_path[low[:-3]] = rel
-            stem = path.stem.lower()
+            stem = nfc(path.stem).lower()
             cur = self.by_stem.get(stem)
             if cur is None or (self.is_deprioritised(cur) and not self.is_deprioritised(rel)):
                 self.by_stem[stem] = rel
+        self.alias_issues: list[tuple] = []   # (kind, alias, kept note, ignored note): reported by the lint
+        self._add_aliases()
         self.out_links: dict[str, set] = {}
         self.backlinks: dict[str, list] = {n["path"]: [] for n in self.notes}
         for n in self.notes:
@@ -617,19 +752,56 @@ class VaultIndex:
                 t = self.resolve(link)
                 if t and t != n["path"]:
                     targets.add(t)
+            for href in extract_md_links(n["text"]):       # [text](Note.md): by path only, like the page
+                rel = rel_link_path(n["path"], href)
+                t = self.resolve_path(rel) if rel is not None else None
+                if t and t != n["path"]:
+                    targets.add(t)
             self.out_links[n["path"]] = targets
             for t in targets:
                 self.backlinks[t].append(n)
 
+    def _add_aliases(self) -> None:
+        """Frontmatter aliases join ``by_stem`` (so /api/vault ships them in "stems" and the page needs no logic
+        of its own), but only for names no note's file name already uses: a real name always wins. Two notes with
+        the same alias: the first in vault order wins, a note outside ``link_deprioritise`` beats one inside."""
+        names = set(self.by_stem)                      # file names, before any alias is added
+        owner: dict[str, str] = {}
+        for n in self.notes:
+            for alias in n["aliases"]:
+                key = self.link_key(alias)
+                if key in names:
+                    if self.by_stem[key] != n["path"]:
+                        self.alias_issues.append(("name", alias, self.by_stem[key], n["path"]))
+                    continue
+                cur = owner.get(key)
+                if cur is None:
+                    owner[key] = n["path"]
+                elif cur != n["path"]:
+                    if self.is_deprioritised(cur) and not self.is_deprioritised(n["path"]):
+                        self.alias_issues.append(("alias", alias, n["path"], cur))
+                        owner[key] = n["path"]
+                    else:
+                        self.alias_issues.append(("alias", alias, cur, n["path"]))
+        self.by_stem.update(owner)
+
+    @staticmethod
+    def link_key(name: str) -> str:
+        """Lookup key of a link target or alias: NFC, ``/`` separators, no leading ``/``, no ``.md``, lower-cased."""
+        t = nfc(name.strip().replace("\\", "/").lstrip("/")).lower()
+        return t[:-3] if t.endswith(".md") else t
+
     def is_deprioritised(self, rel: str) -> bool:
-        low = rel.lower()
+        low = nfc(rel).lower()
         return any(low == p or low.startswith(p + "/") for p in self.deprioritised)
 
     def resolve(self, target: str):
-        t = target.strip().replace("\\", "/").lstrip("/").lower()
-        if t.endswith(".md"):
-            t = t[:-3]
+        t = self.link_key(target)
         return self.by_path.get(t) or self.by_stem.get(t)
+
+    def resolve_path(self, rel: str):
+        """Note at a vault-relative path (with or without .md), case-insensitively; no fall-back to a bare name."""
+        return self.by_path.get(self.link_key(rel))
 
     def backlinks_for(self, rel: str) -> list[dict]:
         return sorted(({"path": n["path"], "name": n["name"]} for n in self.backlinks.get(rel, [])),
@@ -668,6 +840,32 @@ def build_graph() -> dict:
                 edges.append({"source": n["path"], "target": target})
                 seen.add(key)
     return {"nodes": nodes, "edges": edges}
+
+
+def link_groups() -> list[list[str]]:
+    """Connected components of the link graph (direction ignored) as lists of note paths: largest group first,
+    ties by first path, each group sorted. A note with no links is a group of its own."""
+    g = build_graph()
+    adj: dict[str, set] = {n["id"]: set() for n in g["nodes"]}
+    for e in g["edges"]:
+        adj[e["source"]].add(e["target"])
+        adj[e["target"]].add(e["source"])
+    seen: set = set()
+    groups: list[list[str]] = []
+    for start in adj:
+        if start in seen:
+            continue
+        seen.add(start)
+        stack, group = [start], []
+        while stack:
+            x = stack.pop()
+            group.append(x)
+            for y in adj[x] - seen:
+                seen.add(y)
+                stack.append(y)
+        groups.append(sorted(group))
+    groups.sort(key=lambda grp: (-len(grp), grp[0]))
+    return groups
 
 
 # ── Full-text search ────────────────────────────────────────────────────────
@@ -906,6 +1104,7 @@ body {
   transition: color .1s, background .1s;
 }
 .rbtn:hover { color: var(--tx); background: var(--sh); }
+.sb-actions { display: flex; align-items: center; gap: 2px; }
 .rbtn.spinning svg { animation: spin .5s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -1053,6 +1252,11 @@ body {
 
 .fnotes { padding: 0 4px 2px 22px; }
 .fnotes[hidden] { display: none; }
+/* nested folders: ~13px per level (--depth is also set on each .folder) */
+.folder.sub > .fhd { margin: 0; padding: 4px 8px 4px 4px; }
+.folder.sub > .fnotes { padding: 0 0 2px 13px; }
+.fi.sm { width: 14px; height: 14px; border-radius: 4px; font-size: 8px; }
+.fhd:focus-visible, .ni:focus-visible { outline: 2px solid var(--ac); outline-offset: -2px; }
 
 /* ── Note row in sidebar ── */
 .ni {
@@ -1124,7 +1328,7 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 0 16px;
+  padding: 0 6px 0 16px;
   height: 36px;
   font-size: 12px;
   color: var(--tx2);
@@ -1154,6 +1358,17 @@ body {
   border-radius: 50%;
   flex-shrink: 0;
 }
+.tab-name { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+.tab-x {
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  width: 18px; height: 18px; margin-left: 2px; padding: 0;
+  background: none; border: none; border-radius: 4px; color: var(--tx2); cursor: pointer;
+  opacity: 0; transition: opacity .08s, background .08s, color .08s;
+}
+.tab:hover .tab-x, .tab.active .tab-x, .tab-x:focus-visible { opacity: 1; }
+@media (hover: none) { .tab-x { opacity: 1; } }
+.tab-x:hover { background: var(--sa); color: var(--tx); }
+.tab:focus-visible { outline: 2px solid var(--ac); outline-offset: -2px; }
 
 /* ── Content ── */
 .content {
@@ -1189,6 +1404,7 @@ body {
 /* breadcrumb */
 .bc {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   margin-bottom: 20px;
@@ -1196,6 +1412,8 @@ body {
   color: var(--tx2);
 }
 .bc .sep { opacity: .35; }
+.bc a.bc-f { color: var(--tx2); text-decoration: none; border-radius: 3px; }
+.bc a.bc-f:hover { color: var(--tx); text-decoration: underline; }
 
 /* fm chips */
 .chips {
@@ -1206,6 +1424,9 @@ body {
   padding-bottom: 20px;
   border-bottom: 1px solid var(--bd);
 }
+.chip a.wl { color: inherit; text-decoration: none; border-bottom: 1px dotted currentColor; }
+.chip a.wl:hover { border-bottom-style: solid; }
+.chip .wl.missing { border-bottom: 1px dashed currentColor; cursor: help; opacity: .8; }
 .chip {
   font-size: 11px;
   padding: 2px 8px;
@@ -1542,16 +1763,28 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
 <aside class="sb" id="sb">
   <div class="sb-top">
     <span class="sb-title">Explorer</span>
-    <button class="rbtn" id="rbtn" title="Refresh (R)">
-      <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M1 4v4h4M15 12v-4h-4"/>
-        <path d="M13.5 7A6 6 0 1 0 12 12.5"/>
-      </svg>
-      Refresh
-    </button>
+    <span class="sb-actions">
+      <button class="icon-btn" id="collapse-btn" title="Collapse all folders" aria-label="Collapse all folders">
+        <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 3.5l4 3.5 4-3.5M4 12.5L8 9l4 3.5"/>
+        </svg>
+      </button>
+      <button class="icon-btn" id="reveal-btn" title="Reveal the active note in the file tree" aria-label="Reveal the active note in the file tree">
+        <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v3M8 11.5v3M1.5 8h3M11.5 8h3"/>
+        </svg>
+      </button>
+      <button class="rbtn" id="rbtn" title="Refresh (R)">
+        <svg aria-hidden="true" focusable="false" width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M1 4v4h4M15 12v-4h-4"/>
+          <path d="M13.5 7A6 6 0 1 0 12 12.5"/>
+        </svg>
+        Refresh
+      </button>
+    </span>
   </div>
   <div class="sb-srch">
-    <input class="srch" id="srch" placeholder="Search…" autocomplete="off" spellcheck="false">
+    <input class="srch" id="srch" placeholder="Search…" aria-label="Search notes" autocomplete="off" spellcheck="false">
   </div>
   <nav class="tree" id="tree">
     <div class="loading">Loading…</div>
@@ -1560,11 +1793,11 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
 
 <div class="main">
   <div class="tabrow">
-    <button class="menu-btn" id="menu-btn" aria-label="Open sidebar" aria-controls="sb" aria-expanded="false" title="Notes">&#9776;</button>
+    <button class="menu-btn" id="menu-btn" aria-label="Open sidebar" aria-controls="sb" aria-expanded="false" title="Notes"><svg aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2 4h12M2 8h12M2 12h12"/></svg></button>
     <div class="tabs" id="tabs"></div>
     <div class="toolbar-btns">
-      <button class="toolbar-btn" id="graph-btn">
-        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <button class="toolbar-btn" id="graph-btn" title="Graph" aria-label="Graph" aria-pressed="false">
+        <svg aria-hidden="true" focusable="false" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
           <circle cx="3" cy="8" r="2.2" fill="currentColor" stroke="none"/>
           <circle cx="13" cy="3.5" r="2.2" fill="currentColor" stroke="none"/>
           <circle cx="13" cy="12.5" r="2.2" fill="currentColor" stroke="none"/>
@@ -1573,8 +1806,8 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
         </svg>
         Graph
       </button>
-      <button class="toolbar-btn" id="chat-toggle-btn">
-        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <button class="toolbar-btn" id="chat-toggle-btn" title="Chat" aria-label="Chat" aria-pressed="false">
+        <svg aria-hidden="true" focusable="false" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <path d="M14 2H2a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h3l3 3 3-3h3a1 1 0 0 0 1-1V3a1 1 0 0 0-1-1z"/>
         </svg>
         Chat
@@ -1593,7 +1826,7 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
     <div class="graph-hint">scroll = zoom · drag = pan · click node to open note</div>
   </div>
   <div id="plugin-wrap" hidden>
-    <div class="plugin-head"><span id="plugin-title"></span><button class="chat-close" id="plugin-close" title="Close (Esc)">×</button></div>
+    <div class="plugin-head"><span id="plugin-title"></span><button class="chat-close" id="plugin-close" title="Close (Esc)" aria-label="Close">__XICON__</button></div>
     <div id="plugin-mount"></div>
   </div>
 </div>
@@ -1601,7 +1834,7 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
 <div class="chat-panel" id="chat-panel" hidden>
   <div class="chat-header">
     <span class="chat-header-title">Chat</span>
-    <button class="chat-close" id="chat-close" title="Close">×</button>
+    <button class="chat-close" id="chat-close" title="Close chat" aria-label="Close chat">__XICON__</button>
   </div>
   <div class="chat-ctx" id="chat-ctx">No note open</div>
   <div class="chat-messages" id="chat-messages">
@@ -1614,8 +1847,8 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
     </div>
     <div class="chat-input-row">
       <textarea class="chat-input" id="chat-input" placeholder="Ask about this note…" rows="1"></textarea>
-      <button class="chat-send" id="chat-send" title="Send (Enter)">
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+      <button class="chat-send" id="chat-send" title="Send (Enter)" aria-label="Send">
+        <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
           <path d="M1 1l14 7-14 7V9.5l10-1.5-10-1.5z"/>
         </svg>
       </button>
@@ -1629,7 +1862,7 @@ __DATA__
 const FLAGS = __FLAGS__;   // {chat, watch, export}
 const FM = __FM__;
 const TC = __TC__;
-const tcol = t => TC[t] || "#888";
+const TCL = __TCL__;      // optional "types_light": type -> colour used instead of TC in the light theme
 const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const DONE_STATES = new Set(["done", "waived", "missed"]);
 const todayStr = () => { const d = new Date(), p = n => String(n).padStart(2, "0");
@@ -1646,6 +1879,195 @@ function safeUrl(u) {
 }
 const esc = s => String(s ?? "").replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+// ── Theme-aware colours (pure; tests/test_viewer.py re-implements the maths in Python and compares) ──
+// Colours in viewer.json are written for the dark theme. In the light theme:
+//  * a folder badge uses "bg_light"/"fg_light" when given, else a tint of its colour with text darkened
+//    (hue kept) until it reaches 4.5:1 against that tint;
+//  * a note-type colour uses "types_light" when given, else the configured colour darkened (hue kept)
+//    until it reaches 3:1 against the page background (enough for dots, node fills and chip text).
+const LIGHT_BG = "#fbfbfa", LIGHT_SH = "#e9e9e5", DARK_SH = "#191919";   // = --bg and --sh (light), --sb (dark)
+const BADGE_MIN = 4.5, TYPE_MIN = 3;
+const own = (o, k) => Object.prototype.hasOwnProperty.call(o || {}, k);
+const lightMq = (typeof window !== "undefined" && window.matchMedia) ? window.matchMedia("(prefers-color-scheme: light)") : null;
+const isLight = () => FLAGS.theme === "light" || (FLAGS.theme !== "dark" && !!(lightMq && lightMq.matches));
+const hexRgb = h => {
+  const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(String(h ?? "").trim());
+  if (!m) return null;
+  const s = m[1].length === 3 ? [...m[1]].map(c => c + c).join("") : m[1];
+  return [0, 2, 4].map(i => parseInt(s.slice(i, i + 2), 16));
+};
+const rgbHex = c => "#" + c.map(v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0")).join("");
+const lumOf = c => {
+  const [r, g, b] = c.map(v => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+};
+const contrastOf = (a, b) => { const x = lumOf(a), y = lumOf(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+const mixRgb = (a, b, pct) => a.map((v, i) => v * pct + b[i] * (1 - pct));          // pct of a over b
+// `hex` scaled towards black (so the hue stays) until it reaches `min`:1 against `bgHex`.
+function darkenTo(hex, bgHex, min) {
+  const c = hexRgb(hex), bg = hexRgb(bgHex);
+  if (!c || !bg) return hex;
+  for (let i = 0; i <= 50; i++) {
+    const t = c.map(v => Math.round(v * (1 - i * 0.02)));
+    if (contrastOf(t, bg) >= min) return rgbHex(t);
+  }
+  return "#000000";
+}
+// "#rgb"/"#rrggbb" + a two-digit alpha -> "#rrggbbaa" (canvas colours); anything else is returned as is
+const hexAlpha = (col, aa) => { const c = hexRgb(col); return c ? rgbHex(c) + aa : col; };
+// FNV-1a: a stable hash, so a folder or type always gets the same generated colour
+function hash32(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h >>> 0;
+}
+const typeGrey = light => (light ? darkenTo("#888888", LIGHT_BG, TYPE_MIN) : "#888");
+// Generated colours for what the config does not list: a stable pick from this palette, hashed from the
+// folder path or the type name (the light theme darkens it like any configured colour).
+const PALETTE = ["#5b9bd5", "#4ecdc4", "#e07050", "#c8980a", "#9b8bdb", "#68b068", "#d4709a", "#7fa6c9"];
+const paletteColor = key => PALETTE[hash32(String(key)) % PALETTE.length];
+// Colour of note type `t` in the dark or light theme (maps default to the page's config). A configured
+// type wins; an empty type is grey; any other type gets a generated colour.
+function tcol(t, light = isLight(), tc = TC, tcl = TCL) {
+  if (!t) return typeGrey(light);
+  const cfg = own(tc, t) && tc[t] ? tc[t] : paletteColor(t);
+  if (!light) return cfg;
+  if (own(tcl, t) && tcl[t]) return tcl[t];
+  return darkenTo(cfg, LIGHT_BG, TYPE_MIN);
+}
+// Light-theme badge derived from one accent colour: 15% tint over --sh, text darkened to 4.5:1 on it.
+function derivedLightBadge(base) {
+  const c = hexRgb(base);
+  if (!c) return { bg: "var(--sh)", fg: "var(--tx2)" };
+  const bg = rgbHex(mixRgb(c, hexRgb(LIGHT_SH), 0.15));
+  return { bg, fg: darkenTo(base, bg, BADGE_MIN) };
+}
+const folderLabel = name => String(name).replace(/^\d+[-\s]+/, "");
+// First letter or digit (Unicode-aware, upper-cased) of a folder name once its number prefix is dropped.
+function badgeLetter(name) {
+  const m = /[\p{L}\p{N}]/u.exec(folderLabel(name)) || /[\p{L}\p{N}]/u.exec(name);
+  return m ? [...m[0].toUpperCase()][0] : "?";
+}
+// {bg, fg, letter} of a folder badge. `path` is the vault-relative folder path (a top-level folder: its
+// name). A configured entry wins (dark: exactly as written; light: see above). Without one the badge is
+// generated: the folder's first letter on a colour hashed from its path, so it never changes.
+function folderBadge(path, light = isLight(), fm = FM) {
+  const cfg = own(fm, path) && fm[path] && typeof fm[path] === "object" ? fm[path] : null;
+  const name = path.split("/").pop();
+  const letter = (cfg && cfg.letter) || (path === "(vault root)" ? "~" : badgeLetter(name));
+  const gen = paletteColor(path);
+  if (!light) {
+    const bg = cfg && cfg.bg || rgbHex(mixRgb(hexRgb(cfg && cfg.fg && hexRgb(cfg.fg) ? cfg.fg : gen), hexRgb(DARK_SH), 0.2));
+    return { bg, fg: cfg && cfg.fg || gen, letter };
+  }
+  const d = derivedLightBadge(cfg && (cfg.fg || cfg.bg) || gen);
+  const bg = cfg && cfg.bg_light || d.bg;
+  const fg = cfg && cfg.fg_light || (cfg && cfg.bg_light ? darkenTo(cfg.fg || cfg.bg || gen, bg, BADGE_MIN) : d.fg);
+  return { bg, fg, letter };
+}
+// Colour of a frontmatter chip (type: coloured like the dots, status: green, the rest: grey)
+const chipColor = (key, v) => key === "type" ? tcol(v) : key === "status" ? "var(--k-green)" : "var(--k-grey)";
+const chipStyle = c => `background:color-mix(in srgb, ${esc(c)} 12%, transparent);color:${esc(c)}`;
+
+// ── Nested folder tree (pure: data in, nodes / HTML out) ──
+// Number-aware, case-insensitive ordering: "2-x" before "10-x", "a" next to "A".
+const natCmp = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: "base" })
+  || (a < b ? -1 : a > b ? 1 : 0);
+const newFolderNode = (path, name) => ({ path, name, label: folderLabel(name), folders: [], notes: [], count: 0 });
+// `sections` is vault.folders ([{folder, notes: [{path, name, type}]}], top level in the server's
+// folder_order). Returns one folder node per section; a node is {path, name, label, folders, notes, count}
+// where `path` is the vault-relative folder path (the key of the expanded state) and `count` is recursive.
+// Subfolders sort before notes, both by natCmp; the top level keeps the server's order.
+function buildTree(sections) {
+  const sortNode = node => {
+    node.folders.sort((a, b) => natCmp(a.name, b.name));
+    node.notes.sort((a, b) => natCmp(a.name, b.name) || natCmp(a.path, b.path));
+    node.folders.forEach(sortNode);
+    node.count = node.notes.length + node.folders.reduce((n, f) => n + f.count, 0);
+  };
+  return sections.map(sec => {
+    const top = newFolderNode(sec.folder, sec.folder);
+    const kids = new Map([["", top]]);
+    for (const n of sec.notes) {
+      const dirs = sec.folder === "(vault root)" ? [] : n.path.split("/").slice(1, -1);
+      let node = top, path = sec.folder;
+      for (const d of dirs) {
+        path += "/" + d;
+        let child = kids.get(path);
+        if (!child) { child = newFolderNode(path, d); kids.set(path, child); node.folders.push(child); }
+        node = child;
+      }
+      node.notes.push(n);
+    }
+    sortNode(top);
+    return top;
+  });
+}
+// Every folder path in `nodes`, to drop expanded-state entries of folders that no longer exist.
+function folderPaths(nodes, out = new Set()) {
+  nodes.forEach(n => { out.add(n.path); folderPaths(n.folders, out); });
+  return out;
+}
+// The folder paths that contain the vault-relative `path` (a note or a folder's own path), outermost first.
+// A note at the vault root lives in the "(vault root)" group.
+function ancestorFolders(path) {
+  const parts = String(path).split("/");
+  if (parts.length < 2) return ["(vault root)"];
+  const out = [];
+  for (let i = 1; i < parts.length; i++) out.push(parts.slice(0, i).join("/"));
+  return out;
+}
+
+// Breadcrumb: every folder of the path (number prefixes stripped) as a link to that folder, then the note name.
+function breadcrumbHtml(path, name) {
+  const dirs = String(path).split("/").slice(0, -1);
+  return dirs.map((d, i) => `<a class="bc-f" href="#" data-fpath="${esc(dirs.slice(0, i + 1).join("/"))}" title="Show in the file tree">${esc(folderLabel(d))}</a>` +
+    `<span class="sep">/</span>`).join("") + `<span>${esc(name)}</span>`;
+}
+
+// ── Tabs (pure) ──
+const TAB_LIMIT = 8;
+// Which tab to drop when there are more than TAB_LIMIT: the least recently used one that is not `active`.
+// `lastUsed` maps a path to a counter that grows each time the tab becomes active.
+function tabToEvict(tabs, lastUsed, active) {
+  let victim = null, best = Infinity;
+  for (const t of tabs) {
+    if (t.path === active) continue;
+    const u = lastUsed.has(t.path) ? lastUsed.get(t.path) : -1;
+    if (u < best) { best = u; victim = t; }
+  }
+  return victim;
+}
+// Tabs after closing `path`, plus `next`: the tab to activate when the closed one was the active tab
+// (its right neighbour, else its left one), null when none is left, undefined when the active tab is unchanged.
+function closeTabResult(tabs, path, active) {
+  const i = tabs.findIndex(t => t.path === path);
+  if (i < 0) return { tabs, next: undefined };
+  const rest = tabs.filter((_, j) => j !== i);
+  if (path !== active) return { tabs: rest, next: undefined };
+  return { tabs: rest, next: rest.length ? rest[Math.min(i, rest.length - 1)] : null };
+}
+const CHEVRON = `<svg class="ch" aria-hidden="true" focusable="false" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 4 10 8 6 12"/></svg>`;
+// ctx: {expanded: Set of folder paths, active: note path, light: bool}
+function folderHtml(node, depth, ctx) {
+  const open = ctx.expanded.has(node.path), b = folderBadge(node.path, ctx.light);
+  return `<div class="folder${depth ? " sub" : ""}" role="none" style="--depth:${depth}">` +
+    `<div class="fhd${open ? " open" : ""}" role="treeitem" aria-expanded="${open}" aria-level="${depth + 1}" tabindex="-1" data-fpath="${esc(node.path)}">` +
+    CHEVRON +
+    `<span class="fi${depth ? " sm" : ""}" aria-hidden="true" style="background:${esc(b.bg)};color:${esc(b.fg)}">${esc(b.letter)}</span>` +
+    `<span class="fn">${esc(node.label)}</span><span class="fc">${node.count}</span></div>` +
+    `<div class="fnotes" role="group"${open ? "" : " hidden"}>` +
+    node.folders.map(f => folderHtml(f, depth + 1, ctx)).join("") +
+    node.notes.map(n => noteRowHtml(n, depth + 1, ctx)).join("") + `</div></div>`;
+}
+function noteRowHtml(n, level, ctx) {
+  const on = ctx.active === n.path;
+  return `<div class="ni${on ? " active" : ""}" role="treeitem" aria-level="${level + 1}" aria-selected="${on}" tabindex="-1" ` +
+    `data-path="${esc(n.path)}" title="${esc(n.path)}">` +
+    `<span class="nd" data-type="${esc(n.type)}" style="background:${esc(tcol(n.type, ctx.light))}"></span>` +
+    `<span class="nn">${esc(n.name)}</span></div>`;
+}
 
 // Full-text search over {path, name, content} notes: mirrors search_notes() in viewer.py
 // (the live server answers /api/search; --export runs this over the embedded notes).
@@ -1701,16 +2123,46 @@ function resolveNote(target, pathOnly) {
   if (!noteIdx) {
     noteIdx = { byPath: new Map(), stems: new Map(Object.entries(vault.stems || {})) };
     vault.folders.forEach(s => s.notes.forEach(n => {
-      const p = n.path.toLowerCase();
+      const p = n.path.normalize("NFC").toLowerCase();        // lookup keys are NFC (the server's are too); n.path stays as on disk
       noteIdx.byPath.set(p, n);
       noteIdx.byPath.set(p.replace(/\.md$/, ""), n);
     }));
   }
-  const t = String(target || "").trim().replace(/\\/g, "/").replace(/^\/+/, "")
+  const t = String(target || "").trim().replace(/\\/g, "/").replace(/^\/+/, "").normalize("NFC")
     .replace(/\.md$/i, "").toLowerCase();
   // pathOnly: relative .md links must name a real path; no fall-back to a same-named note elsewhere
   const stem = pathOnly ? null : noteIdx.stems.get(t);
-  return noteIdx.byPath.get(t) || (stem && noteIdx.byPath.get(stem.toLowerCase())) || null;
+  return noteIdx.byPath.get(t) || (stem && noteIdx.byPath.get(stem.normalize("NFC").toLowerCase())) || null;
+}
+
+// ── Frontmatter chips: [[Note]] values become the same clickable links as in the body ──
+// Text with [[target]], [[target#Heading]] and [[target|label]] turned into a.wl links (span.wl.missing when the
+// note does not exist); everything else is escaped text. Same pattern as the wikilink tokenizer below.
+function fmValueHtml(text) {
+  text = String(text ?? "");
+  const re = /\[\[([^\]\n|#]+?)(?:#([^\]\n|]*?))?(?:\\?\|([^\]\n]*?))?\]\]/g;
+  let out = "", last = 0, m;
+  while ((m = re.exec(text))) {
+    out += esc(text.slice(last, m.index));
+    last = m.index + m[0].length;
+    const target = m[1].replace(/\\$/, "").trim(), heading = (m[2] || "").replace(/\\$/, "").trim(), alias = (m[3] || "").trim();
+    const label = alias || (heading ? `${target} › ${heading}` : target);
+    const n = resolveNote(target);
+    out += n ? `<a class="wl" href="#" data-path="${esc(n.path)}">${esc(label)}</a>`
+             : `<span class="wl missing" title="Note not found">${esc(label)}</span>`;
+  }
+  return out + esc(text.slice(last));
+}
+// The chip row for a note's parsed frontmatter ({key: string | string[]}); "" when nothing is worth showing.
+function chipsHtml(fm) {
+  const chips = Object.entries(fm || {}).filter(([k]) => k !== "title").map(([k, v]) => {
+    const items = Array.isArray(v) ? v.map(x => String(x ?? "")) : [String(v ?? "")];
+    const text = items.join(", ");
+    if (!text) return "";
+    return `<span class="chip" data-k="${esc(k)}" data-v="${esc(text)}" style="${chipStyle(chipColor(k, text))}">${esc(k)}: ` +
+      items.map(fmValueHtml).join(", ") + `</span>`;
+  }).join("");
+  return chips ? `<div class="chips">${chips}</div>` : "";
 }
 
 // ── Relative Markdown links to notes: [t](../dir/Other%20note.md#Heading) ──
@@ -1745,17 +2197,17 @@ function attachmentPath(target, wiki) {
   if (!vault) return null;
   if (!fileIdx) {
     fileIdx = { byPath: new Map(), names: new Map(Object.entries(vault.files || {})) };
-    (vault.file_paths || []).forEach(p => fileIdx.byPath.set(p.toLowerCase(), p));
+    (vault.file_paths || []).forEach(p => fileIdx.byPath.set(p.normalize("NFC").toLowerCase(), p));
   }
   if (wiki) {           // ![[pic.png]] / ![[img/pic.png]]: vault path, else Obsidian's vault-wide name lookup
-    const t = String(target || "").trim().replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
+    const t = String(target || "").trim().replace(/\\/g, "/").replace(/^\/+/, "").normalize("NFC").toLowerCase();
     const hit = fileIdx.byPath.get(t);
     if (hit) return hit;
     const named = fileIdx.names.get(t.split("/").pop());
     return named && (t.indexOf("/") < 0 || named.toLowerCase().endsWith("/" + t)) ? named : null;
   }
   const rel = relLinkPath(currentNotePath, target, ATT_EXT);    // relative to the note's folder
-  return rel === null ? null : (fileIdx.byPath.get(rel.toLowerCase()) || null);
+  return rel === null ? null : (fileIdx.byPath.get(rel.normalize("NFC").toLowerCase()) || null);
 }
 function attachmentSrc(path) {
   if (EXPORT) return (EXPORT.attachments || {})[path] || null;
@@ -2073,81 +2525,218 @@ document.addEventListener("click", e => {
 });
 
 // ── Tree ──────────────────────────────────────────────────────
-function renderTree() {
-  const tree = document.getElementById("tree");
-  if (!vault) return;
-  tree.innerHTML = "";
+// Expanded folders are remembered by vault-relative folder path, per vault title, in localStorage.
+const treeKey = () => "sbv-tree:" + (FLAGS.title || "");
+function loadExpanded() {
+  try {
+    const a = JSON.parse(localStorage.getItem(treeKey()) || "[]");
+    return new Set(Array.isArray(a) ? a.filter(x => typeof x === "string") : []);
+  } catch (_) { return new Set(); }
+}
+function saveExpanded() {
+  try { localStorage.setItem(treeKey(), JSON.stringify([...expanded])); } catch (_) {}
+}
+let treeRoots = [], noteEls = new Map(), folderEls = new Map(), activeEl = null;
+const treeEl = () => document.getElementById("tree");
 
-  vault.folders.forEach(sec => {
-    const notes = sec.notes;
-
-    const fm = FM[sec.folder] || { bg:"#1a1a1a", fg:"#777", letter:"?" };
-    const open = expanded.has(sec.folder);
-    const label = sec.folder.replace(/^\d+[-\s]+/, "");
-
-    const el = document.createElement("div");
-    el.className = "folder";
-
-    const hd = document.createElement("div");
-    hd.className = "fhd" + (open ? " open" : "");
-    hd.innerHTML =
-      `<svg class="ch" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 4 10 8 6 12"/></svg>` +
-      `<span class="fi" style="background:${esc(fm.bg)};color:${esc(fm.fg)}">${esc(fm.letter)}</span>` +
-      `<span class="fn">${esc(label)}</span>` +
-      `<span class="fc">${notes.length}</span>`;
-
-    const fnotes = document.createElement("div");
-    fnotes.className = "fnotes";
-    if (!open) fnotes.hidden = true;
-
-    notes.forEach(n => {
-      const ni = document.createElement("div");
-      ni.className = "ni" + (activeTab === n.path ? " active" : "");
-      ni.dataset.path = n.path;
-      ni.innerHTML =
-        `<span class="nd" style="background:${esc(tcol(n.type))}"></span>` +
-        `<span class="nn">${esc(n.name)}</span>`;
-      ni.addEventListener("click", () => openNote({
-        path: n.path, name: n.name, type: n.type, folder: sec.folder
-      }));
-      fnotes.appendChild(ni);
-    });
-
-    hd.addEventListener("click", () => {
-      const now = !hd.classList.contains("open");
-      hd.classList.toggle("open", now);
-      fnotes.hidden = !now;
-      now ? expanded.add(sec.folder) : expanded.delete(sec.folder);
-    });
-
-    el.appendChild(hd);
-    el.appendChild(fnotes);
-    tree.appendChild(el);
-  });
+// Index the rows of whatever the sidebar shows now (tree or search results).
+function indexRows() {
+  noteEls = new Map(); folderEls = new Map(); activeEl = null;
+  treeEl().querySelectorAll(".ni").forEach(el => { noteEls.set(el.dataset.path, el); if (el.classList.contains("active")) activeEl = el; });
+  treeEl().querySelectorAll(".fhd").forEach(el => folderEls.set(el.dataset.fpath, el));
+  const first = activeEl || treeEl().querySelector(".fhd, .ni");
+  if (first) first.tabIndex = 0;                                   // roving tabindex: one stop in the tree
 }
 
+function renderTree() {
+  const tree = treeEl();
+  if (!vault) return;
+  const keep = tree.scrollTop, f = document.activeElement;
+  const focus = f && tree.contains(f) ? (f.dataset.fpath != null ? ["fpath", f.dataset.fpath] : ["path", f.dataset.path]) : null;
+  treeRoots = buildTree(vault.folders);
+  tree.setAttribute("role", "tree");
+  tree.setAttribute("aria-label", "Notes");
+  const ctx = { expanded, active: activeTab, light: isLight() };
+  tree.innerHTML = treeRoots.map(n => folderHtml(n, 0, ctx)).join("");
+  indexRows();
+  tree.scrollTop = keep;
+  if (focus) {                                                      // live reload / theme change must not drop keyboard focus
+    const el = focus[0] === "fpath" ? folderEls.get(focus[1]) : noteEls.get(focus[1]);
+    if (el) el.focus({ preventScroll: true });
+  }
+}
+
+function setFolderOpen(fpath, open) {
+  open ? expanded.add(fpath) : expanded.delete(fpath);
+  const hd = folderEls.get(fpath);
+  if (hd) {
+    hd.classList.toggle("open", open);
+    hd.setAttribute("aria-expanded", String(open));
+    hd.nextElementSibling.hidden = !open;
+  }
+  saveExpanded();
+}
+
+const isNarrow = () => !!(window.matchMedia && window.matchMedia("(max-width: 580px)").matches);
+function clearSearch() {
+  const box = document.getElementById("srch");
+  box.value = ""; searchQ = ""; searchSeq++;
+  renderTree();
+}
+// Opens every folder above the note and scrolls its row into view. It never moves keyboard focus (the
+// search box keeps it). While search results replace the tree only the remembered state changes.
+function revealNote(path, scroll = true) {
+  ancestorFolders(path).forEach(f => { if (!expanded.has(f)) setFolderOpen(f, true); });
+  if (searchQ || !scroll) return;
+  const el = noteEls.get(path);
+  if (el) el.scrollIntoView({ block: "nearest" });
+}
+// Breadcrumb click: show and open that folder in the tree (the sidebar overlay on a phone).
+function revealFolder(fpath) {
+  if (isNarrow()) setSidebar(true);
+  if (searchQ) clearSearch();
+  ancestorFolders(fpath + "/x").forEach(f => setFolderOpen(f, true));
+  const hd = folderEls.get(fpath);
+  if (hd) hd.scrollIntoView({ block: "nearest" });
+}
+function collapseAll() {
+  expanded.clear();
+  folderEls.forEach(hd => {
+    hd.classList.remove("open"); hd.setAttribute("aria-expanded", "false"); hd.nextElementSibling.hidden = true;
+  });
+  saveExpanded();
+}
+document.getElementById("collapse-btn").addEventListener("click", collapseAll);
+document.getElementById("reveal-btn").addEventListener("click", () => {
+  if (!activeTab) return;
+  if (searchQ) clearSearch();
+  revealNote(activeTab);
+});
+document.addEventListener("click", e => {          // breadcrumb folder segments
+  const a = e.target.closest && e.target.closest("a.bc-f");
+  if (!a) return;
+  e.preventDefault();
+  revealFolder(a.dataset.fpath);
+});
+
+// One delegated handler for the whole tree (cheap for thousands of rows).
+treeEl().addEventListener("click", e => {
+  const hd = e.target.closest(".fhd");
+  if (hd) { setFolderOpen(hd.dataset.fpath, !hd.classList.contains("open")); return; }
+  const ni = e.target.closest(".ni:not(.sr)");
+  if (!ni) return;
+  const n = findNote(ni.dataset.path);
+  if (n) openNote({ path: n.path, name: n.name, type: n.type, folder: n.path.split("/")[0] });
+});
+
+// Keyboard: Up/Down move between the visible rows, Home/End jump, Right/Left open/close a folder (or step into
+// / out to its parent), Enter and Space open a note or toggle a folder. One tab stop (roving tabindex).
+const visibleRows = () => [...treeEl().querySelectorAll(".fhd, .ni")].filter(r => !r.closest(".fnotes[hidden]"));
+function focusRow(row, rows) {
+  if (!row) return;
+  (rows || visibleRows()).forEach(r => { r.tabIndex = -1; });
+  row.tabIndex = 0;
+  row.focus();
+}
+treeEl().addEventListener("keydown", e => {
+  const row = e.target.closest(".fhd, .ni");
+  if (!row || e.altKey || e.ctrlKey || e.metaKey) return;
+  const rows = visibleRows(), i = rows.indexOf(row), isFolder = row.classList.contains("fhd");
+  const open = isFolder && row.classList.contains("open");
+  const parentRow = () => {
+    const group = (isFolder ? row.parentElement : row).closest(".fnotes");
+    return group && group.previousElementSibling;
+  };
+  switch (e.key) {
+    case "ArrowDown": focusRow(rows[i + 1], rows); break;
+    case "ArrowUp": focusRow(rows[i - 1], rows); break;
+    case "Home": focusRow(rows[0], rows); break;
+    case "End": focusRow(rows[rows.length - 1], rows); break;
+    case "ArrowRight":
+      if (!isFolder) return;
+      if (!open) setFolderOpen(row.dataset.fpath, true); else focusRow(rows[i + 1], rows);
+      break;
+    case "ArrowLeft":
+      if (open) setFolderOpen(row.dataset.fpath, false); else focusRow(parentRow(), rows);
+      break;
+    case "Enter": case " ":
+      if (isFolder) setFolderOpen(row.dataset.fpath, !open); else row.click();
+      break;
+    default: return;
+  }
+  e.preventDefault();
+});
+// Down arrow in the search box steps into the tree / the result list
+document.getElementById("srch").addEventListener("keydown", e => {
+  if (e.key !== "ArrowDown") return;
+  const first = visibleRows()[0];
+  if (first) { e.preventDefault(); focusRow(first); }
+});
+
 // ── Tabs ──────────────────────────────────────────────────────
+const CLOSE_ICON = `<svg aria-hidden="true" focusable="false" width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M3 3l10 10M13 3L3 13"/></svg>`;
+const tabLastUsed = new Map();
+let tabClock = 0;
 function renderTabs() {
   const bar = document.getElementById("tabs");
-  bar.innerHTML = "";
-  tabs.forEach(t => {
-    const el = document.createElement("div");
-    el.className = "tab" + (activeTab === t.path ? " active" : "");
-    el.innerHTML = `<span class="ti" style="background:${esc(tcol(t.type))}"></span>${esc(t.name)}`;
-    el.addEventListener("click", () => switchTo(t));
-    bar.appendChild(el);
+  bar.setAttribute("role", "tablist");
+  bar.innerHTML = tabs.map(t => {
+    const on = activeTab === t.path;
+    return `<div class="tab${on ? " active" : ""}" role="tab" aria-selected="${on}" tabindex="0" data-path="${esc(t.path)}" title="${esc(t.path)}">` +
+      `<span class="ti" data-type="${esc(t.type)}" style="background:${esc(tcol(t.type))}"></span><span class="tab-name">${esc(t.name)}</span>` +
+      `<button type="button" class="tab-x" tabindex="-1" aria-label="Close tab" title="Close tab">${CLOSE_ICON}</button></div>`;
+  }).join("");
+  const el = bar.querySelector(".tab.active");
+  if (el) el.scrollIntoView({ block: "nearest", inline: "nearest" });        // keep the active tab in view
+}
+{
+  const bar = document.getElementById("tabs");
+  const tabOf = e => { const el = e.target.closest(".tab"); return el && tabs.find(t => t.path === el.dataset.path); };
+  bar.addEventListener("click", e => {
+    const t = tabOf(e);
+    if (!t) return;
+    if (e.target.closest(".tab-x")) closeTab(t.path); else switchTo(t);
   });
+  bar.addEventListener("mousedown", e => { if (e.button === 1) e.preventDefault(); });      // no autoscroll on middle click
+  bar.addEventListener("auxclick", e => { const t = tabOf(e); if (t && e.button === 1) { e.preventDefault(); closeTab(t.path); } });
+  bar.addEventListener("keydown", e => {
+    const t = tabOf(e);
+    if (!t || e.target.closest(".tab-x")) return;
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); switchTo(t); }
+    else if (e.key === "Delete") { e.preventDefault(); closeTab(t.path); }
+  });
+  // a vertical wheel scrolls the tab bar sideways when the tabs do not fit
+  bar.addEventListener("wheel", e => {
+    if (bar.scrollWidth > bar.clientWidth && Math.abs(e.deltaY) > Math.abs(e.deltaX)) { bar.scrollLeft += e.deltaY; e.preventDefault(); }
+  }, { passive: false });
+}
+
+// Closes a tab. Closing the active one activates its neighbour (the URL hash follows), or shows the empty
+// start screen when no tab is left.
+function closeTab(path) {
+  const r = closeTabResult(tabs, path, activeTab);
+  tabs = r.tabs;
+  tabLastUsed.delete(path);
+  if (r.next === undefined) { renderTabs(); return; }
+  if (r.next) openNote(r.next); else showWelcome();
 }
 
 const switchTo = t => openNote(t);
 
+// Only the previously and the newly active row change; the tree is not re-rendered.
 function highlight() {
-  document.querySelectorAll(".ni").forEach(el =>
-    el.classList.toggle("active", el.dataset.path === activeTab));
+  if (activeEl) { activeEl.classList.remove("active"); activeEl.setAttribute("aria-selected", "false"); }
+  activeEl = activeTab ? noteEls.get(activeTab) || null : null;
+  if (activeEl) { activeEl.classList.add("active"); activeEl.setAttribute("aria-selected", "true"); }
 }
 
 // ── Open note ─────────────────────────────────────────────────
-const findNote = path => vault?.folders.flatMap(s => s.notes).find(n => n.path === path);
+let noteByPath = null;                       // rebuilt after every load()
+const findNote = path => {
+  if (!vault) return undefined;
+  if (!noteByPath) { noteByPath = new Map(); vault.folders.forEach(s => s.notes.forEach(n => noteByPath.set(n.path, n))); }
+  return noteByPath.get(path);
+};
 const hashFor = path => "#" + encodeURIComponent(path);
 
 // Opens (or switches to) a note tab. activeTab is set *before* the hash is written, so the
@@ -2156,27 +2745,36 @@ function openNote(note) {
   closeSidebar();
   if (graphMode) closeGraph();
   closePlugin();
-  if (!tabs.find(t => t.path === note.path)) {
-    tabs.push(note);
-    if (tabs.length > 8) tabs.shift();
-  }
+  if (!tabs.find(t => t.path === note.path)) tabs.push(note);
   activeTab = note.path;
+  tabLastUsed.set(note.path, ++tabClock);
+  if (tabs.length > TAB_LIMIT) {                       // over the limit: drop the least recently used tab, never the active one
+    const victim = tabToEvict(tabs, tabLastUsed, activeTab);
+    if (victim) { tabs = tabs.filter(t => t !== victim); tabLastUsed.delete(victim.path); }
+  }
   renderTabs();
   loadContent(note);
   highlight();
+  revealNote(note.path);
   if (location.hash !== hashFor(note.path)) location.hash = hashFor(note.path);
 }
 
 const welcomeHTML = document.getElementById("content").innerHTML;
+// The empty start screen (no active note); the hash is cleared without adding a history entry.
+function showWelcome() {
+  activeTab = null;
+  renderTabs(); highlight();
+  document.getElementById("content").innerHTML = welcomeHTML;
+  setChatContext("", "");
+  if (location.hash) history.replaceState(null, "", location.pathname + location.search);
+}
 function routeFromHash() {
   if (!vault) return;                         // initial route happens after the first load()
   let p = "";
   try { p = decodeURIComponent(location.hash.replace(/^#/, "")); } catch (_) { return; }
   if (!p) {                                   // back to the empty hash → welcome screen
     if (activeTab === null) return;
-    activeTab = null;
-    renderTabs(); highlight();
-    document.getElementById("content").innerHTML = welcomeHTML;
+    showWelcome();
     return;
   }
   if (p === activeTab) return;
@@ -2230,20 +2828,10 @@ function showNote(data) {
     raw = raw.slice(fmMatch[0].length);
     // The server parses the frontmatter (one parser for the API, lint and export); parseFmFallback only
     // serves data without a "frontmatter" field (older exports).
-    const kv = Object.entries(data.frontmatter || parseFmFallback(fmMatch[1]))
-      .map(([k, v]) => [k, Array.isArray(v) ? v.join(", ") : String(v ?? "")])
-      .filter(([k, v]) => v && k !== "title");
-    chips = kv.map(([key, v]) => {
-      const c = key === "type" ? tcol(v) : key === "status" ? "var(--k-green)" : "var(--k-grey)";
-      return `<span class="chip" style="background:color-mix(in srgb, ${esc(c)} 12%, transparent);color:${esc(c)}">${esc(key)}: ${esc(v)}</span>`;
-    }).join("");
-    if (chips) chips = `<div class="chips">${chips}</div>`;
+    chips = chipsHtml(data.frontmatter || parseFmFallback(fmMatch[1]));
   }
 
-  const parts = data.path.split("/");
-  const bc = parts.length > 1
-    ? `<div class="bc"><span>${esc(parts[0].replace(/^\d+[-\s]+/,""))}</span><span class="sep">/</span><span>${esc(data.name)}</span></div>`
-    : `<div class="bc"><span>${esc(data.name)}</span></div>`;
+  const bc = `<div class="bc">${breadcrumbHtml(data.path, data.name)}</div>`;
 
   let html = "";
   if (typeof marked !== "undefined") {
@@ -2268,7 +2856,13 @@ async function load() {
   try {
     const first = !vault;
     vault = await api("vault");
-    noteIdx = null; fileIdx = null;
+    noteIdx = null; fileIdx = null; noteByPath = null;
+    if (first) expanded = loadExpanded();
+    {                                                          // forget folders that no longer exist
+      const live = folderPaths(buildTree(vault.folders)), n = expanded.size;
+      expanded = new Set([...expanded].filter(p => live.has(p)));
+      if (expanded.size !== n) saveExpanded();
+    }
     if (searchQ) runSearch(); else renderTree();
     if (first) routeFromHash(); else fireVaultChange();       // plug-ins: onVaultChange
   } catch(e) {
@@ -2280,18 +2874,20 @@ async function load() {
 
 // ── Events ────────────────────────────────────────────────────
 // ── Sidebar search: a result list replaces the tree while the box has a query ──
-let searchTimer = null, searchSeq = 0;
+let searchTimer = null, searchSeq = 0, lastResults = null;
 function renderSearch(results) {
+  lastResults = results;
   const tree = document.getElementById("tree");
   tree.innerHTML = "";
-  if (!results.length) { tree.innerHTML = `<div class="loading">No results</div>`; return; }
+  tree.setAttribute("role", "listbox");
+  if (!results.length) { tree.innerHTML = `<div class="loading">No results</div>`; indexRows(); return; }
   results.forEach(r => {
     const n = findNote(r.path) || {};
     const el = document.createElement("div");
     el.className = "ni sr" + (activeTab === r.path ? " active" : "");
     el.dataset.path = r.path;
     el.innerHTML =
-      `<span class="nd" style="background:${esc(tcol(n.type))}"></span>` +
+      `<span class="nd" data-type="${esc(n.type)}" style="background:${esc(tcol(n.type))}"></span>` +
       `<span class="sr-main"><span class="nn">${esc(r.name)}</span>` +
       `<span class="sr-folder">${esc(r.folder)}</span>` +
       (r.snippet ? `<span class="sr-snip">${esc(r.snippet)}</span>` : "") + `</span>`;
@@ -2299,6 +2895,9 @@ function renderSearch(results) {
       path: r.path, name: r.name, type: n.type || "", folder: r.folder }));
     tree.appendChild(el);
   });
+  tree.setAttribute("role", "listbox");
+  tree.querySelectorAll(".ni").forEach(el => { el.setAttribute("role", "option"); el.tabIndex = -1; });
+  indexRows();
 }
 async function runSearch() {
   const seq = ++searchSeq, q = searchQ;
@@ -2314,11 +2913,11 @@ document.getElementById("srch").addEventListener("input", e => {
   searchQ = e.target.value.trim();
   clearTimeout(searchTimer);
   searchSeq++;                                  // invalidate any search in flight
-  if (!searchQ) { renderTree(); return; }       // cleared: restore the tree
+  if (!searchQ) { renderTree(); if (activeTab) revealNote(activeTab); return; }       // cleared: restore the tree
   searchTimer = setTimeout(runSearch, 150);     // debounce
 });
 
-// ── Mobile sidebar overlay (the ☰ button only exists below 580px) ──
+// ── Mobile sidebar overlay (the menu button only exists below 580px) ──
 const sidebarOpen = () => document.body.classList.contains("sb-open");
 function setSidebar(open) {
   document.body.classList.toggle("sb-open", open);
@@ -2352,6 +2951,7 @@ async function openGraph() {
   closePlugin();
   graphMode = true;
   document.getElementById("graph-btn").classList.add("active");
+  document.getElementById("graph-btn").setAttribute("aria-pressed", "true");
   const wrap = document.getElementById("graph-wrap");
   wrap.hidden = false;
   if (!graphData) {
@@ -2368,6 +2968,7 @@ async function openGraph() {
 function closeGraph() {
   graphMode = false;
   document.getElementById("graph-btn").classList.remove("active");
+  document.getElementById("graph-btn").setAttribute("aria-pressed", "false");
   document.getElementById("graph-wrap").hidden = true;
   fgInstance = null;
 }
@@ -2377,13 +2978,23 @@ let graphColors = { bg: "", link: "", label: "" };
 function readGraphColors() {
   graphColors = { bg: cssVar("--graph-bg"), link: cssVar("--graph-link"), label: cssVar("--graph-label") };
 }
+// The OS theme changed while the page is open: CSS variables switch by themselves; what JS colours
+// (graph canvas, folder badges, type dots, tabs, chips) is redone here. The graph canvas repaints every frame.
+function applyTheme() {
+  refreshGraphTheme();
+  if (!vault) return;
+  if (searchQ) { if (lastResults) renderSearch(lastResults); } else renderTree();
+  renderTabs();
+  document.querySelectorAll(".chip[data-k]").forEach(el =>
+    el.setAttribute("style", chipStyle(chipColor(el.dataset.k, el.dataset.v))));
+}
 function refreshGraphTheme() {
   readGraphColors();
   if (fgInstance) fgInstance.backgroundColor(graphColors.bg).linkColor(() => graphColors.link);
 }
 {
   const mq = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)");
-  const onTheme = () => refreshGraphTheme();      // CSS variables switch by themselves; only the canvas needs a nudge
+  const onTheme = () => applyTheme();
   if (mq) { if (mq.addEventListener) mq.addEventListener("change", onTheme); else if (mq.addListener) mq.addListener(onTheme); }
 }
 
@@ -2420,12 +3031,12 @@ function renderGraph() {
     .nodeLabel(d => esc(d.name) + (degree[d.id] ? ` · ${degree[d.id]} links` : ""))   // force-graph inserts this as HTML
     .nodeCanvasObject((node, ctx, gs) => {
       const r = nodeRadius(node);
-      const col = tcol(node.type);
+      const col = tcol(node.type);                       // theme-aware: read on every frame
       ctx.beginPath();
       ctx.arc(node.x, node.y, r, 0, 2 * Math.PI);
-      ctx.fillStyle = col + (degree[node.id] ? "dd" : "55");
+      ctx.fillStyle = hexAlpha(col, degree[node.id] ? "dd" : "55");
       ctx.fill();
-      ctx.strokeStyle = col + "44";
+      ctx.strokeStyle = hexAlpha(col, "44");
       ctx.lineWidth = 1.5;
       ctx.stroke();
       if (gs > 0.55) {
@@ -2466,7 +3077,7 @@ function openPlugin(id) {
   closePlugin();
   if (graphMode) closeGraph();
   activePlugin = id;
-  if (rec.btn) rec.btn.classList.add("active");
+  if (rec.btn) { rec.btn.classList.add("active"); rec.btn.setAttribute("aria-pressed", "true"); }
   const wrap = document.getElementById("plugin-wrap"), mount = document.getElementById("plugin-mount");
   document.getElementById("plugin-title").textContent = rec.def.title;
   mount.innerHTML = "";
@@ -2484,7 +3095,7 @@ function closePlugin() {
   const rec = pluginRegistry.get(activePlugin);
   activePlugin = null;
   if (rec) {
-    if (rec.btn) rec.btn.classList.remove("active");
+    if (rec.btn) { rec.btn.classList.remove("active"); rec.btn.setAttribute("aria-pressed", "false"); }
     try { if (typeof rec.def.unmount === "function") rec.def.unmount(); }
     catch (e) { console.warn("[VaultViewer] plug-in unmount failed:", e); }
   }
@@ -2497,6 +3108,9 @@ pluginUi = {
     btn.className = "toolbar-btn";
     btn.dataset.plugin = rec.def.id;
     btn.textContent = rec.def.title;
+    btn.title = rec.def.title;
+    btn.setAttribute("aria-label", rec.def.title);
+    btn.setAttribute("aria-pressed", "false");
     btn.addEventListener("click", () => openPlugin(rec.def.id));
     const anchor = [...document.querySelectorAll(".toolbar-btn[data-plugin]")].pop() || document.getElementById("graph-btn");
     anchor.after(btn);                                  // right after Graph, in registration order
@@ -2518,6 +3132,7 @@ async function openChat() {
   chatOpen = true;
   document.getElementById("chat-panel").hidden = false;
   document.getElementById("chat-toggle-btn").classList.add("active");
+  document.getElementById("chat-toggle-btn").setAttribute("aria-pressed", "true");
   document.getElementById("chat-input").focus();
   if (!chatConfigLoaded) {
     chatConfigLoaded = true;
@@ -2535,6 +3150,7 @@ function closeChat() {
   chatOpen = false;
   document.getElementById("chat-panel").hidden = true;
   document.getElementById("chat-toggle-btn").classList.remove("active");
+  document.getElementById("chat-toggle-btn").setAttribute("aria-pressed", "false");
 }
 
 function setChatContext(noteTitle, noteContent) {
@@ -2689,6 +3305,10 @@ load();
 __PLUGINS__
 </body>
 </html>"""
+# icons are inline SVG (no glyph from a web font, so offline mode looks the same); one copy, used twice above
+VIEWER_HTML = VIEWER_HTML.replace(
+    "__XICON__", '<svg aria-hidden="true" focusable="false" width="12" height="12" viewBox="0 0 16 16" fill="none" '
+                 'stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 3l10 10M13 3L3 13"/></svg>')
 
 
 # ── HTTP server ──────────────────────────────────────────────────────────────
@@ -2772,7 +3392,7 @@ def render_page(mode: str = "online", data: dict = None) -> str:
     flags = {"chat": mode == "online", "watch": mode != "export", "export": mode == "export",
              # offline and export never load remote images; online follows the "remote_images" setting
              "remote_images": REMOTE_IMAGES if mode == "online" else "block",
-             "plugins": list(PLUGINS), "theme": THEME}
+             "plugins": list(PLUGINS), "theme": THEME, "title": CONFIG.get("title", VAULT.name)}
     head, libs, data_tag = "", "", ""
     if mode == "online":
         head, libs = CDN_FONTS, cdn_libs()
@@ -2793,6 +3413,7 @@ def render_page(mode: str = "online", data: dict = None) -> str:
     repl = {
         "FM": js_json(CONFIG.get("folders", {})),
         "TC": js_json(CONFIG.get("types", {})),
+        "TCL": js_json(CONFIG.get("types_light") if isinstance(CONFIG.get("types_light"), dict) else {}),
         "TITLE": html_escape(CONFIG.get("title", VAULT.name)),
         "FLAGS": js_json(flags),
         "THEMEATTR": "" if THEME == "system" else f' data-theme="{THEME}"',
@@ -2800,7 +3421,7 @@ def render_page(mode: str = "online", data: dict = None) -> str:
         "HEAD": head, "LIBS": libs, "DATA": data_tag, "PLUGINS": plug,
     }
     # single pass, so substituted content is never re-scanned for placeholders
-    return re.sub(r"__(FM|TC|TITLE|FLAGS|THEMEATTR|SCHEME|HEAD|LIBS|DATA|PLUGINS)__", lambda m: repl[m.group(1)], VIEWER_HTML)
+    return re.sub(r"__(FM|TCL|TC|TITLE|FLAGS|THEMEATTR|SCHEME|HEAD|LIBS|DATA|PLUGINS)__", lambda m: repl[m.group(1)], VIEWER_HTML)
 
 
 BIND_HOST = "127.0.0.1"
