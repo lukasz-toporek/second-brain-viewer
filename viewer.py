@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 import webbrowser
 from datetime import date
 from html import escape as html_escape
@@ -685,12 +686,20 @@ def note_aliases(fm: dict) -> list[str]:
     return out
 
 
+def nfc(s: str) -> str:
+    """Unicode NFC. Every name and link target is normalised before it is lower-cased and looked up, so a file
+    saved in decomposed form (NFD: some sync tools, macOS apps) matches a link typed normally, and the reverse.
+    Only the lookup *keys* are normalised: paths returned by the API stay as they are on disk."""
+    return unicodedata.normalize("NFC", s)
+
+
 def link_deprioritise_prefixes() -> list:
-    """Lower-cased vault-relative folder prefixes from the optional "link_deprioritise" config key."""
+    """Lower-cased (NFC) vault-relative folder prefixes from the optional "link_deprioritise" config key."""
     raw = CONFIG.get("link_deprioritise") or []
     if not isinstance(raw, list):
         return []
-    return [p.strip().strip("/").replace("\\", "/").lower() for p in raw if isinstance(p, str) and p.strip().strip("/")]
+    return [nfc(p.strip().strip("/").replace("\\", "/")).lower()
+            for p in raw if isinstance(p, str) and p.strip().strip("/")]
 
 
 class VaultIndex:
@@ -714,9 +723,10 @@ class VaultIndex:
             rel = path.relative_to(VAULT).as_posix()
             if path.suffix != ".md":
                 self.file_paths.append(rel)
-                cur = self.files.get(path.name.lower())
+                key = nfc(path.name).lower()
+                cur = self.files.get(key)
                 if cur is None or (self.is_deprioritised(cur) and not self.is_deprioritised(rel)):
-                    self.files[path.name.lower()] = rel
+                    self.files[key] = rel
                 continue
             text = path.read_text(encoding="utf-8")
             fm = parse_frontmatter(text)
@@ -725,10 +735,10 @@ class VaultIndex:
                 "folder": rel.split("/")[0] if "/" in rel else "(vault root)", "text": text,
                 "aliases": note_aliases(fm),
             })
-            low = rel.lower()
+            low = nfc(rel).lower()
             self.by_path[low] = rel
             self.by_path[low[:-3]] = rel
-            stem = path.stem.lower()
+            stem = nfc(path.stem).lower()
             cur = self.by_stem.get(stem)
             if cur is None or (self.is_deprioritised(cur) and not self.is_deprioritised(rel)):
                 self.by_stem[stem] = rel
@@ -777,12 +787,12 @@ class VaultIndex:
 
     @staticmethod
     def link_key(name: str) -> str:
-        """Lookup key of a link target or alias: ``/`` separators, no leading ``/``, no ``.md``, lower-cased."""
-        t = name.strip().replace("\\", "/").lstrip("/").lower()
+        """Lookup key of a link target or alias: NFC, ``/`` separators, no leading ``/``, no ``.md``, lower-cased."""
+        t = nfc(name.strip().replace("\\", "/").lstrip("/")).lower()
         return t[:-3] if t.endswith(".md") else t
 
     def is_deprioritised(self, rel: str) -> bool:
-        low = rel.lower()
+        low = nfc(rel).lower()
         return any(low == p or low.startswith(p + "/") for p in self.deprioritised)
 
     def resolve(self, target: str):
@@ -2087,16 +2097,16 @@ function resolveNote(target, pathOnly) {
   if (!noteIdx) {
     noteIdx = { byPath: new Map(), stems: new Map(Object.entries(vault.stems || {})) };
     vault.folders.forEach(s => s.notes.forEach(n => {
-      const p = n.path.toLowerCase();
+      const p = n.path.normalize("NFC").toLowerCase();        // lookup keys are NFC (the server's are too); n.path stays as on disk
       noteIdx.byPath.set(p, n);
       noteIdx.byPath.set(p.replace(/\.md$/, ""), n);
     }));
   }
-  const t = String(target || "").trim().replace(/\\/g, "/").replace(/^\/+/, "")
+  const t = String(target || "").trim().replace(/\\/g, "/").replace(/^\/+/, "").normalize("NFC")
     .replace(/\.md$/i, "").toLowerCase();
   // pathOnly: relative .md links must name a real path; no fall-back to a same-named note elsewhere
   const stem = pathOnly ? null : noteIdx.stems.get(t);
-  return noteIdx.byPath.get(t) || (stem && noteIdx.byPath.get(stem.toLowerCase())) || null;
+  return noteIdx.byPath.get(t) || (stem && noteIdx.byPath.get(stem.normalize("NFC").toLowerCase())) || null;
 }
 
 // ── Frontmatter chips: [[Note]] values become the same clickable links as in the body ──
@@ -2161,17 +2171,17 @@ function attachmentPath(target, wiki) {
   if (!vault) return null;
   if (!fileIdx) {
     fileIdx = { byPath: new Map(), names: new Map(Object.entries(vault.files || {})) };
-    (vault.file_paths || []).forEach(p => fileIdx.byPath.set(p.toLowerCase(), p));
+    (vault.file_paths || []).forEach(p => fileIdx.byPath.set(p.normalize("NFC").toLowerCase(), p));
   }
   if (wiki) {           // ![[pic.png]] / ![[img/pic.png]]: vault path, else Obsidian's vault-wide name lookup
-    const t = String(target || "").trim().replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
+    const t = String(target || "").trim().replace(/\\/g, "/").replace(/^\/+/, "").normalize("NFC").toLowerCase();
     const hit = fileIdx.byPath.get(t);
     if (hit) return hit;
     const named = fileIdx.names.get(t.split("/").pop());
     return named && (t.indexOf("/") < 0 || named.toLowerCase().endsWith("/" + t)) ? named : null;
   }
   const rel = relLinkPath(currentNotePath, target, ATT_EXT);    // relative to the note's folder
-  return rel === null ? null : (fileIdx.byPath.get(rel.toLowerCase()) || null);
+  return rel === null ? null : (fileIdx.byPath.get(rel.normalize("NFC").toLowerCase()) || null);
 }
 function attachmentSrc(path) {
   if (EXPORT) return (EXPORT.attachments || {})[path] || null;

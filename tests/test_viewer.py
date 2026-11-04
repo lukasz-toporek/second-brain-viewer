@@ -22,7 +22,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import unicodedata
 import unittest
+import urllib.parse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -2671,6 +2673,84 @@ class AliasTests(LinkVaultCase):
         self.assertIn("alias 'Bob' ignorowany: nazwa pliku Bob.md", r.stdout)       # alias vs real name
         self.assertIn("alias 'Twin' jest też w Dup1.md", r.stdout)                  # two notes, one alias
         self.assertEqual(r.returncode, 1)
+
+
+class UnicodeNameTests(LinkVaultCase):
+    NFC_NAME = "Zażółć"                                       # as typed in a link
+    NFD_NAME = unicodedata.normalize("NFD", "Zażółć")         # as some sync tools / macOS apps save the file
+    OTHER_NFC = "Gęślą"
+    OTHER_NFD = unicodedata.normalize("NFD", "Gęślą")
+
+    @property
+    def NOTES(self):                                           # noqa: N802 (built from the class constants above)
+        return {
+            f"{self.NFD_NAME}.md": "---\naliases: [" + unicodedata.normalize("NFD", "Żółw") + "]\n---\n# NFD file\n",
+            f"dir/{self.NFD_NAME}.md": "# NFD file in dir\n",
+            f"{self.OTHER_NFC}.md": "# NFC file\n",
+            f"{self.NFD_NAME}.png": "x",
+            "A.md": f"# A\n[[{self.NFC_NAME}]] [[dir/{self.NFC_NAME}]] [[Żółw]] [md](dir/{self.NFC_NAME}.md) ![[{self.NFC_NAME}.png]]\n",
+            "B.md": f"# B\n[[{self.OTHER_NFD}]]\n",
+            "C.md": f"# C\n[[{self.NFC_NAME.upper()}]]\n",
+        }
+
+    def setUp(self):
+        super().setUp()
+        names = {p.name for p in self.root.iterdir()}
+        if f"{self.NFD_NAME}.md" not in names:
+            self.skipTest("this filesystem normalises file names")
+
+    def test_nfd_file_is_reached_by_an_nfc_link_and_the_reverse(self):
+        idx = viewer.get_index()
+        nfd_path = f"{self.NFD_NAME}.md"
+        self.assertEqual(idx.resolve(self.NFC_NAME), nfd_path)                      # NFD file, NFC link
+        self.assertEqual(idx.resolve(self.NFD_NAME), nfd_path)
+        self.assertEqual(idx.resolve(f"dir/{self.NFC_NAME}"), f"dir/{self.NFD_NAME}.md")
+        self.assertEqual(idx.resolve(self.OTHER_NFD), f"{self.OTHER_NFC}.md")       # NFC file, NFD link
+        self.assertEqual(idx.resolve(self.OTHER_NFC), f"{self.OTHER_NFC}.md")
+        self.assertEqual(idx.resolve("Żółw"), nfd_path)                              # an NFD alias, linked in NFC
+        self.assertEqual(idx.resolve(self.NFC_NAME.upper()), nfd_path)               # still case-insensitive
+
+    def test_edges_backlinks_and_paths_as_on_disk(self):
+        e = self.edges()
+        nfd_path = f"{self.NFD_NAME}.md"
+        self.assertIn(("A.md", nfd_path) if "A.md" < nfd_path else (nfd_path, "A.md"), e)
+        self.assertIn(tuple(sorted(("A.md", f"dir/{self.NFD_NAME}.md"))), e)         # path link and Markdown link
+        self.assertIn(tuple(sorted(("B.md", f"{self.OTHER_NFC}.md"))), e)
+        self.assertIn(tuple(sorted(("C.md", nfd_path))), e)
+        self.assertEqual(self.backlinks(nfd_path), ["A.md", "C.md"])
+        nodes = {n["id"] for n in viewer.build_graph()["nodes"]}
+        self.assertIn(nfd_path, nodes)                                              # paths are not normalised in the output
+        self.assertNotIn(f"{self.NFC_NAME}.md", nodes)
+        self.assert_export_matches_api()
+
+    def test_note_api_opens_the_real_file_and_attachments_resolve(self):
+        note = self.api("/api/note?path=" + urllib.parse.quote(f"{self.NFD_NAME}.md"))
+        self.assertEqual(note["path"], f"{self.NFD_NAME}.md")
+        payload = self.api("/api/vault")
+        key = unicodedata.normalize("NFC", f"{self.NFC_NAME}.png").lower()                  # keys are NFC, values as on disk
+        self.assertEqual(payload["files"][key], f"{self.NFD_NAME}.png")
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_the_page_normalises_the_target_before_lookup(self):
+        payload = self.api("/api/vault")
+        r = run_page_js(f"""vault = {json.dumps(payload)};
+          const p = t => {{ const n = resolveNote(t); return n && n.path; }};
+          console.log(JSON.stringify({{
+            nfcToNfd: p({json.dumps(self.NFC_NAME)}), nfdToNfd: p({json.dumps(self.NFD_NAME)}),
+            nfdToNfc: p({json.dumps(self.OTHER_NFD)}), alias: p("Żółw"), pathOnly: resolveNote({json.dumps("dir/" + self.NFC_NAME)}, true).path,
+            att: attachmentPath({json.dumps(self.NFC_NAME + ".png")}, true), attNfd: attachmentPath({json.dumps(self.NFD_NAME + ".png")}, true),
+            attRel: (currentNotePath = "A.md", attachmentPath({json.dumps(urllib.parse.quote(self.NFC_NAME) + ".png")}, false)),
+          }}));""")
+        self.assertEqual(r["nfcToNfd"], f"{self.NFD_NAME}.md")
+        self.assertEqual(r["nfdToNfd"], f"{self.NFD_NAME}.md")
+        self.assertEqual(r["nfdToNfc"], f"{self.OTHER_NFC}.md")
+        self.assertEqual(r["alias"], f"{self.NFD_NAME}.md")
+        self.assertEqual(r["pathOnly"], f"dir/{self.NFD_NAME}.md")
+        self.assertEqual((r["att"], r["attNfd"], r["attRel"]), (f"{self.NFD_NAME}.png",) * 3)
+
+    def test_lint_does_not_report_normalisation_differences_as_broken(self):
+        r = subprocess.run([sys.executable, str(ROOT / "tools" / "vault-lint.py"), "--vault", str(self.root)], capture_output=True, text=True)
+        self.assertNotIn("zepsuty", r.stdout)
 
 
 class IndexTests(unittest.TestCase):
