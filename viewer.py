@@ -41,6 +41,8 @@ FOLDER_ORDER: list = []
 CONFIG: dict = {}
 OFFLINE: bool = False
 REMOTE_IMAGE_MODES = ("allow", "click", "block")
+THEME_MODES = ("system", "dark", "light")
+THEME: str = "system"                    # the validated "theme" setting
 REMOTE_IMAGES: str = "allow"             # the validated "remote_images" setting (online mode only)
 PLUGINS: dict = {}                       # enabled, validated plug-ins: id -> resolved Path of its .js file
 PLUGINS_OFF: str = ""                    # why plug-ins are disabled ("--no-plugins" / "plugins_enabled: false"), else ""
@@ -58,6 +60,7 @@ def load_config(vault_path: Path) -> dict:
         "folders": {},
         "link_deprioritise": [],
         "remote_images": "allow",
+        "theme": "system",
         "types": {"daily": "#5b9bd5", "meta": "#888", "index": "#888"},
         "system_prompt": "You are a knowledge base assistant. Answer concisely.",
     }
@@ -73,7 +76,7 @@ def load_config(vault_path: Path) -> dict:
 
 
 def init_config(vault_path: Path, no_plugins: bool = False) -> None:
-    global VAULT, OUTPUT, SKIP_NAMES, SKIP_DIRS, FOLDER_ORDER, CONFIG, REMOTE_IMAGES, PLUGINS, PLUGINS_OFF, _INDEX_CACHE
+    global VAULT, OUTPUT, SKIP_NAMES, SKIP_DIRS, FOLDER_ORDER, CONFIG, REMOTE_IMAGES, THEME, PLUGINS, PLUGINS_OFF, _INDEX_CACHE
     _INDEX_CACHE = (None, None)          # the cache is keyed by vault-relative paths: drop it per vault
     VAULT = vault_path.resolve()
     CONFIG = load_config(VAULT)
@@ -86,6 +89,11 @@ def init_config(vault_path: Path, no_plugins: bool = False) -> None:
         print(f"warning: viewer config: \"remote_images\" must be one of {', '.join(REMOTE_IMAGE_MODES)} "
               f"(got {REMOTE_IMAGES!r}); using \"block\"", file=sys.stderr)
         REMOTE_IMAGES = "block"
+    THEME = CONFIG.get("theme", "system")
+    if THEME not in THEME_MODES:
+        print(f"warning: viewer config: \"theme\" must be one of {', '.join(THEME_MODES)} "
+              f"(got {THEME!r}); using \"system\"", file=sys.stderr)
+        THEME = "system"
     PLUGINS_OFF = ""
     if no_plugins:
         PLUGINS_OFF = "--no-plugins"
@@ -737,14 +745,16 @@ def build_index() -> str:
 # ── Viewer HTML ──────────────────────────────────────────────────────────────
 
 VIEWER_HTML = r"""<!doctype html>
-<html lang="pl">
+<html lang="pl"__THEMEATTR__>
 <head>
 <meta charset="utf-8">
+<meta name="color-scheme" content="__SCHEME__">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Vault</title>
 __HEAD__
 <style>
 :root {
+  color-scheme: light dark;
   --bg:      #131313;
   --sb:      #191919;
   --sh:      #1e1e1e;
@@ -754,9 +764,89 @@ __HEAD__
   --tx2:     #6a6a6a;
   --ac:      #e07050;
   --ac2:     #2a1508;
+  --on-ac:   #fff;
 
   --cp: #e07050; --cw: #4ecdc4; --cd: #5b9bd5;
   --cm: #888;    --ci: #888;    --ch: #e07050;
+
+  /* hues shared by callouts and Dataview states */
+  --k-blue: #5b9bd5; --k-teal: #4ecdc4; --k-green: #68b068; --k-amber: #c8980a;
+  --k-red: #d05050;  --k-violet: #9b8bdb; --k-purple: #b07ad0; --k-grey: #888; --k-idle: #9a9a9a;
+
+  --graph-bg:    #0d0d0d;
+  --graph-link:  rgba(255,255,255,.12);
+  --graph-label: rgba(255,255,255,.45);
+  --hint:        rgba(255,255,255,.25);
+  --tip-bg: #1e1e1e; --tip-bd: #333;
+  --code-fg: #b8a8d8; --pre-bg: #111; --pre-fg: #c0cce0;
+  --wl-bd: rgba(224,112,80,.5);
+  --err: #c05050;
+  --shadow: rgba(0,0,0,.5);
+  --backdrop: rgba(0,0,0,.55);
+}
+/* The light theme follows the OS setting unless viewer.json "theme" forces one (data-theme on <html>).
+   The two light blocks below must stay identical (a test checks it). */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg:      #fbfbfa;
+    --sb:      #f1f1ee;
+    --sh:      #e9e9e5;
+    --sa:      #dededa;
+    --bd:      #d3d3cd;
+    --tx:      #1f1f1f;
+    --tx2:     #595959;
+    --ac:      #b43f1c;
+    --ac2:     #f6ddd2;
+    --on-ac:   #fff;
+
+    --cp: #b43f1c; --cw: #086860; --cd: #1f63a6;
+    --cm: #595959; --ci: #595959; --ch: #b43f1c;
+
+    --k-blue: #1f63a6; --k-teal: #086860; --k-green: #256425; --k-amber: #865f00;
+    --k-red: #b02a2a;  --k-violet: #6a52b8; --k-purple: #8444a8; --k-grey: #595959; --k-idle: #666;
+
+    --graph-bg:    #f4f4f1;
+    --graph-link:  rgba(0,0,0,.18);
+    --graph-label: rgba(0,0,0,.65);
+    --hint:        rgba(0,0,0,.5);
+    --tip-bg: #fff; --tip-bd: #c8c8c2;
+    --code-fg: #6b3fa0; --pre-bg: #f1f1ee; --pre-fg: #2a3a5a;
+    --wl-bd: rgba(180,63,28,.5);
+    --err: #b02a2a;
+    --shadow: rgba(0,0,0,.2);
+    --backdrop: rgba(0,0,0,.35);
+  }
+}
+:root[data-theme="dark"] { color-scheme: dark; }
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg:      #fbfbfa;
+  --sb:      #f1f1ee;
+  --sh:      #e9e9e5;
+  --sa:      #dededa;
+  --bd:      #d3d3cd;
+  --tx:      #1f1f1f;
+  --tx2:     #595959;
+  --ac:      #b43f1c;
+  --ac2:     #f6ddd2;
+  --on-ac:   #fff;
+
+  --cp: #b43f1c; --cw: #086860; --cd: #1f63a6;
+  --cm: #595959; --ci: #595959; --ch: #b43f1c;
+
+  --k-blue: #1f63a6; --k-teal: #086860; --k-green: #256425; --k-amber: #865f00;
+  --k-red: #b02a2a;  --k-violet: #6a52b8; --k-purple: #8444a8; --k-grey: #595959; --k-idle: #666;
+
+  --graph-bg:    #f4f4f1;
+  --graph-link:  rgba(0,0,0,.18);
+  --graph-label: rgba(0,0,0,.65);
+  --hint:        rgba(0,0,0,.5);
+  --tip-bg: #fff; --tip-bd: #c8c8c2;
+  --code-fg: #6b3fa0; --pre-bg: #f1f1ee; --pre-fg: #2a3a5a;
+  --wl-bd: rgba(180,63,28,.5);
+  --err: #b02a2a;
+  --shadow: rgba(0,0,0,.2);
+  --backdrop: rgba(0,0,0,.35);
 }
 
 *,*::before,*::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -840,7 +930,7 @@ body {
   position: absolute;
   top: 36px;
   left: 0; right: 0; bottom: 0;
-  background: #0d0d0d;
+  background: var(--graph-bg);
   overflow: hidden;
   z-index: 5;
 }
@@ -861,15 +951,15 @@ body {
   left: 50%;
   transform: translateX(-50%);
   font-size: 11px;
-  color: rgba(255,255,255,.25);
+  color: var(--hint);
   pointer-events: none;
   white-space: nowrap;
 }
 
 .graph-tooltip {
   position: absolute;
-  background: #1e1e1e;
-  border: 1px solid #333;
+  background: var(--tip-bg);
+  border: 1px solid var(--tip-bd);
   border-radius: 6px;
   padding: 6px 10px;
   font-size: 11px;
@@ -1145,17 +1235,17 @@ body {
   background: var(--sh);
   padding: 2px 5px;
   border-radius: 3px;
-  color: #b8a8d8;
+  color: var(--code-fg);
 }
 .md pre {
-  background: #111;
+  background: var(--pre-bg);
   border: 1px solid var(--bd);
   border-radius: 6px;
   padding: 16px;
   overflow-x: auto;
   margin-bottom: 16px;
 }
-.md pre code { background: none; padding: 0; color: #c0cce0; }
+.md pre code { background: none; padding: 0; color: var(--pre-fg); }
 .md hr { border: none; border-top: 1px solid var(--bd); margin: 24px 0; }
 .md table { width: 100%; border-collapse: collapse; margin-bottom: 16px; font-size: 12.5px; overflow-x: auto; display: block; }
 .md th { text-align: left; padding: 7px 12px; border-bottom: 1px solid var(--bd); color: var(--tx2); font-weight: 500; white-space: nowrap; }
@@ -1163,7 +1253,7 @@ body {
 .md strong { font-weight: 600; color: var(--tx); }
 
 /* wikilinks */
-.md a.wl { color: var(--ac); border-bottom: 1px dotted rgba(224,112,80,.5); }
+.md a.wl { color: var(--ac); border-bottom: 1px dotted var(--wl-bd); }
 .md a.wl:hover { text-decoration: none; border-bottom-style: solid; }
 .md .wl.missing { color: var(--tx2); border-bottom: 1px dashed var(--tx2); cursor: help; }
 .md img { max-width: 100%; height: auto; }
@@ -1174,7 +1264,7 @@ body {
 
 /* callouts */
 .callout {
-  --co: #5b9bd5;
+  --co: var(--k-blue);
   border-left: 3px solid var(--co);
   background: var(--sh);
   background: color-mix(in srgb, var(--co) 10%, transparent);
@@ -1187,14 +1277,14 @@ details.callout > summary.callout-title { cursor: pointer; }
 details.callout:not([open]) > summary.callout-title { margin-bottom: 0; }
 .callout-body { color: var(--tx); }
 .callout-body > :last-child { margin-bottom: 0; }
-.c-info, .c-note, .c-todo { --co: #5b9bd5; }
-.c-tip, .c-hint, .c-success, .c-check, .c-done { --co: #4ecdc4; }
-.c-abstract, .c-summary, .c-tldr { --co: #68b068; }
-.c-warning, .c-caution, .c-attention { --co: #c8980a; }
-.c-danger, .c-error, .c-bug, .c-failure, .c-fail, .c-missing { --co: #d05050; }
-.c-question, .c-help, .c-faq { --co: #9b8bdb; }
-.c-example { --co: #b07ad0; }
-.c-quote, .c-cite { --co: #888; }
+.c-info, .c-note, .c-todo { --co: var(--k-blue); }
+.c-tip, .c-hint, .c-success, .c-check, .c-done { --co: var(--k-teal); }
+.c-abstract, .c-summary, .c-tldr { --co: var(--k-green); }
+.c-warning, .c-caution, .c-attention { --co: var(--k-amber); }
+.c-danger, .c-error, .c-bug, .c-failure, .c-fail, .c-missing { --co: var(--k-red); }
+.c-question, .c-help, .c-faq { --co: var(--k-violet); }
+.c-example { --co: var(--k-purple); }
+.c-quote, .c-cite { --co: var(--k-grey); }
 
 /* note embeds */
 .md .embed { display: block; border-left: 3px solid var(--ac); background: var(--sh); border-radius: 0 6px 6px 0;
@@ -1214,14 +1304,14 @@ details.callout:not([open]) > summary.callout-title { margin-bottom: 0; }
 a.dv-link { color: var(--ac); }
 a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
 .dv-state { font-weight: 500; }
-.s-not-started { color: #9a9a9a; }
-.s-in-progress { color: #5b9bd5; background: rgba(91,155,213,.14); border-color: rgba(91,155,213,.35); }
-.s-to-verify   { color: #c8980a; background: rgba(200,152,10,.14); border-color: rgba(200,152,10,.35); }
-.s-done        { color: #68b068; background: rgba(104,176,104,.14); border-color: rgba(104,176,104,.35); }
-.s-waived      { color: #9b8bdb; background: rgba(155,139,219,.14); border-color: rgba(155,139,219,.35); }
-.s-missed      { color: #d05050; background: rgba(208,80,80,.14); border-color: rgba(208,80,80,.35); }
-.md li.overdue { border-left: 2px solid #d05050; padding-left: 8px; margin-left: -10px; }
-.md li.overdue .dv-due { color: #d05050; background: rgba(208,80,80,.14); border-color: rgba(208,80,80,.35); }
+.s-not-started { color: var(--k-idle); }
+.s-in-progress { color: var(--k-blue); background: color-mix(in srgb, var(--k-blue) 14%, transparent); border-color: color-mix(in srgb, var(--k-blue) 35%, transparent); }
+.s-to-verify { color: var(--k-amber); background: color-mix(in srgb, var(--k-amber) 14%, transparent); border-color: color-mix(in srgb, var(--k-amber) 35%, transparent); }
+.s-done { color: var(--k-green); background: color-mix(in srgb, var(--k-green) 14%, transparent); border-color: color-mix(in srgb, var(--k-green) 35%, transparent); }
+.s-waived { color: var(--k-violet); background: color-mix(in srgb, var(--k-violet) 14%, transparent); border-color: color-mix(in srgb, var(--k-violet) 35%, transparent); }
+.s-missed { color: var(--k-red); background: color-mix(in srgb, var(--k-red) 14%, transparent); border-color: color-mix(in srgb, var(--k-red) 35%, transparent); }
+.md li.overdue { border-left: 2px solid var(--k-red); padding-left: 8px; margin-left: -10px; }
+.md li.overdue .dv-due { color: var(--k-red); background: color-mix(in srgb, var(--k-red) 14%, transparent); border-color: color-mix(in srgb, var(--k-red) 35%, transparent); }
 
 /* backlinks */
 .backlinks { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--bd); }
@@ -1231,7 +1321,7 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
 .backlinks a.wl { color: var(--ac); text-decoration: none; }
 
 .loading { padding: 40px 56px; color: var(--tx2); font-size: 13px; }
-.err     { padding: 40px 56px; color: #c05050; font-size: 13px; }
+.err     { padding: 40px 56px; color: var(--err); font-size: 13px; }
 
 /* scrollbar */
 ::-webkit-scrollbar { width: 4px; height: 4px; }
@@ -1354,7 +1444,7 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
   align-items: center;
   gap: 4px;
 }
-.chat-model-dot { width: 5px; height: 5px; border-radius: 50%; background: #4ecdc4; display: inline-block; }
+.chat-model-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--k-teal); display: inline-block; }
 .chat-input-row {
   display: flex;
   gap: 6px;
@@ -1389,7 +1479,7 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
   justify-content: center;
   cursor: pointer;
   flex-shrink: 0;
-  color: #fff;
+  color: var(--on-ac);
   transition: opacity .1s;
 }
 .chat-send:hover { opacity: .85; }
@@ -1437,10 +1527,10 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
   /* the sidebar becomes an overlay over the content, with a backdrop */
   body.sb-open .sb {
     display: flex; position: fixed; top: 0; left: 0; bottom: 0;
-    width: min(300px, 85vw); z-index: 30; box-shadow: 4px 0 24px rgba(0,0,0,.5);
+    width: min(300px, 85vw); z-index: 30; box-shadow: 4px 0 24px var(--shadow);
   }
   body.sb-open .sb-backdrop {
-    display: block; position: fixed; inset: 0; z-index: 29; background: rgba(0,0,0,.55);
+    display: block; position: fixed; inset: 0; z-index: 29; background: var(--backdrop);
   }
   .chat-panel { width: 100%; position: absolute; right: 0; top: 0; bottom: 0; z-index: 10; }
 }
@@ -1540,6 +1630,7 @@ const FLAGS = __FLAGS__;   // {chat, watch, export}
 const FM = __FM__;
 const TC = __TC__;
 const tcol = t => TC[t] || "#888";
+const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const DONE_STATES = new Set(["done", "waived", "missed"]);
 const todayStr = () => { const d = new Date(), p = n => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; };
@@ -2143,8 +2234,8 @@ function showNote(data) {
       .map(([k, v]) => [k, Array.isArray(v) ? v.join(", ") : String(v ?? "")])
       .filter(([k, v]) => v && k !== "title");
     chips = kv.map(([key, v]) => {
-      const c = key === "type" ? tcol(v) : key === "status" ? "#68b068" : "#888";
-      return `<span class="chip" style="background:${esc(c)}20;color:${esc(c)}">${esc(key)}: ${esc(v)}</span>`;
+      const c = key === "type" ? tcol(v) : key === "status" ? "var(--k-green)" : "var(--k-grey)";
+      return `<span class="chip" style="background:color-mix(in srgb, ${esc(c)} 12%, transparent);color:${esc(c)}">${esc(key)}: ${esc(v)}</span>`;
     }).join("");
     if (chips) chips = `<div class="chips">${chips}</div>`;
   }
@@ -2267,7 +2358,7 @@ async function openGraph() {
     try {
       graphData = await api("graph");
     } catch(e) {
-      wrap.querySelector("#fg-mount").innerHTML = `<div style="padding:40px;color:#c05858">Graph: ${esc(e.message)}</div>`;
+      wrap.querySelector("#fg-mount").innerHTML = `<div style="padding:40px;color:var(--err)">Graph: ${esc(e.message)}</div>`;
       return;
     }
   }
@@ -2281,7 +2372,23 @@ function closeGraph() {
   fgInstance = null;
 }
 
+// Graph colours come from the theme variables; refreshed when the OS theme changes (see applyTheme below).
+let graphColors = { bg: "", link: "", label: "" };
+function readGraphColors() {
+  graphColors = { bg: cssVar("--graph-bg"), link: cssVar("--graph-link"), label: cssVar("--graph-label") };
+}
+function refreshGraphTheme() {
+  readGraphColors();
+  if (fgInstance) fgInstance.backgroundColor(graphColors.bg).linkColor(() => graphColors.link);
+}
+{
+  const mq = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)");
+  const onTheme = () => refreshGraphTheme();      // CSS variables switch by themselves; only the canvas needs a nudge
+  if (mq) { if (mq.addEventListener) mq.addEventListener("change", onTheme); else if (mq.addListener) mq.addListener(onTheme); }
+}
+
 function renderGraph() {
+  readGraphColors();
   const wrap = document.getElementById("graph-wrap");
   const mount = document.getElementById("fg-mount");
   mount.innerHTML = "";
@@ -2307,8 +2414,8 @@ function renderGraph() {
     .nodeId("id")
     .linkSource("source")
     .linkTarget("target")
-    .backgroundColor("#0d0d0d")
-    .linkColor(() => "rgba(255,255,255,0.12)")
+    .backgroundColor(graphColors.bg)
+    .linkColor(() => graphColors.link)
     .linkWidth(1)
     .nodeLabel(d => esc(d.name) + (degree[d.id] ? ` · ${degree[d.id]} links` : ""))   // force-graph inserts this as HTML
     .nodeCanvasObject((node, ctx, gs) => {
@@ -2324,7 +2431,7 @@ function renderGraph() {
       if (gs > 0.55) {
         const lbl = node.name.length > 22 ? node.name.slice(0, 20) + "…" : node.name;
         ctx.font = `${10 / gs}px Inter, system-ui, sans-serif`;
-        ctx.fillStyle = "rgba(255,255,255,0.45)";
+        ctx.fillStyle = graphColors.label;
         ctx.textAlign = "center";
         ctx.textBaseline = "top";
         ctx.fillText(lbl, node.x, node.y + r + 3);
@@ -2419,7 +2526,7 @@ async function openChat() {
       const dot = document.querySelector(".chat-model-dot");
       document.getElementById("chat-model-name").textContent =
         `${cfg.provider} / ${cfg.model}`;
-      dot.style.background = cfg.provider === "anthropic" ? "#e07050" : "#4ecdc4";
+      dot.style.background = cfg.provider === "anthropic" ? "var(--ac)" : "var(--k-teal)";
     } catch(_) {}
   }
 }
@@ -2665,7 +2772,7 @@ def render_page(mode: str = "online", data: dict = None) -> str:
     flags = {"chat": mode == "online", "watch": mode != "export", "export": mode == "export",
              # offline and export never load remote images; online follows the "remote_images" setting
              "remote_images": REMOTE_IMAGES if mode == "online" else "block",
-             "plugins": list(PLUGINS)}
+             "plugins": list(PLUGINS), "theme": THEME}
     head, libs, data_tag = "", "", ""
     if mode == "online":
         head, libs = CDN_FONTS, cdn_libs()
@@ -2688,10 +2795,12 @@ def render_page(mode: str = "online", data: dict = None) -> str:
         "TC": js_json(CONFIG.get("types", {})),
         "TITLE": html_escape(CONFIG.get("title", VAULT.name)),
         "FLAGS": js_json(flags),
+        "THEMEATTR": "" if THEME == "system" else f' data-theme="{THEME}"',
+        "SCHEME": "light dark" if THEME == "system" else THEME,
         "HEAD": head, "LIBS": libs, "DATA": data_tag, "PLUGINS": plug,
     }
     # single pass, so substituted content is never re-scanned for placeholders
-    return re.sub(r"__(FM|TC|TITLE|FLAGS|HEAD|LIBS|DATA|PLUGINS)__", lambda m: repl[m.group(1)], VIEWER_HTML)
+    return re.sub(r"__(FM|TC|TITLE|FLAGS|THEMEATTR|SCHEME|HEAD|LIBS|DATA|PLUGINS)__", lambda m: repl[m.group(1)], VIEWER_HTML)
 
 
 BIND_HOST = "127.0.0.1"

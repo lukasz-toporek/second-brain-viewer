@@ -142,6 +142,14 @@ Offline and export always behave as `"block"` (their CSPs never allowed remote i
 rendered by the app's Markdown setup, i.e. note bodies, embedded notes and plug-in `renderMarkdown()` output. Any other
 value is reported on stderr and treated as `"block"`.
 
+### Theme: light / dark
+
+The viewer follows the operating system's appearance setting (`prefers-color-scheme`), and switches live when the OS
+setting changes, including an open graph. The optional `"theme"` key in `viewer.json` is `"system"` (default),
+`"dark"` or `"light"`; the last two force a theme. Any other value prints a warning and falls back to `"system"`.
+It works the same in online, `--offline` and `--export` and needs no network access. Colours from `"types"` and
+`"folders"` stay as configured. Plug-ins should use the theme CSS variables (list in `docs/plugins.md`).
+
 ### Plug-ins (frontend, v1)
 
 A vault can add its own toolbar views without forking `viewer.py`. List the scripts in the vault's `viewer.json`:
@@ -236,6 +244,7 @@ Place a `viewer.json` in the vault root (or any parent directory — the viewer 
   },
   "link_deprioritise": ["90-meta/Szablony", "_Archive"],
   "remote_images": "allow",
+  "theme": "system",
   "plugins": [],
   "plugins_enabled": true,
   "system_prompt": "You are a knowledge base assistant. Answer concisely."

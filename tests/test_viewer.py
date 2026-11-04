@@ -1807,6 +1807,142 @@ class SymlinkLeakTests(unittest.TestCase):
         self.assertNotIn("Deep.md", buf.getvalue())
 
 
+def _lum(h):
+    h = h.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    ch = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+    ch = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in ch]
+    return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2]
+
+
+def contrast(a, b):
+    la, lb = sorted((_lum(a), _lum(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def css_blocks():
+    """(dark vars, light vars in the media query, light vars in [data-theme=light]) from the page CSS."""
+    css = re.search(r"<style>(.*?)</style>", viewer.VIEWER_HTML, re.S).group(1)
+    dark = re.search(r"^:root \{(.*?)^\}", css, re.S | re.M).group(1)
+    media = re.search(r"@media \(prefers-color-scheme: light\) \{\s*:root:not\(\[data-theme=\"dark\"\]\) \{(.*?)\n  \}\n\}", css, re.S).group(1)
+    forced = re.search(r':root\[data-theme="light"\] \{(.*?)^\}', css, re.S | re.M).group(1)
+    var = lambda block: dict(re.findall(r"(--[\w-]+):\s*([^;]+);", block))
+    return var(dark), var(media), var(forced), css
+
+
+class ThemeTests(unittest.TestCase):
+    def tearDown(self):
+        viewer.init_config(VAULT)
+
+    def test_css_has_both_themes_and_color_scheme(self):
+        dark, light, forced, css = css_blocks()
+        self.assertIn("color-scheme: light dark;", css)
+        self.assertIn('@media (prefers-color-scheme: light)', css)
+        self.assertEqual(dark["--bg"], "#131313")                      # today's dark palette is unchanged
+        self.assertEqual(dark["--ac"], "#e07050")
+        self.assertEqual(light, forced)                                 # media query and forced light agree
+        self.assertEqual(set(light), set(dark) - set())                 # same variable names in both themes
+        for mode in ("online", "offline", "export"):
+            html = viewer.render_page(mode, {"notes": {}})
+            self.assertIn('<meta name="color-scheme" content="light dark">', html)
+
+    def test_every_var_used_is_defined_in_both_themes(self):
+        dark, light, _, css = css_blocks()
+        js = viewer.VIEWER_HTML
+        used = set(re.findall(r"var\((--[\w-]+)", js)) | set(re.findall(r'cssVar\("(--[\w-]+)"\)', js))
+        used.discard("--co")                 # per-callout variable, set on the element itself
+        self.assertTrue(used)
+        self.assertEqual(sorted(used - set(dark)), [])
+        self.assertEqual(sorted(used - set(light)), [])
+        # --co / --st style per-element variables are set where they are used, not in :root
+        self.assertEqual(sorted(set(dark) - set(light)), [])
+
+    def test_light_theme_contrast(self):
+        _, light, _, _ = css_blocks()
+        bg = light["--bg"]
+        pairs = [("--tx", "--bg"), ("--tx2", "--bg"), ("--tx2", "--sb"), ("--tx", "--sh"), ("--ac", "--bg"),
+                 ("--code-fg", "--sh"), ("--pre-fg", "--pre-bg"), ("--err", "--bg"), ("--tx", "--sa"),
+                 ("--tx2", "--sh"), ("--ac", "--sh")]
+        pairs += [(k, "--bg") for k in light if k.startswith("--k-")]
+        for fg, back in pairs:
+            with self.subTest(fg=fg, bg=back):
+                self.assertGreaterEqual(contrast(light[fg], light[back]), 4.5, f"{fg} on {back}")
+        # callout / state text on its own 14% tint of the same hue over the page background
+        for k in [k for k in light if k.startswith("--k-")]:
+            fg = light[k].lstrip("#")
+            f = [int(fg[i:i + 2], 16) for i in (0, 2, 4)] if len(fg) == 6 else [int(c * 2, 16) for c in fg]
+            b = [int(bg[i:i + 2], 16) for i in (1, 3, 5)]
+            tint = "#" + "".join(f"{round(c * .14 + d * .86):02x}" for c, d in zip(f, b))
+            with self.subTest(tint=k):
+                self.assertGreaterEqual(contrast(light[k], tint), 4.5)
+
+    def test_dark_palette_text_contrast_unchanged_or_better(self):
+        dark, _, _, _ = css_blocks()
+        self.assertGreaterEqual(contrast(dark["--tx"], dark["--bg"]), 9)
+
+    def test_theme_setting_reaches_the_page_in_all_modes(self):
+        for theme, attr, scheme in (("light", ' data-theme="light"', "light"), ("dark", ' data-theme="dark"', "dark"),
+                                    ("system", "", "light dark")):
+            with tempfile.TemporaryDirectory() as d:
+                root = Path(d) / "v"
+                shutil.copytree(VAULT, root)
+                (root / ".viewer.json").write_text(json.dumps({"theme": theme}), encoding="utf-8")
+                viewer.init_config(root)
+                for mode in ("online", "offline", "export"):
+                    with self.subTest(theme=theme, mode=mode):
+                        html = viewer.render_page(mode, {"notes": {}})
+                        self.assertIn(f'<html lang="pl"{attr}>', html)
+                        self.assertIn(f'<meta name="color-scheme" content="{scheme}">', html)
+                        self.assertIn(f'"theme": "{theme}"', html)
+                        self.assertNotIn("__THEMEATTR__", html)
+
+    def test_default_is_system_and_invalid_falls_back_with_warning(self):
+        viewer.init_config(VAULT)
+        self.assertEqual(viewer.THEME, "system")
+        self.assertIn('<html lang="pl">', viewer.render_page("offline"))
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "v"
+            shutil.copytree(VAULT, root)
+            (root / ".viewer.json").write_text(json.dumps({"theme": "sepia"}), encoding="utf-8")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                viewer.init_config(root)
+            self.assertEqual(viewer.THEME, "system")
+            self.assertIn('"theme" must be one of system, dark, light', err.getvalue())
+            self.assertIn('<html lang="pl">', viewer.render_page("online"))
+
+    def test_graph_uses_theme_variables(self):
+        js = viewer.VIEWER_HTML
+        self.assertNotIn("#0d0d0d", js.split("</style>", 1)[1])
+        self.assertIn("--graph-bg", js)
+        self.assertIn("getComputedStyle", js)
+        self.assertIn("(prefers-color-scheme: light)", js.split("</style>", 1)[1])
+        self.assertIn('addEventListener("change"', js)
+        self.assertNotIn("rgba(255,255,255", js.split("</style>", 1)[1])
+
+    def test_no_hardcoded_neutrals_left_in_rules(self):
+        """Colours that depend on the theme are variables; literals remain only in the palette blocks."""
+        _, _, _, css = css_blocks()
+        body = re.sub(r"^:root.*?^\}", "", css, flags=re.S | re.M)
+        body = re.sub(r"@media \(prefers-color-scheme: light\) \{.*?\n  \}\n\}", "", body, flags=re.S)
+        body = re.sub(r':root\[data-theme="light"\] \{.*?^\}', "", body, flags=re.S | re.M)
+        for bad in ("#0d0d0d", "#111", "#1e1e1e", "#333", "#b8a8d8", "#c0cce0", "rgba(255,255,255", "#c05050"):
+            self.assertNotIn(bad, body)
+
+    def test_cli_warns_on_invalid_theme(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "v"
+            shutil.copytree(VAULT, root)
+            (root / ".viewer.json").write_text(json.dumps({"theme": "neon"}), encoding="utf-8")
+            out = Path(d) / "o.html"
+            r = subprocess.run([sys.executable, str(ROOT / "viewer.py"), "--vault", str(root), "--export", str(out)],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('"theme" must be one of', r.stderr)
+            self.assertIn('<html lang="pl">', out.read_text(encoding="utf-8"))
+
+
 class IndexTests(unittest.TestCase):
     def test_resolution_forms(self):
         viewer.init_config(VAULT)

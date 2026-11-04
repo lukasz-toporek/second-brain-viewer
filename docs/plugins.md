@@ -79,6 +79,20 @@ A plugin is a folder with a `plugin.json` manifest and static files:
 - extra frontmatter chip renderers keyed by field name,
 - extra sidebar sections.
 
+## Theming
+The viewer follows the OS light/dark setting (`"theme": "system"`, or `"dark"` / `"light"` in `viewer.json`),
+and can switch while the page is open. A plug-in must not hard-code colours; use these CSS variables
+(`var(--tx2)` etc.), which exist in both themes:
+
+- surfaces and text: `--bg` (page), `--sb` (panels), `--sh` (hover / code background), `--sa` (active),
+  `--bd` (borders), `--tx` (text), `--tx2` (muted text), `--ac` (accent), `--ac2` (accent background),
+  `--on-ac` (text on an accent fill), `--err` (error text);
+- hues for status colours, readable on `--bg` in both themes: `--k-blue`, `--k-teal`, `--k-green`, `--k-amber`,
+  `--k-red`, `--k-violet`, `--k-purple`, `--k-grey`, `--k-idle`;
+- code: `--code-fg`, `--pre-bg`, `--pre-fg`.
+
+For a tinted background use `color-mix(in srgb, var(--k-red) 14%, transparent)`.
+
 ## Security model
 - Plugins are trusted code, equivalent to running a script: they are **off unless listed
   and `enabled` in the vault's own config**, and the viewer prints the enabled plugin ids
