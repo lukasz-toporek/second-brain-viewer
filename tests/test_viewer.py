@@ -2363,6 +2363,47 @@ class RevealAndBreadcrumbTests(unittest.TestCase):
         self.assertNotIn(".focus(", reveal)                                                 # never steals focus from the search box
 
 
+class FrontmatterLinkChipTests(unittest.TestCase):
+    """[[...]] inside frontmatter chips render as the same a.wl links as in the body; everything else is escaped."""
+
+    def run_chips(self, fm):
+        return run_page_js(f"""
+          vault = {{folders: [{{folder: "k", notes: [{{path: "k/Beta.md", name: "Beta", type: ""}}, {{path: "k/Zażółć.md", name: "Zażółć", type: ""}}]}}],
+                    stems: {{beta: "k/Beta.md", "zażółć": "k/Zażółć.md"}}}};
+          console.log(JSON.stringify(chipsHtml({json.dumps(fm)})));""") if NODE else None
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_wikilinks_in_chips_are_links_and_missing_ones_are_styled(self):
+        html = self.run_chips({"related": "[[Beta]]", "up": "[[Nope]]", "alias": "[[Beta|the beta]]", "h": "[[Beta#Intro]]"})
+        self.assertIn('<a class="wl" href="#" data-path="k/Beta.md">Beta</a>', html)
+        self.assertNotIn("[[", re.sub(r' data-v="[^"]*"', "", html))                        # no raw brackets left in the visible text
+        self.assertIn('<span class="wl missing" title="Note not found">Nope</span>', html)
+        self.assertIn('data-path="k/Beta.md">the beta</a>', html)
+        self.assertIn("Beta › Intro</a>", html)
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_list_items_and_mixed_text(self):
+        html = self.run_chips({"related": ["[[Beta]]", "[[Zażółć]]", "plain <b>x</b>"], "note": "see [[Beta]] & more"})
+        self.assertEqual(html.count('<a class="wl"'), 3)
+        self.assertIn('data-path="k/Zażółć.md">Zażółć</a>, plain &lt;b&gt;x&lt;/b&gt;', html)          # items joined, others escaped
+        self.assertIn("see <a class=\"wl\" href=\"#\" data-path=\"k/Beta.md\">Beta</a> &amp; more", html)
+        self.assertNotIn("<b>", html)
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_other_values_stay_escaped_text_and_empty_ones_are_dropped(self):
+        html = self.run_chips({"title": "T", "status": "done", "tags": [], "x": "a [b] <i>"})
+        self.assertNotIn("title:", html)
+        self.assertIn("status: done", html)
+        self.assertNotIn("tags:", html)
+        self.assertIn("x: a [b] &lt;i&gt;", html)
+        self.assertNotIn("<a ", html)
+
+    def test_css_styles_links_inside_chips(self):
+        css = viewer.render_page("offline").split("<style>")[1].split("</style>")[0]
+        self.assertIn(".chip a.wl", css)
+        self.assertIn(".chip .wl.missing", css)
+
+
 class IndexTests(unittest.TestCase):
     def test_resolution_forms(self):
         viewer.init_config(VAULT)

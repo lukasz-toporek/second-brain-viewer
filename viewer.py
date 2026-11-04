@@ -1226,6 +1226,9 @@ body {
   padding-bottom: 20px;
   border-bottom: 1px solid var(--bd);
 }
+.chip a.wl { color: inherit; text-decoration: none; border-bottom: 1px dotted currentColor; }
+.chip a.wl:hover { border-bottom-style: solid; }
+.chip .wl.missing { border-bottom: 1px dashed currentColor; cursor: help; opacity: .8; }
 .chip {
   font-size: 11px;
   padding: 2px 8px;
@@ -1934,6 +1937,36 @@ function resolveNote(target, pathOnly) {
   return noteIdx.byPath.get(t) || (stem && noteIdx.byPath.get(stem.toLowerCase())) || null;
 }
 
+// ── Frontmatter chips: [[Note]] values become the same clickable links as in the body ──
+// Text with [[target]], [[target#Heading]] and [[target|label]] turned into a.wl links (span.wl.missing when the
+// note does not exist); everything else is escaped text. Same pattern as the wikilink tokenizer below.
+function fmValueHtml(text) {
+  text = String(text ?? "");
+  const re = /\[\[([^\]\n|#]+?)(?:#([^\]\n|]*?))?(?:\\?\|([^\]\n]*?))?\]\]/g;
+  let out = "", last = 0, m;
+  while ((m = re.exec(text))) {
+    out += esc(text.slice(last, m.index));
+    last = m.index + m[0].length;
+    const target = m[1].replace(/\\$/, "").trim(), heading = (m[2] || "").replace(/\\$/, "").trim(), alias = (m[3] || "").trim();
+    const label = alias || (heading ? `${target} › ${heading}` : target);
+    const n = resolveNote(target);
+    out += n ? `<a class="wl" href="#" data-path="${esc(n.path)}">${esc(label)}</a>`
+             : `<span class="wl missing" title="Note not found">${esc(label)}</span>`;
+  }
+  return out + esc(text.slice(last));
+}
+// The chip row for a note's parsed frontmatter ({key: string | string[]}); "" when nothing is worth showing.
+function chipsHtml(fm) {
+  const chips = Object.entries(fm || {}).filter(([k]) => k !== "title").map(([k, v]) => {
+    const items = Array.isArray(v) ? v.map(x => String(x ?? "")) : [String(v ?? "")];
+    const text = items.join(", ");
+    if (!text) return "";
+    return `<span class="chip" data-k="${esc(k)}" data-v="${esc(text)}" style="${chipStyle(chipColor(k, text))}">${esc(k)}: ` +
+      items.map(fmValueHtml).join(", ") + `</span>`;
+  }).join("");
+  return chips ? `<div class="chips">${chips}</div>` : "";
+}
+
 // ── Relative Markdown links to notes: [t](../dir/Other%20note.md#Heading) ──
 // Path of the note currently being rendered; showNote() sets it before marked.parse (chat bubbles
 // use the active note).
@@ -2553,13 +2586,7 @@ function showNote(data) {
     raw = raw.slice(fmMatch[0].length);
     // The server parses the frontmatter (one parser for the API, lint and export); parseFmFallback only
     // serves data without a "frontmatter" field (older exports).
-    const kv = Object.entries(data.frontmatter || parseFmFallback(fmMatch[1]))
-      .map(([k, v]) => [k, Array.isArray(v) ? v.join(", ") : String(v ?? "")])
-      .filter(([k, v]) => v && k !== "title");
-    chips = kv.map(([key, v]) => {
-      return `<span class="chip" data-k="${esc(key)}" data-v="${esc(v)}" style="${chipStyle(chipColor(key, v))}">${esc(key)}: ${esc(v)}</span>`;
-    }).join("");
-    if (chips) chips = `<div class="chips">${chips}</div>`;
+    chips = chipsHtml(data.frontmatter || parseFmFallback(fmMatch[1]));
   }
 
   const bc = `<div class="bc">${breadcrumbHtml(data.path, data.name)}</div>`;

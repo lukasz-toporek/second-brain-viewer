@@ -18,6 +18,8 @@ A lightweight local viewer for Markdown knowledge bases. Zero dependencies — P
 - **Obsidian syntax** — `[[wikilinks]]` (`[[A|alias]]`, `[[dir/A]]`, `[[A#Heading|x]]`), `> [!note]` callouts (foldable with `-` / `+`), `![[Note]]` embeds, a "Linked from" backlinks section
 - **Dataview inline fields** — `[state:: …] [due:: …] [link:: …]` render as chips; open tasks past their `due` date are marked overdue
 - **Mobile layout** — below 580 px a ☰ button at the left of the tab row opens the sidebar as an overlay with a backdrop (closes when a note opens, on Escape, or on a backdrop click)
+- **Frontmatter links** — in the chips above a note, `[[Note]]` values (also list items, `[[Note|label]]`, `[[Note#Heading]]`) are
+  clickable wikilinks like in the body, with the dashed "missing" style when the note does not exist; all other values stay escaped text.
 - **Navigation** — opening a note from anywhere (tree, link, URL hash, Back/Forward, search, graph, backlinks, plug-in)
   expands its folders in the tree, highlights it and scrolls it into view without taking focus from the search box. The
   breadcrumb shows the whole folder path (`knowledge / deep / nested / Gamma`, number prefixes stripped); clicking a folder
