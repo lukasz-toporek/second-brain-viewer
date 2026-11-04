@@ -15,6 +15,7 @@ import hashlib
 import http.client
 import importlib.util
 import json
+import os
 import re
 import shutil
 import struct
@@ -2762,7 +2763,7 @@ class LintStructureTests(LinkVaultCase):
         "Beta.md": "---\ntype: wiedza\nup:\n---\n# Beta (empty up)\n[[Hub]]\n",
         "NoUp.md": "---\ntype: wiedza\n---\n# NoUp\n[[Hub]]\n",
         "BadUp.md": '---\ntype: wiedza\nup: "[[Nope]]"\n---\n# BadUp\n[[Hub]]\n',
-        "PlainUp.md": "---\ntype: wiedza\nup: Hub\n---\n# PlainUp (a bare name resolves too)\n[[Hub]]\n",
+        "PlainUp.md": "---\ntype: wiedza\nup: Hub\n---\n# PlainUp (a bare name draws no line)\n[[Hub]]\n",
         "ListUp.md": '---\ntype: wiedza\nup:\n  - "[[Hub]]"\n  - "[[Alpha]]"\n---\n# ListUp (a list works)\n[[Hub]]\n',
         "island/I1.md": '---\ntype: wiedza\nup: "[[I2]]"\n---\n# I1\n[[I2]]\n',
         "island/I2.md": '---\ntype: wiedza\nup: "[[I3]]"\n---\n# I2\n[[I3]]\n',
@@ -2797,10 +2798,12 @@ class LintStructureTests(LinkVaultCase):
             self.assertRegex(out, rf"{missing}\n  • brak pola up:")
         self.assertRegex(out, r"BadUp\.md\n  • zepsute up: \[\[Nope\]\]")
         self.assertNotIn("brak pola up", out.split("BadUp.md")[1].split("\n\n")[0])          # not reported as missing too
-        for ok in ("Home.md", "Alpha.md", "PlainUp.md", "ListUp.md", "Hub.md"):               # home is exempt; the rest resolve
+        self.assertRegex(out, r'PlainUp\.md\n  • brak linku w up: Hub — użyj up: "\[\[Hub\]\]" \(taka notatka istnieje')
+        for ok in ("Home.md", "Alpha.md", "ListUp.md", "Hub.md"):                             # home is exempt; the rest resolve
             self.assertNotRegex(out, rf"\n{re.escape(ok)}\n")
         self.assertEqual(out.count("brak pola up"), 2)
         self.assertEqual(out.count("zepsute up"), 1)
+        self.assertEqual(out.count("brak linku w up"), 1)
 
     def test_groups_report_in_the_config_is_informational(self):
         (self.root / "BadUp.md").unlink()                                                  # leave a vault with no real issue
@@ -2826,6 +2829,88 @@ class LintStructureTests(LinkVaultCase):
         line = next(l for l in r.stdout.splitlines() if "(25)" in l)
         self.assertEqual(line.count(".md"), 20)
         self.assertIn("… i 5 więcej", line)
+
+
+class LintPolishTests(LinkVaultCase):
+    """require_up accepts only what the graph draws; no-frontmatter hint; Markdown note links in the lint."""
+    NOTES = {
+        "People.md": "---\ntype: home\n---\n# People\n",
+        "Sub/Deep.md": "---\ntype: wiedza\nup: \"[[People]]\"\n---\n# Deep\n",
+        "Attach.pdf": "x",
+    }
+
+    def lint(self, notes, require_up=True):
+        for rel, text in notes.items():
+            f = self.root / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(text, encoding="utf-8")
+        (self.root / ".viewer.json").write_text(json.dumps({"title": "L", "lint": {"require_up": require_up}}), encoding="utf-8")
+        return subprocess.run([sys.executable, str(ROOT / "tools" / "vault-lint.py"), "--vault", str(self.root)], capture_output=True, text=True)
+
+    @staticmethod
+    def fm(up_line):
+        return f"---\ntype: wiedza\n{up_line}\n---\n# N\n"
+
+    def test_up_forms(self):
+        cases = {
+            "BareYes.md": "up: People", "BareNo.md": "up: Nobody", "Quoted.md": 'up: "[[People]]"',
+            "Unquoted.md": "up: [[People]]", "Mixed.md": 'up:\n  - Nobody\n  - "[[People]]"',
+            "MixedBare.md": 'up:\n  - People\n  - Nobody', "Broken.md": 'up: "[[Nobody]]"',
+        }
+        r = self.lint({k: self.fm(v) for k, v in cases.items()} | {"Home2.md": "---\ntype: home\n---\n"})
+        out = r.stdout
+        self.assertEqual(r.returncode, 1)
+        self.assertRegex(out, r'BareYes\.md\n  • brak linku w up: People — użyj up: "\[\[People\]\]" \(taka notatka istnieje')
+        self.assertRegex(out, r'BareNo\.md\n  • brak linku w up: Nobody — użyj up: "\[\[Nobody\]\]"\n')
+        self.assertRegex(out, r"Broken\.md\n  • zepsute up")
+        self.assertRegex(out, r"MixedBare\.md\n  • brak linku w up: People")
+        for ok in ("Quoted.md", "Unquoted.md", "Mixed.md", "Home2.md"):
+            self.assertNotRegex(out, rf"\n{ok}\n")
+        # the lint agrees with the graph: every accepted note has an edge to People, no bare one has
+        edges = {e for e in self.edges() if "People.md" in e}
+        for ok in ("Quoted", "Unquoted", "Mixed"):
+            self.assertTrue(any(f"{ok}.md" in e for e in edges), ok)
+        for bad in ("BareYes", "BareNo", "MixedBare"):
+            self.assertFalse(any(f"{bad}.md" in e for e in edges), bad)
+
+    def test_note_without_frontmatter_gets_the_up_hint_only_with_require_up(self):
+        r = self.lint({"Plain.md": "# no frontmatter\n"})
+        self.assertRegex(r.stdout, r'Plain\.md\n  • brak frontmattera \(lint\.require_up: dodaj up: "\[\[…\]\]"\)')
+        self.assertEqual(r.stdout.count("Plain.md"), 1)
+        r = self.lint({"Plain.md": "# no frontmatter\n"}, require_up=False)
+        self.assertIn("  • brak frontmattera\n", r.stdout + "\n")
+        self.assertNotIn("require_up", r.stdout)
+
+    def test_markdown_note_links(self):
+        body = "\n".join([
+            "[ok](../People.md)", "[ok2](./../People.md#h)", "[sp](My%20Note.md)", "[missing](Missing.md)", "[up](../../x.md)",
+            "[web](http://example.com/a.md)", "[mail](mailto:a@b.c)", "[frag](#h)", "[att](Attach.pdf)", "![img](pic.png)",
+            "`[code](Inline.md)`", "```", "[fenced](Fenced.md)", "```",
+        ])
+        r = self.lint({"Sub/Links.md": f'---\ntype: wiedza\nup: "[[People]]"\n---\n{body}\n', "Sub/My Note.md": self.fm('up: "[[People]]"')},
+                      require_up=False)
+        out = r.stdout
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("zepsuty link: […](Missing.md) — brak notatki Sub/Missing.md", out)
+        self.assertIn("zepsuty link: […](../../x.md) — wychodzi poza katalog vaulta", out)
+        self.assertEqual(out.count("zepsuty link"), 2, out)
+
+    def test_md_link_check_matches_the_graph(self):
+        self.lint({"Sub/L.md": self.fm('up: "[[People]]"') + "[a](../People.md) [b](Gone.md)\n"})
+        edges = self.edges()
+        self.assertTrue(any("Sub/L.md" in e and "People.md" in e for e in edges))
+        self.assertEqual(len([e for e in edges if "Sub/L.md" in e]), 1)                   # Gone.md adds no line
+
+
+class HelpTests(unittest.TestCase):
+    def test_help_prints_usage_and_writes_nothing(self):
+        for script in (ROOT / "viewer.py", ROOT / "tools" / "vault-lint.py"):
+            for flag in ("--help", "-h"):
+                with tempfile.TemporaryDirectory() as d:
+                    r = subprocess.run([sys.executable, str(script), flag, "--vault", d], cwd=d, capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 0, (script, flag, r.stderr))
+                    self.assertIn("Usage" if script.name == "viewer.py" else "python3 vault-lint.py", r.stdout)
+                    self.assertEqual(os.listdir(d), [], (script, flag))
 
 
 class IndexTests(unittest.TestCase):

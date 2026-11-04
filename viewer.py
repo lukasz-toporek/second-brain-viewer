@@ -645,33 +645,54 @@ def extract_md_links(text: str) -> list[str]:
             for m in _MDLINK_RE.finditer(blank_code(text)) if not m.group(0).startswith("[[")]      # [[w]](x) is a wikilink, then text
 
 
-def rel_link_path(base: str, href: str, ext: str = ".md"):
-    """Vault-relative path a scheme-less, non-# link points to, resolved against the folder of `base`
-    (``.`` and ``..`` normalised, never above the vault root); None if it is not a link ending in `ext`.
-    Mirror of ``relLinkPath()`` in the page: keep the two visibly parallel."""
+def _walk_link(base: str, href: str, ext: str):
+    """(vault-relative path, escaped) for rel_link_path(); (None, False) if not a link ending in `ext`.
+    `escaped` is True when a ``..`` tried to go above the vault root (the path is then clamped to the root)."""
     u = href.strip()
     if not u or u[0] == "#" or re.match(r"[a-z][a-z0-9+.-]*:", u, re.I) or re.match(r"[\\/]{2}", u):
-        return None
+        return None, False
     p = re.split(r"[#?]", u)[0]
     if re.search(r"%(?![0-9a-fA-F]{2})", p):           # decodeURIComponent would throw
-        return None
+        return None, False
     try:
         p = unquote(p, errors="strict")
     except UnicodeDecodeError:
-        return None
+        return None, False
     p = p.replace("\\", "/")
     if not p.lower().endswith(ext):
-        return None
+        return None, False
     parts = [] if p.startswith("/") else base.split("/")[:-1]
+    escaped = False
     for seg in p.split("/"):
         if seg in ("", "."):
             continue
         if seg == "..":
             if parts:
                 parts.pop()
+            else:
+                escaped = True
         else:
             parts.append(seg)
-    return "/".join(parts)
+    return "/".join(parts), escaped
+
+
+def rel_link_path(base: str, href: str, ext: str = ".md"):
+    """Vault-relative path a scheme-less, non-# link points to, resolved against the folder of `base`
+    (``.`` and ``..`` normalised, never above the vault root); None if it is not a link ending in `ext`.
+    Mirror of ``relLinkPath()`` in the page: keep the two visibly parallel."""
+    return _walk_link(base, href, ext)[0]
+
+
+def link_escapes_root(base: str, href: str, ext: str = ".md") -> bool:
+    """True when a note link's ``..`` goes above the vault root (rel_link_path() silently clamps it)."""
+    return _walk_link(base, href, ext)[1]
+
+
+def frontmatter_links(value) -> list[str]:
+    """Wikilink targets in one frontmatter value (text or a list of texts): the only form of a frontmatter
+    value that draws a graph line, since build_graph() reads links with extract_wikilinks() too."""
+    items = value if isinstance(value, list) else [value] if value is not None else []
+    return [t for item in items for t in extract_wikilinks(str(item))]
 
 
 def note_aliases(fm: dict) -> list[str]:
@@ -3873,6 +3894,9 @@ def serve(port: int = 5001) -> None:
 
 def main() -> None:
     args = sys.argv[1:]
+    if "-h" in args or "--help" in args:      # before anything reads config or writes a file
+        print((__doc__ or "").strip())
+        return
 
     # --vault PATH  (default: current working directory)
     vault_path = Path.cwd()
