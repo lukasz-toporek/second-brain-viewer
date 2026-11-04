@@ -21,6 +21,10 @@ import re
 import sys
 from pathlib import Path
 
+# One frontmatter parser for the viewer and the lint: viewer.py sits next to tools/
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from viewer import fm_str, frontmatter_block, parse_frontmatter as _parse_frontmatter  # noqa: E402
+
 VAULT = Path.cwd()
 
 # Defaults (the original hard-coded Polish schema)
@@ -70,18 +74,18 @@ def excluded(path: Path) -> bool:
     return any(part in EXCLUDED_DIRS for part in path.parts)
 
 def parse_frontmatter(text: str) -> dict | None:
-    if not text.startswith("---"):
+    """The shared parser from viewer.py; None (not {}) when the note has no frontmatter block."""
+    if frontmatter_block(text) is None:
         return None
-    end = text.find("\n---", 3)
-    if end == -1:
-        return None
-    fm_block = text[4:end]
-    result = {}
-    for line in fm_block.splitlines():
-        if ":" in line:
-            key, _, val = line.partition(":")
-            result[key.strip()] = val.strip()
-    return result
+    return _parse_frontmatter(text)
+
+
+def _present(value) -> bool:
+    """A frontmatter value counts as filled in when it is non-blank text or a list with a non-blank item."""
+    if isinstance(value, list):
+        return any(str(v).strip() for v in value)
+    return bool(str(value or "").strip())
+
 
 def extract_wikilinks(text: str) -> list[str]:
     return [m.rstrip("\\").strip() for m in re.findall(r"\[\[([^\]|#\n]+)", text)]
@@ -142,7 +146,7 @@ def lint() -> int:
             continue
 
         # Check type field
-        note_type = fm.get("type", "").strip()
+        note_type = fm_str(fm, "type").strip()
         if not note_type:
             issues.append((str(rel), "brak pola type: w frontmatterze"))
         elif note_type not in VALID_TYPES:
@@ -150,7 +154,7 @@ def lint() -> int:
 
         # Check required fields per type
         for field in REQUIRED_FIELDS.get(note_type, []):
-            if not fm.get(field, "").strip():
+            if not _present(fm.get(field)):
                 issues.append((str(rel), f"brak wymaganego pola '{field}' dla type: {note_type}"))
 
         # Check wikilinks

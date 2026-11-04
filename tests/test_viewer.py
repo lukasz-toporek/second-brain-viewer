@@ -774,6 +774,145 @@ class CalloutTests(unittest.TestCase):
         self.assertNotIn("callout", self.render("> Just a plain blockquote."))
 
 
+class FrontmatterParserTests(unittest.TestCase):
+    CASES = [
+        # (name, text, expected)
+        ("scalars", "---\ntype: wiedza\nstatus: active\n---\nx", {"type": "wiedza", "status": "active"}),
+        ("double quoted", '---\na: "hello: world"\nb: "esc \\" q" # note\n---\n', {"a": "hello: world", "b": 'esc " q'}),
+        ("single quoted", "---\na: 'it''s'\nb: ' pad '\n---\n", {"a": "it's", "b": " pad "}),
+        ("inline list", '---\ntags: [a, "b c", \'d, e\', f]\nnone: []\n---\n', {"tags": ["a", "b c", "d, e", "f"], "none": []}),
+        ("inline list with wikilink", "---\nmix: [x, [[Y]]]\n---\n", {"mix": ["x", "[[Y]]"]}),
+        ("wikilink scalar is not a list", "---\nr: [[Beta]]\nq: \"[[Beta]]\"\n---\n", {"r": "[[Beta]]", "q": "[[Beta]]"}),
+        ("block list", '---\ntags:\n  - one\n  - "two words"\n  - \'three\'\nafter: 1\n---\n',
+         {"tags": ["one", "two words", "three"], "after": "1"}),
+        ("block list at key indent", "---\nflat:\n- a\n- b\nz: end\n---\n", {"flat": ["a", "b"], "z": "end"}),
+        ("comments", "---\n# own line\ntype: x\n  # indented\n\nstatus: y\n---\n", {"type": "x", "status": "y"}),
+        ("comment inside a block list", "---\nl:\n  - a\n  # skipped\n  - b\n---\n", {"l": ["a", "b"]}),
+        ("empty values", "---\nk:\nj: \nl: ''\n---\n", {"k": "", "j": "", "l": ""}),
+        ("windows line endings", "---\r\ntype: a\r\ntags:\r\n  - x\r\n  - y\r\n---\r\nbody", {"type": "a", "tags": ["x", "y"]}),
+        ("bom", "\ufeff---\ntype: z\n---\n", {"type": "z"}),
+        ("colons in values", "---\ndate: 2024-01-01T10:00:00\nurl: https://x.y/z\n---", {"date": "2024-01-01T10:00:00", "url": "https://x.y/z"}),
+        ("hash in plain value is kept", "---\ncolor: #ff0000\n---\n", {"color": "#ff0000"}),
+        ("nested map kept as raw text", "---\nmeta:\n  a: 1\n  b: 2\nnext: ok\n---\n", {"meta": "a: 1\nb: 2", "next": "ok"}),
+        ("block scalars kept raw", "---\nlit: |\n  line1\n\n  # hash\n  line2\nfold: >-\n  f1\n  f2\n---\n",
+         {"lit": "line1\n\n# hash\nline2", "fold": "f1\nf2"}),
+        ("multi-line plain value", "---\nplain: first\n  second\nnext: 1\n---\n", {"plain": "first\nsecond", "next": "1"}),
+        ("unterminated quote / list keep raw", '---\nu: [a, b\nv: "q\nw: \'x\n---\n', {"u": "[a, b", "v": '"q', "w": "'x"}),
+        ("duplicate key: last wins", "---\na: 1\na: 2\n---\n", {"a": "2"}),
+        ("garbage lines are ignored", "---\n:::\n- stray\n  indented\nno colon here\nok: 1\n---\n", {"ok": "1"}),
+        ("no frontmatter", "# title\n---\ntype: x\n---\n", {}),
+        ("unclosed block", "---\ntype: x\n", {}),
+        ("empty block", "---\n---\nbody", {}),
+        ("empty input", "", {}),
+    ]
+
+    def test_table(self):
+        for name, text, expected in self.CASES:
+            with self.subTest(name):
+                self.assertEqual(viewer.parse_frontmatter(text), expected)
+
+    def test_never_raises_on_junk(self):
+        junk = ["---\n" + "\x00[{\"'\\" * 50 + "\n---\n", "---\n" + ("k: [" * 100) + "\n---\n", "---\n- - - -\n:\n: :\n---\n",
+                "---\nk: \"" + "\\" * 99 + "\n---\n", "---" * 100]
+        for text in junk:
+            with self.subTest(text=text[:20]):
+                self.assertIsInstance(viewer.parse_frontmatter(text), dict)
+
+    def test_values_are_str_or_list_of_str(self):
+        for _, text, _ in self.CASES:
+            for v in viewer.parse_frontmatter(text).values():
+                self.assertTrue(isinstance(v, str) or (isinstance(v, list) and all(isinstance(i, str) for i in v)))
+
+    def test_fm_str_normalises_lists(self):
+        self.assertEqual(viewer.fm_str({"type": ["a", "b"]}, "type"), "a")
+        self.assertEqual(viewer.fm_str({"type": []}, "type"), "")
+        self.assertEqual(viewer.fm_str({"type": "x"}, "type"), "x")
+        self.assertEqual(viewer.fm_str({}, "status"), "")
+
+    def test_list_valued_type_status_date_stay_strings(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "N.md").write_text("---\ntype: [wiedza, extra]\nstatus:\n  - active\ndate: [2025-01-01]\n---\n# N\n",
+                                       encoding="utf-8")
+            viewer.init_config(root)
+            try:
+                note = viewer.scan_vault()["folders"][0]["notes"][0]
+                self.assertEqual((note["type"], note["status"], note["date"]), ("wiedza", "active", "2025-01-01"))
+                self.assertEqual(viewer.VaultIndex().notes[0]["type"], "wiedza")
+            finally:
+                viewer.init_config(VAULT)
+
+
+class FrontmatterApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.s = Server()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.s.stop()
+
+    def test_api_note_has_parsed_frontmatter(self):
+        st, _, body = self.s.req("GET", "/api/note?path=10-knowledge/Alpha.md")
+        d = json.loads(body)
+        self.assertEqual(d["frontmatter"], {"type": "wiedza", "status": "active", "tags": ["testing", "fixture"],
+                                            "related": ["[[Beta]]"]})
+        self.assertEqual((d["type"], d["status"]), ("wiedza", "active"))
+        d = json.loads(self.s.req("GET", "/api/note?path=10-knowledge/Beta.md")[2])
+        self.assertEqual(d["frontmatter"], {"type": "wiedza"})
+        d = json.loads(self.s.req("GET", "/api/note?path=Home.md")[2])
+        self.assertIsInstance(d["frontmatter"], dict)
+
+    def test_export_has_the_same_field(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "o.html"
+            subprocess.run([sys.executable, str(ROOT / "viewer.py"), "--vault", str(VAULT), "--export", str(out)],
+                           check=True, capture_output=True)
+            data = re.search(r"window\.__EXPORT__ = (.*?);</script>", out.read_text(encoding="utf-8"), re.S).group(1)
+        notes = json.loads(data.replace("<\\/", "</").replace("<\\u0021--", "<!--"))["notes"]
+        self.assertEqual(notes["10-knowledge/Alpha.md"]["frontmatter"]["tags"], ["testing", "fixture"])
+
+    def test_chips_use_server_field_with_fallback(self):
+        js = page_script("offline")
+        self.assertIn("data.frontmatter || parseFmFallback(", js)
+
+
+class LintTests(unittest.TestCase):
+    LINT = ROOT / "tools" / "vault-lint.py"
+
+    def run_lint(self, vault):
+        return subprocess.run([sys.executable, str(self.LINT), "--vault", str(vault)], capture_output=True, text=True)
+
+    def test_fixture_vault_output_is_unchanged(self):
+        r = self.run_lint(VAULT)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("3 problem(ów) w 9 plikach", r.stdout)
+        self.assertIn("zepsuty wikilink: [[Does Not Exist]]", r.stdout)
+        self.assertEqual(r.stdout.count("brak wymaganego pola 'status' dla type: projekt"), 2)
+        self.assertNotIn("brak frontmattera", r.stdout)
+
+    def test_uses_the_viewer_parser(self):
+        spec = importlib.util.spec_from_file_location("vault_lint", self.LINT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertIsNone(mod.parse_frontmatter("# no frontmatter"))
+        self.assertEqual(mod.parse_frontmatter("---\ntags: [a]\n---\n"), {"tags": ["a"]})
+        self.assertIs(mod._parse_frontmatter, viewer.parse_frontmatter)
+
+    def test_list_values_and_quotes_in_lint(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "viewer.json").write_text(json.dumps({"lint": {"valid_types": ["projekt"],
+                                              "required_fields": {"projekt": ["status", "owners"]}}}), encoding="utf-8")
+            (root / "Ok.md").write_text('---\ntype: "projekt"\nstatus: \'x\'\nowners:\n  - ann\n---\n', encoding="utf-8")
+            (root / "Bad.md").write_text("---\ntype: [projekt]\nstatus: x\nowners: []\n---\n", encoding="utf-8")
+            r = self.run_lint(root)
+        self.assertIn("Bad.md", r.stdout)
+        self.assertIn("brak wymaganego pola 'owners'", r.stdout)
+        self.assertNotIn("Ok.md", r.stdout)
+        self.assertEqual(r.stdout.count("brak wymaganego"), 1)
+
+
 class GraphXssTests(unittest.TestCase):
     NAME = "<img src=x onerror=alert(1)>"
 

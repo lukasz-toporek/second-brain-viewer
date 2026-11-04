@@ -219,23 +219,141 @@ def vault_files() -> list:
     return sorted(out)
 
 
+_FM_BLOCK_RE = re.compile(r"\A---[ \t]*\n(?:(.*?)\n)?---[ \t]*(?:\n|\Z)", re.S)
+_FM_KEY_RE = re.compile(r"^([^\s:#\-][^:]*?)[ \t]*:(.*)$")
+_FM_ITEM_RE = re.compile(r"^[ \t]*-(?:[ \t]+(.*))?$")
+
+
+def frontmatter_block(text: str):
+    """The text between the opening and closing ``---`` lines (CRLF-safe), or None if there is none."""
+    m = _FM_BLOCK_RE.match(text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n"))
+    return None if m is None else (m.group(1) or "")
+
+
+def _fm_unquote(v: str) -> str:
+    """'x' / "x" -> x (an inline ``# comment`` after the closing quote is dropped); anything else is kept."""
+    v = v.strip()
+    if len(v) < 2 or v[0] not in "\"'":
+        return v
+    q, i, out = v[0], 1, []
+    while i < len(v):
+        c = v[i]
+        if q == '"' and c == "\\" and i + 1 < len(v):
+            out.append({"n": "\n", "t": "\t", '"': '"', "\\": "\\"}.get(v[i + 1], "\\" + v[i + 1]))
+            i += 2
+            continue
+        if c == q:
+            if q == "'" and v[i + 1:i + 2] == "'":         # '' is an escaped single quote
+                out.append("'")
+                i += 2
+                continue
+            rest = v[i + 1:].strip()
+            return "".join(out) if not rest or rest.startswith("#") else v
+        out.append(c)
+        i += 1
+    return v                                               # unterminated: keep the raw text
+
+
+def _fm_split_flow(inner: str) -> list:
+    """Items of ``a, "b, c", [[d]]`` split at top-level commas (quotes and brackets respected)."""
+    items, cur, depth, quote = [], [], 0, ""
+    for c in inner:
+        if quote:
+            cur.append(c)
+            if c == quote:
+                quote = ""
+        elif c in "\"'":
+            quote = c
+            cur.append(c)
+        elif c in "[{":
+            depth += 1
+            cur.append(c)
+        elif c in "]}":
+            depth -= 1
+            cur.append(c)
+        elif c == "," and depth == 0:
+            items.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+    items.append("".join(cur))
+    return [_fm_unquote(i) for i in items if i.strip()]
+
+
 def parse_frontmatter(text: str) -> dict:
-    if not text.startswith("---"):
+    """Parse the leading ``---`` block into ``{key: str | list[str]}`` (stdlib only, no globals).
+
+    Handles ``key: value`` scalars, single/double-quoted values (unquoted), inline lists
+    ``[a, "b c", d]``, block lists (``key:`` then ``- item`` lines), own-line ``#`` comments, empty values
+    and Windows line endings. Anything more complex (nested maps, ``|`` / ``>`` block scalars, multi-line
+    values, unterminated quotes or brackets) is kept as the raw text in a string, and never raises.
+    A value starting with ``[[`` is a wikilink, not a list. Inline comments after plain values are kept.
+    """
+    block = frontmatter_block(text)
+    if block is None:
         return {}
-    end = text.find("\n---", 3)
-    if end == -1:
-        return {}
-    result = {}
-    for line in text[4:end].splitlines():
-        if ":" in line:
-            key, _, val = line.partition(":")
-            result[key.strip()] = val.strip()
+    lines = block.split("\n")
+    result: dict = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        m = _FM_KEY_RE.match(line)
+        if m is None:                                       # blank, comment or stray indented line
+            continue
+        key, val = m.group(1).strip().strip("\"'"), m.group(2).strip()
+        if not key:
+            continue
+        # lines that belong to this key: indented ones, blank/comment ones in between, and (for a bare
+        # "key:") "- item" lines at the key's own indent
+        j = i
+        while j < len(lines):
+            nxt = lines[j]
+            if nxt.strip() == "" or nxt.lstrip().startswith("#") or nxt[:1] in (" ", "\t") \
+                    or (not val and _FM_ITEM_RE.match(nxt)):
+                j += 1
+            else:
+                break
+        while j > i and (lines[j - 1].strip() == "" or lines[j - 1].lstrip().startswith("#")):
+            j -= 1                                          # trailing blanks/comments are not part of the value
+        raw_body = lines[i:j]
+        body = [b for b in raw_body if b.strip() and not b.lstrip().startswith("#")]
+        i = j
+        if val and val[0] in "|>":                          # block scalar: keep the raw lines
+            result[key] = "\n".join(b.strip() for b in raw_body)
+        elif val.startswith("[") and not val.startswith("[["):
+            flow = " ".join([val] + [b.strip() for b in body])
+            result[key] = _fm_split_flow(flow[1:-1]) if flow.endswith("]") else "\n".join([val] + [b.strip() for b in body])
+        elif val:
+            result[key] = _fm_unquote(val) if not body else "\n".join([val] + [b.strip() for b in body])
+        elif body and all(_FM_ITEM_RE.match(b) or b[:1] in (" ", "\t") for b in body) and _FM_ITEM_RE.match(body[0]):
+            items: list = []
+            for b in body:
+                im = _FM_ITEM_RE.match(b)
+                if im and (b.lstrip() == b or len(b) - len(b.lstrip()) <= len(body[0]) - len(body[0].lstrip())):
+                    items.append(_fm_unquote(im.group(1) or ""))
+                elif items:
+                    items[-1] += "\n" + b.strip()          # continuation of the previous item
+            result[key] = items
+        elif body:                                          # nested map etc.: keep the raw text, dedented
+            ind = min(len(b) - len(b.lstrip()) for b in body)
+            result[key] = "\n".join(b[ind:].rstrip() for b in body)
+        else:
+            result[key] = ""
     return result
 
 
+def fm_str(fm: dict, key: str) -> str:
+    """fm[key] as a string: a list (e.g. ``type: [a, b]``) gives its first item; missing gives ''."""
+    v = fm.get(key, "")
+    if isinstance(v, list):
+        return v[0] if v else ""
+    return v if isinstance(v, str) else str(v)
+
+
 def extract_title(text: str, fm: dict, path: Path) -> str:
-    if fm.get("title"):
-        return fm["title"]
+    if fm_str(fm, "title"):
+        return fm_str(fm, "title")
     for line in text.splitlines():
         if line.startswith("# "):
             return line[2:].strip()
@@ -286,9 +404,9 @@ def scan_vault() -> dict:
         by_folder.setdefault(folder, []).append({
             "name":    path.stem,
             "path":    rel.as_posix(),
-            "type":    fm.get("type", ""),
-            "status":  fm.get("status", ""),
-            "date":    fm.get("date", ""),
+            "type":    fm_str(fm, "type"),
+            "status":  fm_str(fm, "status"),
+            "date":    fm_str(fm, "date"),
             "summary": extract_summary(text),
         })
     folders = [
@@ -350,7 +468,7 @@ class VaultIndex:
             text = path.read_text(encoding="utf-8")
             fm = parse_frontmatter(text)
             self.notes.append({
-                "path": rel, "name": path.stem, "type": fm.get("type", ""),
+                "path": rel, "name": path.stem, "type": fm_str(fm, "type"),
                 "folder": rel.split("/")[0] if "/" in rel else "(vault root)", "text": text,
             })
             low = rel.lower()
@@ -1758,26 +1876,37 @@ function backlinksHtml(list) {
     `</ul></div>`;
 }
 
+// Fallback for note data without "frontmatter" (exports made by an older viewer): key/value pairs and
+// YAML block lists only.
+function parseFmFallback(block) {
+  const lines = block.split(/\r?\n/), out = {};
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(lines[i]);
+    if (!m) continue;
+    let v = m[2].trim();
+    if (!v) {
+      const items = [];
+      while (i + 1 < lines.length && /^\s*-\s+/.test(lines[i + 1]))
+        items.push(lines[++i].replace(/^\s*-\s+/, "").trim().replace(/^["']|["']$/g, ""));
+      v = items.join(", ");
+    }
+    out[m[1]] = v;
+  }
+  return out;
+}
+
 function showNote(data) {
   let raw = data.content;
   let chips = "";
 
-  const fmMatch = raw.match(/^---\n([\s\S]*?)\n---\n?/);
+  const fmMatch = raw.match(/^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/);
   if (fmMatch) {
     raw = raw.slice(fmMatch[0].length);
-    const lines = fmMatch[1].split("\n"), kv = [];
-    for (let i = 0; i < lines.length; i++) {
-      const m = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(lines[i]);
-      if (!m) continue;
-      let v = m[2].trim();
-      if (!v) {                       // YAML block list: "key:" followed by "- item" lines
-        const items = [];
-        while (i + 1 < lines.length && /^\s*-\s+/.test(lines[i + 1]))
-          items.push(lines[++i].replace(/^\s*-\s+/, "").trim().replace(/^["']|["']$/g, ""));
-        v = items.join(", ");
-      }
-      if (v && m[1] !== "title") kv.push([m[1], v]);
-    }
+    // The server parses the frontmatter (one parser for the API, lint and export); parseFmFallback only
+    // serves data without a "frontmatter" field (older exports).
+    const kv = Object.entries(data.frontmatter || parseFmFallback(fmMatch[1]))
+      .map(([k, v]) => [k, Array.isArray(v) ? v.join(", ") : String(v ?? "")])
+      .filter(([k, v]) => v && k !== "title");
     chips = kv.map(([key, v]) => {
       const c = key === "type" ? tcol(v) : key === "status" ? "#68b068" : "#888";
       return `<span class="chip" style="background:${esc(c)}20;color:${esc(c)}">${esc(key)}: ${esc(v)}</span>`;
@@ -2356,7 +2485,7 @@ class VaultHandler(BaseHTTPRequestHandler):
             rel_posix = note_path.relative_to(VAULT.resolve()).as_posix()
             payload = {
                 "path": rel_posix, "name": note_path.stem, "content": text,
-                "type": fm.get("type", ""), "status": fm.get("status", ""),
+                "type": fm_str(fm, "type"), "status": fm_str(fm, "status"), "frontmatter": fm,
                 "backlinks": get_index().backlinks_for(rel_posix),
             }
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -2664,7 +2793,7 @@ def export_html(out_path: Path) -> None:
         fm = parse_frontmatter(n["text"])
         notes[n["path"]] = {
             "path": n["path"], "name": n["name"], "content": n["text"],
-            "type": fm.get("type", ""), "status": fm.get("status", ""),
+            "type": fm_str(fm, "type"), "status": fm_str(fm, "status"), "frontmatter": fm,
             "backlinks": idx.backlinks_for(n["path"]),
         }
     attachments = export_attachments(idx)

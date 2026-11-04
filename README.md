@@ -77,6 +77,15 @@ name matches first, then body-only matches, at most 50, an empty list for querie
 It is covered by the same `Host` check as the other endpoints. In an exported file (`--export`) the identical
 search runs client-side over the embedded notes.
 
+### Frontmatter
+
+One stdlib parser (`parse_frontmatter()` in `viewer.py`) serves the API, the export and `tools/vault-lint.py`. It returns
+`str` for scalars and `list[str]` for lists and understands `key: value`, single/double-quoted values, inline lists
+`[a, "b c"]`, block lists (`key:` + `- item` lines), own-line `#` comments, empty values and Windows line endings.
+Nested maps, `|` / `>` block scalars and multi-line values are kept as raw text in a string; malformed input never raises.
+`type`, `status` and `date` are always strings (a list gives its first item). `GET /api/note` (and each note in an
+export) carries the parsed values as `"frontmatter": {…}`, and the frontmatter chips are built from it.
+
 ### Embeds and foldable callouts
 
 - `![[Note]]`, `![[Note#Heading]]` and `![[Note|label]]` render the target note's body inline in a bordered box whose
