@@ -906,6 +906,7 @@ body {
   transition: color .1s, background .1s;
 }
 .rbtn:hover { color: var(--tx); background: var(--sh); }
+.sb-actions { display: flex; align-items: center; gap: 2px; }
 .rbtn.spinning svg { animation: spin .5s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -1205,6 +1206,7 @@ body {
 /* breadcrumb */
 .bc {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   margin-bottom: 20px;
@@ -1212,6 +1214,8 @@ body {
   color: var(--tx2);
 }
 .bc .sep { opacity: .35; }
+.bc a.bc-f { color: var(--tx2); text-decoration: none; border-radius: 3px; }
+.bc a.bc-f:hover { color: var(--tx); text-decoration: underline; }
 
 /* fm chips */
 .chips {
@@ -1558,13 +1562,25 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
 <aside class="sb" id="sb">
   <div class="sb-top">
     <span class="sb-title">Explorer</span>
-    <button class="rbtn" id="rbtn" title="Refresh (R)">
-      <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M1 4v4h4M15 12v-4h-4"/>
-        <path d="M13.5 7A6 6 0 1 0 12 12.5"/>
-      </svg>
-      Refresh
-    </button>
+    <span class="sb-actions">
+      <button class="icon-btn" id="collapse-btn" title="Collapse all folders" aria-label="Collapse all folders">
+        <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 3.5l4 3.5 4-3.5M4 12.5L8 9l4 3.5"/>
+        </svg>
+      </button>
+      <button class="icon-btn" id="reveal-btn" title="Reveal the active note in the file tree" aria-label="Reveal the active note in the file tree">
+        <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v3M8 11.5v3M1.5 8h3M11.5 8h3"/>
+        </svg>
+      </button>
+      <button class="rbtn" id="rbtn" title="Refresh (R)">
+        <svg aria-hidden="true" focusable="false" width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M1 4v4h4M15 12v-4h-4"/>
+          <path d="M13.5 7A6 6 0 1 0 12 12.5"/>
+        </svg>
+        Refresh
+      </button>
+    </span>
   </div>
   <div class="sb-srch">
     <input class="srch" id="srch" placeholder="Search…" autocomplete="off" spellcheck="false">
@@ -1792,6 +1808,23 @@ function folderPaths(nodes, out = new Set()) {
   nodes.forEach(n => { out.add(n.path); folderPaths(n.folders, out); });
   return out;
 }
+// The folder paths that contain the vault-relative `path` (a note or a folder's own path), outermost first.
+// A note at the vault root lives in the "(vault root)" group.
+function ancestorFolders(path) {
+  const parts = String(path).split("/");
+  if (parts.length < 2) return ["(vault root)"];
+  const out = [];
+  for (let i = 1; i < parts.length; i++) out.push(parts.slice(0, i).join("/"));
+  return out;
+}
+
+// Breadcrumb: every folder of the path (number prefixes stripped) as a link to that folder, then the note name.
+function breadcrumbHtml(path, name) {
+  const dirs = String(path).split("/").slice(0, -1);
+  return dirs.map((d, i) => `<a class="bc-f" href="#" data-fpath="${esc(dirs.slice(0, i + 1).join("/"))}" title="Show in the file tree">${esc(folderLabel(d))}</a>` +
+    `<span class="sep">/</span>`).join("") + `<span>${esc(name)}</span>`;
+}
+
 // ── Tabs (pure) ──
 const TAB_LIMIT = 8;
 // Which tab to drop when there are more than TAB_LIMIT: the least recently used one that is not `active`.
@@ -2313,6 +2346,48 @@ function setFolderOpen(fpath, open) {
   saveExpanded();
 }
 
+const isNarrow = () => !!(window.matchMedia && window.matchMedia("(max-width: 580px)").matches);
+function clearSearch() {
+  const box = document.getElementById("srch");
+  box.value = ""; searchQ = ""; searchSeq++;
+  renderTree();
+}
+// Opens every folder above the note and scrolls its row into view. It never moves keyboard focus (the
+// search box keeps it). While search results replace the tree only the remembered state changes.
+function revealNote(path, scroll = true) {
+  ancestorFolders(path).forEach(f => { if (!expanded.has(f)) setFolderOpen(f, true); });
+  if (searchQ || !scroll) return;
+  const el = noteEls.get(path);
+  if (el) el.scrollIntoView({ block: "nearest" });
+}
+// Breadcrumb click: show and open that folder in the tree (the sidebar overlay on a phone).
+function revealFolder(fpath) {
+  if (isNarrow()) setSidebar(true);
+  if (searchQ) clearSearch();
+  ancestorFolders(fpath + "/x").forEach(f => setFolderOpen(f, true));
+  const hd = folderEls.get(fpath);
+  if (hd) hd.scrollIntoView({ block: "nearest" });
+}
+function collapseAll() {
+  expanded.clear();
+  folderEls.forEach(hd => {
+    hd.classList.remove("open"); hd.setAttribute("aria-expanded", "false"); hd.nextElementSibling.hidden = true;
+  });
+  saveExpanded();
+}
+document.getElementById("collapse-btn").addEventListener("click", collapseAll);
+document.getElementById("reveal-btn").addEventListener("click", () => {
+  if (!activeTab) return;
+  if (searchQ) clearSearch();
+  revealNote(activeTab);
+});
+document.addEventListener("click", e => {          // breadcrumb folder segments
+  const a = e.target.closest && e.target.closest("a.bc-f");
+  if (!a) return;
+  e.preventDefault();
+  revealFolder(a.dataset.fpath);
+});
+
 // One delegated handler for the whole tree (cheap for thousands of rows).
 treeEl().addEventListener("click", e => {
   const hd = e.target.closest(".fhd");
@@ -2405,6 +2480,7 @@ function openNote(note) {
   renderTabs();
   loadContent(note);
   highlight();
+  revealNote(note.path);
   if (location.hash !== hashFor(note.path)) location.hash = hashFor(note.path);
 }
 
@@ -2486,10 +2562,7 @@ function showNote(data) {
     if (chips) chips = `<div class="chips">${chips}</div>`;
   }
 
-  const parts = data.path.split("/");
-  const bc = parts.length > 1
-    ? `<div class="bc"><span>${esc(parts[0].replace(/^\d+[-\s]+/,""))}</span><span class="sep">/</span><span>${esc(data.name)}</span></div>`
-    : `<div class="bc"><span>${esc(data.name)}</span></div>`;
+  const bc = `<div class="bc">${breadcrumbHtml(data.path, data.name)}</div>`;
 
   let html = "";
   if (typeof marked !== "undefined") {
@@ -2571,7 +2644,7 @@ document.getElementById("srch").addEventListener("input", e => {
   searchQ = e.target.value.trim();
   clearTimeout(searchTimer);
   searchSeq++;                                  // invalidate any search in flight
-  if (!searchQ) { renderTree(); return; }       // cleared: restore the tree
+  if (!searchQ) { renderTree(); if (activeTab) revealNote(activeTab); return; }       // cleared: restore the tree
   searchTimer = setTimeout(runSearch, 150);     // debounce
 });
 

@@ -2330,6 +2330,39 @@ class TabTests(unittest.TestCase):
         self.assertNotIn("tabs.shift()", js)                                     # no silent dropping of the oldest
 
 
+class RevealAndBreadcrumbTests(unittest.TestCase):
+    @unittest.skipUnless(NODE, "node not available")
+    def test_ancestor_folders_and_breadcrumb(self):
+        r = run_page_js("""
+          console.log(JSON.stringify({
+            note: ancestorFolders("10-knowledge/deep/nested/Gamma.md"), top: ancestorFolders("10-knowledge/Alpha.md"),
+            root: ancestorFolders("Root.md"), folder: ancestorFolders("10-knowledge/deep/x"),
+            bc: breadcrumbHtml("10-knowledge/deep/nested/Gamma.md", "Gamma"), bcRoot: breadcrumbHtml("Root.md", "Root"),
+            bcEsc: breadcrumbHtml('1-<b>/x.md', "x"),
+          }));""")
+        self.assertEqual(r["note"], ["10-knowledge", "10-knowledge/deep", "10-knowledge/deep/nested"])
+        self.assertEqual(r["top"], ["10-knowledge"])
+        self.assertEqual(r["root"], ["(vault root)"])
+        self.assertEqual(r["folder"], ["10-knowledge", "10-knowledge/deep"])
+        links = re.findall(r'<a class="bc-f" href="#" data-fpath="([^"]*)"[^>]*>([^<]*)</a>', r["bc"])
+        self.assertEqual(links, [("10-knowledge", "knowledge"), ("10-knowledge/deep", "deep"), ("10-knowledge/deep/nested", "nested")])
+        self.assertTrue(r["bc"].endswith("<span>Gamma</span>"))
+        self.assertEqual(r["bc"].count('<span class="sep">/</span>'), 3)                 # knowledge / deep / nested / Gamma
+        self.assertEqual(r["bcRoot"], "<span>Root</span>")
+        self.assertNotIn("<b>", r["bcEsc"])                                               # folder names are escaped
+
+    def test_explorer_buttons_reveal_and_no_focus_stealing(self):
+        html = viewer.render_page("offline")
+        for ident, title in (("collapse-btn", "Collapse all folders"), ("reveal-btn", "Reveal the active note in the file tree")):
+            self.assertRegex(html, rf'<button class="icon-btn" id="{ident}" title="{title}" aria-label="{title}">')
+        self.assertLess(html.index('id="collapse-btn"'), html.index('id="rbtn"'))          # next to Refresh
+        js = page_script("offline")
+        self.assertRegex(js, r"function openNote\(note\) \{[\s\S]*?highlight\(\);\s*revealNote\(note\.path\);")
+        reveal = js[js.index("function revealNote"):js.index("// Breadcrumb click")]
+        self.assertIn('scrollIntoView({ block: "nearest" })', reveal)
+        self.assertNotIn(".focus(", reveal)                                                 # never steals focus from the search box
+
+
 class IndexTests(unittest.TestCase):
     def test_resolution_forms(self):
         viewer.init_config(VAULT)
