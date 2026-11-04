@@ -2902,6 +2902,76 @@ class LintPolishTests(LinkVaultCase):
         self.assertEqual(len([e for e in edges if "Sub/L.md" in e]), 1)                   # Gone.md adds no line
 
 
+def run_snippet_js(js: str):
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "t.js"
+        f.write_text(js, encoding="utf-8")
+        r = subprocess.run([NODE, str(f)], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise AssertionError(r.stderr)
+    return json.loads(r.stdout)
+
+
+@unittest.skipUnless(NODE, "node not available")
+class HashAndTreeStateTests(unittest.TestCase):
+    NFC = unicodedata.normalize("NFC", "Zażółć")
+    NFD = unicodedata.normalize("NFD", "Zażółć")
+
+    def find_note(self, paths, query):
+        js = page_script("offline")
+        a = js.index("let noteByPath = null")
+        b = js.index("\n};", js.index("const findNote")) + 3
+        notes = [{"path": p} for p in paths]
+        return run_snippet_js(f"let vault = {{folders: [{{notes: {json.dumps(notes)}}}]}};\n{js[a:b]}\n"
+                              f"const r = findNote({json.dumps(query)}); console.log(JSON.stringify(r ? r.path : null));")
+
+    def test_find_note_falls_back_to_nfc(self):
+        self.assertNotEqual(self.NFC, self.NFD)
+        self.assertEqual(self.find_note([self.NFD + ".md"], self.NFC + ".md"), self.NFD + ".md")      # on-disk path comes back
+        self.assertEqual(self.find_note([self.NFC + ".md"], self.NFD + ".md"), self.NFC + ".md")
+        self.assertEqual(self.find_note(["A.md"], "B.md"), None)
+
+    def test_exact_match_wins_and_first_in_vault_order(self):
+        both = [self.NFD + ".md", self.NFC + ".md"]
+        self.assertEqual(self.find_note(both, self.NFC + ".md"), self.NFC + ".md")                    # exact
+        self.assertEqual(self.find_note([self.NFD + ".md", "d/" + self.NFD + ".md"], self.NFC + ".md"), self.NFD + ".md")
+
+    def test_api_note_accepts_only_the_on_disk_path(self):
+        # The page always asks the API with the path it found (findNote returns the on-disk one), so the server
+        # needs no NFC fallback of its own.
+        self.assertIn("hashFor(note.path)", viewer.VIEWER_HTML)
+
+    def tree_state(self, flags, store):
+        js = page_script("offline")
+        a = js.index("const treeKey")
+        b = js.index("} catch (_) {}\n", a) + len("} catch (_) {}\n")
+        return run_snippet_js(f"const FLAGS = {json.dumps(flags)}; const _s = {json.dumps(store)};\n"
+                              "global.localStorage = {getItem: k => (k in _s ? _s[k] : null), setItem: (k, v) => { _s[k] = v; }};\n"
+                              f"{js[a:b]}\nconsole.log(JSON.stringify([treeKey(), _s]));")
+
+    def test_tree_key_has_vault_id_and_migrates_once(self):
+        key, store = self.tree_state({"title": "T", "vault_id": "abc"}, {"sbv-tree:T": '["x"]'})
+        self.assertEqual(key, "sbv-tree:T:abc")
+        self.assertEqual(store, {"sbv-tree:T": '["x"]', "sbv-tree:T:abc": '["x"]'})                    # copied, old key kept
+        key, store = self.tree_state({"title": "T", "vault_id": "def"}, {"sbv-tree:T:def": '["y"]', "sbv-tree:T": '["x"]'})
+        self.assertEqual(store["sbv-tree:T:def"], '["y"]')                                             # existing state not overwritten
+
+    def test_vault_id_in_every_mode_but_not_the_path(self):
+        with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+            ids = []
+            for d in (d1, d2):
+                viewer.init_config(Path(d))
+                self.addCleanup(viewer.init_config, VAULT)
+                vid = viewer.vault_id()
+                ids.append(vid)
+                self.assertRegex(vid, r"^[0-9a-f]{12}$")
+                for mode in ("online", "offline", "export"):
+                    html = viewer.render_page(mode, {"folders": []} if mode == "export" else None)
+                    self.assertIn(f'"vault_id":"{vid}"', html.replace(" ", ""), mode)
+                    self.assertNotIn(str(Path(d).resolve()), html, mode)
+            self.assertNotEqual(*ids)
+
+
 class HelpTests(unittest.TestCase):
     def test_help_prints_usage_and_writes_nothing(self):
         for script in (ROOT / "viewer.py", ROOT / "tools" / "vault-lint.py"):

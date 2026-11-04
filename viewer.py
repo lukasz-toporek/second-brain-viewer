@@ -2547,7 +2547,12 @@ document.addEventListener("click", e => {
 
 // ── Tree ──────────────────────────────────────────────────────
 // Expanded folders are remembered by vault-relative folder path, per vault title, in localStorage.
-const treeKey = () => "sbv-tree:" + (FLAGS.title || "");
+const treeKey = () => "sbv-tree:" + (FLAGS.title || "") + ":" + (FLAGS.vault_id || "");
+// one-time migration: state saved under the old per-title key is copied to this vault's key (the old key stays)
+try {
+  const old = "sbv-tree:" + (FLAGS.title || "");
+  if (localStorage.getItem(treeKey()) === null && localStorage.getItem(old) !== null) localStorage.setItem(treeKey(), localStorage.getItem(old));
+} catch (_) {}
 function loadExpanded() {
   try {
     const a = JSON.parse(localStorage.getItem(treeKey()) || "[]");
@@ -2752,11 +2757,19 @@ function highlight() {
 }
 
 // ── Open note ─────────────────────────────────────────────────
-let noteByPath = null;                       // rebuilt after every load()
+let noteByPath = null, noteByNfc = null;     // rebuilt after every load()
 const findNote = path => {
   if (!vault) return undefined;
   if (!noteByPath) { noteByPath = new Map(); vault.folders.forEach(s => s.notes.forEach(n => noteByPath.set(n.path, n))); }
-  return noteByPath.get(path);
+  const hit = noteByPath.get(path);
+  if (hit || typeof path !== "string") return hit;
+  // A hash typed or pasted in another Unicode form than the file name on disk (NFD vs NFC): compare normalised.
+  // An exact match always wins; among notes that differ only in form, the first in vault order.
+  if (!noteByNfc) {
+    noteByNfc = new Map();
+    vault.folders.forEach(s => s.notes.forEach(n => { const k = n.path.normalize("NFC"); if (!noteByNfc.has(k)) noteByNfc.set(k, n); }));
+  }
+  return noteByNfc.get(path.normalize("NFC"));
 };
 const hashFor = path => "#" + encodeURIComponent(path);
 
@@ -2877,7 +2890,7 @@ async function load() {
   try {
     const first = !vault;
     vault = await api("vault");
-    noteIdx = null; fileIdx = null; noteByPath = null;
+    noteIdx = null; fileIdx = null; noteByPath = null; noteByNfc = null;
     if (first) expanded = loadExpanded();
     {                                                          // forget folders that no longer exist
       const live = folderPaths(buildTree(vault.folders)), n = expanded.size;
@@ -3408,12 +3421,18 @@ def js_json(obj) -> str:
     return json.dumps(obj, ensure_ascii=False).replace("</", "<\\/").replace("<!--", "<\\u0021--")
 
 
+def vault_id() -> str:
+    """Short opaque id of this vault (12 hex digits of SHA-256 of its resolved path): keys per-vault browser state.
+    The path itself never goes into the page or the export."""
+    return hashlib.sha256(str(VAULT.resolve()).encode("utf-8")).hexdigest()[:12]
+
+
 def render_page(mode: str = "online", data: dict = None) -> str:
     """mode: 'online' (CDN libs, chat) | 'offline' (vendored, no chat) | 'export' (single file)."""
     flags = {"chat": mode == "online", "watch": mode != "export", "export": mode == "export",
              # offline and export never load remote images; online follows the "remote_images" setting
              "remote_images": REMOTE_IMAGES if mode == "online" else "block",
-             "plugins": list(PLUGINS), "theme": THEME, "title": CONFIG.get("title", VAULT.name)}
+             "plugins": list(PLUGINS), "theme": THEME, "title": CONFIG.get("title", VAULT.name), "vault_id": vault_id()}
     head, libs, data_tag = "", "", ""
     if mode == "online":
         head, libs = CDN_FONTS, cdn_libs()
