@@ -1980,45 +1980,46 @@ class VaultHandler(BaseHTTPRequestHandler):
             self._respond(404, "text/plain", b"Not found")
 
     def do_POST(self):
-        if not self._guard():
+        if not self._host_ok():
+            self._respond(403, "text/plain", b"Forbidden: bad Host header", close=True)
             return
         parsed = urlparse(self.path)
         if parsed.path != "/api/chat":
-            self._respond(404, "text/plain", b"Not found")
+            self._respond(404, "text/plain", b"Not found", close=True)
             return
         if OFFLINE:
-            self._respond(403, "text/plain", b"Chat is disabled in offline mode")
+            self._respond(403, "text/plain", b"Chat is disabled in offline mode", close=True)
             return
 
         # CSRF / cross-origin protection: browsers cannot send a custom header or
         # application/json cross-origin without a CORS preflight, which we never grant.
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if ctype != "application/json":
-            self._respond(415, "text/plain", b"Content-Type must be application/json")
+            self._respond(415, "text/plain", b"Content-Type must be application/json", close=True)
             return
         if self.headers.get("X-Vault-Viewer") != "1":
-            self._respond(403, "text/plain", b"Missing X-Vault-Viewer header")
+            self._respond(403, "text/plain", b"Missing X-Vault-Viewer header", close=True)
             return
         try:
             length = int(self.headers.get("Content-Length", ""))
         except ValueError:
-            self._respond(411, "text/plain", b"Content-Length required")
+            self._respond(411, "text/plain", b"Content-Length required", close=True)
             return
         if length < 0:
-            self._respond(400, "text/plain", b"Bad Content-Length")
+            self._respond(400, "text/plain", b"Bad Content-Length", close=True)
             return
         if length > MAX_BODY:
-            self._respond(413, "text/plain", b"Request body too large")
+            self._respond(413, "text/plain", b"Request body too large", close=True)
             return
         raw = self.rfile.read(length)
         try:
             req_body = json.loads(raw)
         except Exception:
-            self._respond(400, "text/plain", b"Bad JSON")
+            self._respond(400, "text/plain", b"Bad JSON", close=True)
             return
 
         if not isinstance(req_body, dict) or not isinstance(req_body.get("messages", []), list):
-            self._respond(400, "text/plain", b"Bad request")
+            self._respond(400, "text/plain", b"Bad request", close=True)
             return
         messages = req_body.get("messages", [])
         context  = req_body.get("context", "")
@@ -2161,8 +2162,12 @@ class VaultHandler(BaseHTTPRequestHandler):
         except Exception as e:
             sse_error(str(e))
 
-    def _respond(self, code, ct, body, cache=True):
+    def _respond(self, code, ct, body, cache=True, close=False):
         self.send_response(code)
+        if close:
+            # an unread request body may still be on the wire: don't let the client reuse the socket
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self.send_header("Content-Type", ct)
         self.send_header("Content-Length", len(body))
         self.send_header("X-Content-Type-Options", "nosniff")

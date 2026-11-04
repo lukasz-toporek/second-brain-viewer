@@ -25,7 +25,7 @@ class Server:
         self.port = self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
 
-    def req(self, method, path, headers=None, body=None, host=True):
+    def req(self, method, path, headers=None, body=None, host=True, declared_length=None):
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         h = dict(headers or {})
         c.putrequest(method, path, skip_host=True)
@@ -35,7 +35,9 @@ class Server:
             c.putheader("Host", host)
         for k, v in h.items():
             c.putheader(k, v)
-        if body is not None:
+        if declared_length is not None:
+            c.putheader("Content-Length", str(declared_length))
+        elif body is not None:
             c.putheader("Content-Length", str(len(body)))
         c.endheaders(body)
         r = c.getresponse()
@@ -99,8 +101,11 @@ class OnlineTests(unittest.TestCase):
         self.assertEqual(st, 403)                              # no custom header
         st, _, _ = self.s.req("POST", "/api/chat", {"Content-Type": "text/plain", "X-Vault-Viewer": "1"}, body)
         self.assertEqual(st, 415)                              # wrong content type
-        st, _, _ = self.s.req("POST", "/api/chat", ok_h, b"x" * (viewer.MAX_BODY + 1))
+        # Declare an oversized body but send none: the server answers 413 without reading it, so
+        # this cannot hit BrokenPipe on a client that is still writing (macOS socket buffers).
+        st, h, _ = self.s.req("POST", "/api/chat", ok_h, None, declared_length=viewer.MAX_BODY + 1)
         self.assertEqual(st, 413)                              # too big
+        self.assertEqual(h.get("Connection"), "close")
         st, _, _ = self.s.req("POST", "/api/chat", ok_h, body, host="evil.example")
         self.assertEqual(st, 403)                              # bad host
         st, _, _ = self.s.req("POST", "/api/chat", ok_h, body)
