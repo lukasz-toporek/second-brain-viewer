@@ -350,6 +350,39 @@ def build_graph() -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+# ── Full-text search ────────────────────────────────────────────────────────
+
+SEARCH_LIMIT = 50
+SEARCH_MIN = 2
+
+
+def search_notes(q: str, notes: list) -> list:
+    """Case-insensitive substring search over note names and full text.
+
+    Name matches come first, then body-only matches, each in vault order, at most SEARCH_LIMIT in
+    all. ``snippet`` is ~120 characters (whitespace collapsed) around the first body match.
+    The browser's ``searchNotes()`` (used by --export) is a line-for-line mirror of this function.
+    """
+    q = q.strip()
+    if len(q) < SEARCH_MIN:
+        return []
+    rx = re.compile(re.escape(q[:200]), re.IGNORECASE)
+    by_name, by_body = [], []
+    for n in notes:
+        in_name = rx.search(n["name"]) is not None
+        m = rx.search(n["text"])
+        snippet = ""
+        if m:
+            lo = max(0, m.start() - 40)
+            hi = min(len(n["text"]), max(m.end(), lo + 120))
+            snippet = re.sub(r"\s+", " ", n["text"][lo:hi]).strip()
+            snippet = ("…" if lo > 0 else "") + snippet + ("…" if hi < len(n["text"]) else "")
+        if in_name or m:
+            (by_name if in_name else by_body).append(
+                {"path": n["path"], "name": n["name"], "folder": n["folder"], "snippet": snippet})
+    return (by_name + by_body)[:SEARCH_LIMIT]
+
+
 # ── File watcher ────────────────────────────────────────────────────────────
 
 def vault_snapshot() -> dict:
@@ -638,6 +671,14 @@ body {
   transition: color .07s;
 }
 .ni:hover .nn, .ni.active .nn { color: var(--tx); }
+
+/* search results */
+.ni.sr { align-items: flex-start; padding: 6px 8px; margin: 0 4px; }
+.ni.sr .nd { margin-top: 6px; }
+.sr-main { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.sr-folder { font-size: 10.5px; color: var(--tx2); opacity: .7; }
+.sr-snip { font-size: 11px; color: var(--tx2); margin-top: 2px; line-height: 1.35;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 
 /* ── Main ── */
 .main {
@@ -1153,17 +1194,43 @@ function safeUrl(u) {
 const esc = s => String(s ?? "").replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
+// Full-text search over {path, name, content} notes: mirrors search_notes() in viewer.py
+// (the live server answers /api/search; --export runs this over the embedded notes).
+const SEARCH_LIMIT = 50, SEARCH_MIN = 2;
+function searchNotes(q, notes) {
+  q = String(q ?? "").trim();
+  if ([...q].length < SEARCH_MIN) return [];
+  const rx = new RegExp([...q].slice(0, 200).join("").replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+  const byName = [], byBody = [];
+  for (const n of notes) {
+    const inName = rx.test(n.name);
+    const m = rx.exec(n.content);
+    let snippet = "";
+    if (m) {
+      const lo = Math.max(0, m.index - 40);
+      const hi = Math.min(n.content.length, Math.max(m.index + m[0].length, lo + 120));
+      snippet = n.content.slice(lo, hi).replace(/\s+/g, " ").trim();
+      snippet = (lo > 0 ? "…" : "") + snippet + (hi < n.content.length ? "…" : "");
+    }
+    if (inName || m) (inName ? byName : byBody).push({ path: n.path, name: n.name,
+      folder: n.path.includes("/") ? n.path.split("/")[0] : "(vault root)", snippet });
+  }
+  return byName.concat(byBody).slice(0, SEARCH_LIMIT);
+}
+
 // All data access goes through api(): live server (fetch) or the data embedded by --export.
 const EXPORT = window.__EXPORT__ || null;
 async function api(kind, arg) {
   if (EXPORT) {
     if (kind === "vault") return EXPORT.vault;
     if (kind === "graph") return EXPORT.graph;
+    if (kind === "search") return searchNotes(arg, Object.values(EXPORT.notes));
     const n = EXPORT.notes[arg];
     if (!n) throw new Error("Note not found");
     return n;
   }
   const url = kind === "vault" ? "/api/vault" : kind === "graph" ? "/api/graph"
+    : kind === "search" ? "/api/search?q=" + encodeURIComponent(arg)
     : "/api/note?path=" + encodeURIComponent(arg);
   const r = await fetch(url);
   if (!r.ok) throw new Error(r.statusText || ("HTTP " + r.status));
@@ -1336,16 +1403,12 @@ function renderTree() {
   const tree = document.getElementById("tree");
   if (!vault) return;
   tree.innerHTML = "";
-  const q = searchQ.toLowerCase();
 
   vault.folders.forEach(sec => {
-    let notes = sec.notes;
-    if (q) notes = notes.filter(n =>
-      n.name.toLowerCase().includes(q) || (n.summary||"").toLowerCase().includes(q));
-    if (q && !notes.length) return;
+    const notes = sec.notes;
 
     const fm = FM[sec.folder] || { bg:"#1a1a1a", fg:"#777", letter:"?" };
-    const open = q || expanded.has(sec.folder);
+    const open = expanded.has(sec.folder);
     const label = sec.folder.replace(/^\d+[-\s]+/, "");
 
     const el = document.createElement("div");
@@ -1517,7 +1580,7 @@ async function load() {
     const first = !vault;
     vault = await api("vault");
     noteIdx = null;
-    renderTree();
+    if (searchQ) runSearch(); else renderTree();
     if (first) routeFromHash();
   } catch(e) {
     document.getElementById("tree").innerHTML = `<div class="err">${esc(e.message)}</div>`;
@@ -1527,10 +1590,43 @@ async function load() {
 }
 
 // ── Events ────────────────────────────────────────────────────
+// ── Sidebar search: a result list replaces the tree while the box has a query ──
+let searchTimer = null, searchSeq = 0;
+function renderSearch(results) {
+  const tree = document.getElementById("tree");
+  tree.innerHTML = "";
+  if (!results.length) { tree.innerHTML = `<div class="loading">No results</div>`; return; }
+  results.forEach(r => {
+    const n = findNote(r.path) || {};
+    const el = document.createElement("div");
+    el.className = "ni sr" + (activeTab === r.path ? " active" : "");
+    el.dataset.path = r.path;
+    el.innerHTML =
+      `<span class="nd" style="background:${esc(tcol(n.type))}"></span>` +
+      `<span class="sr-main"><span class="nn">${esc(r.name)}</span>` +
+      `<span class="sr-folder">${esc(r.folder)}</span>` +
+      (r.snippet ? `<span class="sr-snip">${esc(r.snippet)}</span>` : "") + `</span>`;
+    el.addEventListener("click", () => openNote({
+      path: r.path, name: r.name, type: n.type || "", folder: r.folder }));
+    tree.appendChild(el);
+  });
+}
+async function runSearch() {
+  const seq = ++searchSeq, q = searchQ;
+  try {
+    const results = await api("search", q);
+    if (seq === searchSeq && searchQ === q) renderSearch(results);   // drop stale answers
+  } catch (e) {
+    if (seq === searchSeq)
+      document.getElementById("tree").innerHTML = `<div class="err">${esc(e.message)}</div>`;
+  }
+}
 document.getElementById("srch").addEventListener("input", e => {
   searchQ = e.target.value.trim();
-  if (searchQ) vault?.folders.forEach(s => expanded.add(s.folder));
-  renderTree();
+  clearTimeout(searchTimer);
+  searchSeq++;                                  // invalidate any search in flight
+  if (!searchQ) { renderTree(); return; }       // cleared: restore the tree
+  searchTimer = setTimeout(runSearch, 150);     // debounce
 });
 
 document.addEventListener("keydown", e => {
@@ -1976,6 +2072,11 @@ class VaultHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/api/graph":
             body = json.dumps(build_graph(), ensure_ascii=False).encode("utf-8")
+            self._respond(200, "application/json; charset=utf-8", body, cache=False)
+
+        elif parsed.path == "/api/search":
+            q = parse_qs(parsed.query).get("q", [""])[0]
+            body = json.dumps(search_notes(q, get_index().notes), ensure_ascii=False).encode("utf-8")
             self._respond(200, "application/json; charset=utf-8", body, cache=False)
 
         elif parsed.path == "/api/note":

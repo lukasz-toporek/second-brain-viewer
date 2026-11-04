@@ -20,6 +20,35 @@ import viewer  # noqa: E402
 VAULT = ROOT / "tests" / "fixtures" / "vault"
 
 
+NODE = shutil.which("node")
+
+
+def page_script(mode="offline") -> str:
+    return re.findall(r"<script>(.*?)</script>", viewer.render_page(mode), re.S)[-1]
+
+
+def run_page_js(snippet: str, mode="offline"):
+    """Run the page's note-resolution + Markdown-extension code (real vendored marked) under node.
+
+    The slice of the page script from safeUrl() to the wikilink click handler touches no DOM except
+    document.addEventListener, which is stubbed. `snippet` runs after it and prints JSON.
+    """
+    js = page_script(mode)
+    a = js.index("// Only http(s), mailto")
+    b = js.index("// delegated click handler for wikilinks")
+    prelude = (
+        "global.window = {}; global.document = {addEventListener(){}};\n"
+        f"global.marked = require({json.dumps(str(ROOT / 'vendor' / 'marked.min.js'))}).marked;\n"
+        "const FLAGS = {};\n")
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "t.js"
+        f.write_text(prelude + js[a:b] + "\n" + snippet, encoding="utf-8")
+        r = subprocess.run([NODE, str(f)], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise AssertionError(r.stderr)
+    return json.loads(r.stdout)
+
+
 class Server:
     def __init__(self, offline=False, vault=VAULT):
         viewer.init_config(vault)
@@ -203,6 +232,99 @@ class OfflineTests(unittest.TestCase):
             self.assertEqual(self.s.req("GET", bad)[0], 404, bad)
 
 
+def make_search_vault(root: Path) -> None:
+    (root / "Needle in name.md").write_text("# x\nnothing relevant here\n", encoding="utf-8")
+    (root / "Zażółć gęślą.md").write_text("body about ZAŻÓŁĆ\n", encoding="utf-8")
+    (root / "sub").mkdir()
+    (root / "sub" / "Body only.md").write_text(
+        "---\ntype: x\n---\n" + "pad " * 30 + "\nthe   NEEDLE\nis\there " + "tail " * 40 + "\n", encoding="utf-8")
+    (root / "sub" / "Regex.md").write_text("price is a.b (1+1) [x] \\ done\n", encoding="utf-8")
+    for i in range(60):                                     # many body-only matches for the limit
+        (root / f"bulk{i:02d}.md").write_text(f"filler {i} needle\n", encoding="utf-8")
+
+
+class SearchTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        make_search_vault(Path(cls.tmp.name))
+        cls.s = Server(vault=Path(cls.tmp.name))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.s.stop()
+        cls.tmp.cleanup()
+
+    def search(self, q):
+        from urllib.parse import quote
+        st, h, b = self.s.req("GET", "/api/search?q=" + quote(q))
+        self.assertEqual(st, 200)
+        self.assertIn("json", h["Content-Type"])
+        return json.loads(b)
+
+    def test_name_matches_first_then_body_and_limit(self):
+        r = self.search("needle")
+        self.assertEqual(len(r), 50)                                    # capped
+        self.assertEqual(r[0]["name"], "Needle in name")                # name match first...
+        self.assertEqual(r[0]["path"], "Needle in name.md")
+        self.assertEqual(r[0]["folder"], "(vault root)")
+        self.assertEqual(r[0]["snippet"], "")                           # ...no body hit -> no snippet
+        self.assertEqual([x["name"] for x in r[1:3]], ["bulk00", "bulk01"])   # then body, vault order
+        self.assertEqual(len({x["path"] for x in r}), 50)
+
+    def test_snippet_is_collapsed_window_around_first_body_match(self):
+        r = self.search("THE   needle\nis")[0]                         # raw (not collapsed) text matches
+        self.assertEqual(r["name"], "Body only")
+        self.assertEqual(r["folder"], "sub")
+        self.assertIn("the NEEDLE is here", r["snippet"])               # whitespace collapsed, case kept
+        self.assertTrue(r["snippet"].startswith("…") and r["snippet"].endswith("…"))
+        self.assertLessEqual(len(r["snippet"]), 122)
+        self.assertNotIn("\n", r["snippet"])
+
+    def test_case_insensitive_unicode_and_regex_chars_are_literal(self):
+        self.assertEqual([x["name"] for x in self.search("zażółć")][:1], ["Zażółć gęślą"])
+        self.assertEqual([x["name"] for x in self.search("a.b (1+1) [x] \\")], ["Regex"])
+        self.assertEqual(self.search("axb"), [])                        # '.' is not a wildcard
+
+    def test_short_or_blank_queries_return_empty(self):
+        for q in ("", " ", "n", " n ", "%20%20"):
+            self.assertEqual(self.search(q), [], repr(q))
+        self.assertEqual(self.s.req("GET", "/api/search")[0], 200)      # no q at all
+        self.assertEqual(len(self.search("ne")), 50)                    # 2 chars is enough
+
+    def test_host_guard(self):
+        for host in ("evil.example:%d" % self.s.port, "localhost", None):
+            self.assertEqual(self.s.req("GET", "/api/search?q=needle", host=host)[0], 403)
+
+
+@unittest.skipUnless(NODE, "node not available")
+class SearchParityTests(unittest.TestCase):
+    """The export's client-side searchNotes() must return exactly what /api/search returns."""
+
+    def test_js_matches_python(self):
+        with tempfile.TemporaryDirectory() as d:
+            make_search_vault(Path(d))
+            viewer.init_config(Path(d))
+            idx = viewer.VaultIndex()
+        notes = [{"path": n["path"], "name": n["name"], "content": n["text"]} for n in idx.notes]
+        queries = ["needle", "NEEDLE", "zażółć", "a.b (1+1) [x] \\", "axb", "n", "", " ", "ne", "tail", "pad", "the   needle",
+                   "😀"]
+        js = run_page_js(f"console.log(JSON.stringify({json.dumps(queries)}.map(q => searchNotes(q, {json.dumps(notes)}))));")
+        for q, got in zip(queries, js):
+            self.assertEqual(got, viewer.search_notes(q, idx.notes), repr(q))
+        viewer.init_config(VAULT)
+
+    def test_fixture_vault(self):
+        viewer.init_config(VAULT)
+        idx = viewer.VaultIndex()
+        notes = [{"path": n["path"], "name": n["name"], "content": n["text"]} for n in idx.notes]
+        queries = ["alpha", "beta", "link", "[[", "overdue", "Target Heading"]
+        js = run_page_js(f"console.log(JSON.stringify({json.dumps(queries)}.map(q => searchNotes(q, {json.dumps(notes)}))));")
+        for q, got in zip(queries, js):
+            self.assertEqual(got, viewer.search_notes(q, idx.notes), repr(q))
+            self.assertTrue(got, q)
+
+
 class GraphXssTests(unittest.TestCase):
     NAME = "<img src=x onerror=alert(1)>"
 
@@ -231,6 +353,16 @@ class GraphXssTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_export_has_client_side_search(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "out.html"
+            subprocess.run([sys.executable, str(ROOT / "viewer.py"), "--vault", str(VAULT), "--export", str(out)],
+                           check=True, capture_output=True)
+            html = out.read_text(encoding="utf-8")
+        self.assertIn("function searchNotes(", html)
+        self.assertIn('kind === "search") return searchNotes(arg, Object.values(EXPORT.notes))', html)
+        self.assertIn("/api/search?q=", html)                  # live mode still calls the server
+
     def test_export(self):
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "out.html"
@@ -284,35 +416,6 @@ class CliTests(unittest.TestCase):
             f.write_text(js, encoding="utf-8")
             r = subprocess.run([node, "--check", str(f)], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-
-
-NODE = shutil.which("node")
-
-
-def page_script(mode="offline") -> str:
-    return re.findall(r"<script>(.*?)</script>", viewer.render_page(mode), re.S)[-1]
-
-
-def run_page_js(snippet: str, mode="offline"):
-    """Run the page's note-resolution + Markdown-extension code (real vendored marked) under node.
-
-    The slice of the page script from safeUrl() to the wikilink click handler touches no DOM except
-    document.addEventListener, which is stubbed. `snippet` runs after it and prints JSON.
-    """
-    js = page_script(mode)
-    a = js.index("// Only http(s), mailto")
-    b = js.index("// delegated click handler for wikilinks")
-    prelude = (
-        "global.window = {}; global.document = {addEventListener(){}};\n"
-        f"global.marked = require({json.dumps(str(ROOT / 'vendor' / 'marked.min.js'))}).marked;\n"
-        "const FLAGS = {};\n")
-    with tempfile.TemporaryDirectory() as d:
-        f = Path(d) / "t.js"
-        f.write_text(prelude + js[a:b] + "\n" + snippet, encoding="utf-8")
-        r = subprocess.run([NODE, str(f)], capture_output=True, text=True, timeout=30)
-    if r.returncode != 0:
-        raise AssertionError(r.stderr)
-    return json.loads(r.stdout)
 
 
 @unittest.skipUnless(NODE, "node not available")

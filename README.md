@@ -4,7 +4,7 @@ A lightweight local viewer for Markdown knowledge bases. Zero dependencies — P
 
 ## Features
 
-- **File tree** sidebar with folder grouping and search
+- **File tree** sidebar with folder grouping and **full-text search** (see below)
 - **Note rendering** with Markdown and frontmatter chips
 - **Wikilink graph** (force-directed, powered by [force-graph](https://github.com/vasturiano/force-graph))
 - **Chat** with your vault via Claude, Anthropic API, or any OpenAI-compatible backend (Ollama etc.)
@@ -62,6 +62,17 @@ python3 tools/fetch-vendor.py --print-hashes  # print hashes when bumping versio
 ```
 
 If `vendor/` is missing, `--offline` and `--export` stop with an error pointing to this script.
+
+### Full-text search
+
+Typing in the sidebar search box (`/` focuses it) searches the **names and full text** of all notes
+(case-insensitive substring, at least 2 characters, debounced ~150 ms) and replaces the tree with a result
+list: name, folder and a snippet of ~120 characters around the first match. Clearing the box restores the tree.
+
+The same search is available as `GET /api/search?q=<text>` → `[{"path", "name", "folder", "snippet"}, …]`:
+name matches first, then body-only matches, at most 50, an empty list for queries shorter than 2 characters.
+It is covered by the same `Host` check as the other endpoints. In an exported file (`--export`) the identical
+search runs client-side over the embedded notes.
 
 ### Static export
 
