@@ -11,7 +11,7 @@ A lightweight local viewer for Markdown knowledge bases. Zero dependencies — P
 - **Live reload** — file watcher auto-refreshes the browser on vault changes
 - **Relative Markdown links** — `[text](../dir/Other%20note.md#Heading)` open the note like a wikilink (resolved against the current note's folder)
 - **Attachments** — `![](pic.png)`, `![[pic.png]]`, `[doc](files/spec.pdf)` show vault images and link PDFs (see below)
-- **Obsidian syntax** — `[[wikilinks]]` (`[[A|alias]]`, `[[dir/A]]`, `[[A#Heading|x]]`), `> [!note]` callouts, a "Linked from" backlinks section
+- **Obsidian syntax** — `[[wikilinks]]` (`[[A|alias]]`, `[[dir/A]]`, `[[A#Heading|x]]`), `> [!note]` callouts (foldable with `-` / `+`), `![[Note]]` embeds, a "Linked from" backlinks section
 - **Dataview inline fields** — `[state:: …] [due:: …] [link:: …]` render as chips; open tasks past their `due` date are marked overdue
 - **Mobile layout** — below 580 px a ☰ button at the left of the tab row opens the sidebar as an overlay with a backdrop (closes when a note opens, on Escape, or on a backdrop click)
 - **Deep links** — `#<note path>` in the URL; Back/Forward work
@@ -76,6 +76,18 @@ The same search is available as `GET /api/search?q=<text>` → `[{"path", "name"
 name matches first, then body-only matches, at most 50, an empty list for queries shorter than 2 characters.
 It is covered by the same `Host` check as the other endpoints. In an exported file (`--export`) the identical
 search runs client-side over the embedded notes.
+
+### Embeds and foldable callouts
+
+- `![[Note]]`, `![[Note#Heading]]` and `![[Note|label]]` render the target note's body inline in a bordered box whose
+  header link opens the note. With `#Heading` only that section is shown (from the heading to the next heading of the
+  same or a higher level). The target's frontmatter is left out. Embeds load after the note itself is shown, through
+  the same data layer as everything else, so they also work in an export; relative links and attachments inside an
+  embed resolve against the *embedded* note's folder.
+- Nesting is limited to 2 levels; a note embedding itself or an A → B → A loop shows a "circular embed" placeholder
+  (a third level shows "embed nesting limit reached"). A missing note or heading shows the dashed "missing" placeholder.
+  `![[pic.png]]` / `![[a.pdf]]` are attachments (see below), not embeds.
+- `> [!tip]- Title` renders collapsed and `> [!tip]+ Title` open (a `<details>` element); `> [!tip] Title` is unchanged.
 
 ### Attachments: `/api/file`
 

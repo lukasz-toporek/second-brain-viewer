@@ -929,6 +929,8 @@ body {
   margin: 0 0 14px;
 }
 .callout-title { font-weight: 600; color: var(--co); margin-bottom: 2px; }
+details.callout > summary.callout-title { cursor: pointer; }
+details.callout:not([open]) > summary.callout-title { margin-bottom: 0; }
 .callout-body { color: var(--tx); }
 .callout-body > :last-child { margin-bottom: 0; }
 .c-info, .c-note, .c-todo { --co: #5b9bd5; }
@@ -939,6 +941,14 @@ body {
 .c-question, .c-help, .c-faq { --co: #9b8bdb; }
 .c-example { --co: #b07ad0; }
 .c-quote, .c-cite { --co: #888; }
+
+/* note embeds */
+.md .embed { display: block; border-left: 3px solid var(--ac); background: var(--sh); border-radius: 0 6px 6px 0;
+  padding: 8px 14px; margin: 0 0 14px; }
+.md .embed-hd { display: block; font-size: 11px; margin-bottom: 6px; }
+.md .embed-body { display: block; }
+.md .embed-body > :last-child { margin-bottom: 0; }
+.md .embed-loading { color: var(--tx2); font-size: 12px; }
 
 /* dataview inline fields */
 .dv {
@@ -1358,6 +1368,9 @@ function resolveNote(target, pathOnly) {
 // Path of the note currently being rendered; showNote() sets it before marked.parse (chat bubbles
 // use the active note).
 let currentNotePath = "";
+// Note embeds (![[Note]]) only become .embed boxes while a note is being rendered by showNote() or
+// by an embed itself; anywhere else (chat bubbles, plug-ins) they degrade to a plain link.
+let embedsOn = false;
 // Vault-relative path a scheme-less, non-# link points to, resolved against the folder of `base`
 // (. and .. normalised, never above the vault root); null if it is not a link ending in `ext`
 // (default: .md notes; the attachment code passes ATT_EXT).
@@ -1436,6 +1449,10 @@ if (typeof marked !== "undefined") {
         const label = tok.label || (tok.heading ? `${tok.target} › ${tok.heading}` : tok.target);
         const n = resolveNote(tok.target);
         if (!n) return `<span class="wl missing" title="Note not found">${esc(label)}</span>`;
+        if (tok.embed && embedsOn)         // ![[Note]], ![[Note#Heading]], ![[Note|label]]: filled by hydrateEmbeds()
+          return `<span class="embed" data-embed-path="${esc(n.path)}" data-embed-heading="${esc(tok.heading)}">` +
+            `<span class="embed-hd"><a class="wl" href="#" data-path="${esc(n.path)}">${esc(label)}</a></span>` +
+            `<span class="embed-body"><span class="embed-loading">Loading…</span></span></span>`;
         return `<a class="wl" href="#" data-path="${esc(n.path)}">${esc(label)}</a>`;
       },
     }],
@@ -1470,13 +1487,16 @@ if (typeof marked !== "undefined") {
         return `<img src="${esc(u)}" alt="${esc(text)}"${title ? ` title="${esc(title)}"` : ""}>`;
       },
       blockquote(quote) {
-        const m = /^\s*<p>\[!([A-Za-z][\w-]*)\][+-]?[ \t]*([^\n]*?)(?:\n([\s\S]*?))?<\/p>([\s\S]*)$/.exec(quote);
+        const m = /^\s*<p>\[!([A-Za-z][\w-]*)\]([+-]?)[ \t]*([^\n]*?)(?:\n([\s\S]*?))?<\/p>([\s\S]*)$/.exec(quote);
         if (!m) return false;
         const type = m[1].toLowerCase();
-        const title = m[2].trim() || type.charAt(0).toUpperCase() + type.slice(1);
-        const body = (m[3] ? `<p>${m[3]}</p>` : "") + m[4];
-        return `<div class="callout c-${type}"><div class="callout-title">${title}</div>` +
-          (body.trim() ? `<div class="callout-body">${body}</div>` : "") + `</div>\n`;
+        const title = m[3].trim() || type.charAt(0).toUpperCase() + type.slice(1);
+        const body = (m[4] ? `<p>${m[4]}</p>` : "") + m[5];
+        const inner = body.trim() ? `<div class="callout-body">${body}</div>` : "";
+        if (m[2])        // [!type]- collapsed, [!type]+ open
+          return `<details class="callout c-${type}"${m[2] === "+" ? " open" : ""}>` +
+            `<summary class="callout-title">${title}</summary>${inner}</details>\n`;
+        return `<div class="callout c-${type}"><div class="callout-title">${title}</div>${inner}</div>\n`;
       },
     },
   });
@@ -1533,6 +1553,71 @@ if (typeof marked !== "undefined") {
       },
     },
   });
+}
+
+// ── Note embeds: ![[Note]] / ![[Note#Heading]] ──
+const EMBED_MAX_DEPTH = 2;      // an embed inside an embed is fine; a third level is not
+// Frontmatter block (if any) removed from a note's text.
+function stripFrontmatter(text) {
+  return String(text ?? "").replace(/^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/, "");
+}
+// The section of `md` under the heading named `heading` (case-insensitive, emphasis ignored): from the
+// heading line to the next heading of the same or a higher level. Headings in fenced code blocks are
+// ignored. null when there is no such heading.
+function extractSection(md, heading) {
+  const norm = s => String(s).toLowerCase().replace(/[*_`]/g, "").replace(/\s+/g, " ").trim();
+  const want = norm(heading), lines = String(md ?? "").split(/\r?\n/);
+  let fence = null, start = -1, level = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const f = /^ {0,3}(`{3,}|~{3,})/.exec(lines[i]);
+    if (f) { if (!fence) fence = f[1][0]; else if (f[1][0] === fence) fence = null; continue; }
+    if (fence) continue;
+    const m = /^ {0,3}(#{1,6})[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$/.exec(lines[i]);
+    if (!m) continue;
+    if (start < 0) { if (norm(m[2]) === want) { start = i; level = m[1].length; } }
+    else if (m[1].length <= level) return lines.slice(start, i).join("\n");
+  }
+  return start < 0 ? null : lines.slice(start).join("\n");
+}
+// May `path` be embedded inside the notes in `chain` (the host note first, then each enclosing embed)?
+function embedVerdict(chain, path) {
+  if (chain.includes(path)) return "circular";
+  if (chain.length > EMBED_MAX_DEPTH) return "depth";
+  return "ok";
+}
+const EMBED_NOTE = {
+  circular: "↻ circular embed", depth: "embed nesting limit reached",
+};
+// Fills the .embed boxes under `root` (not yet filled), recursively. Never throws.
+async function hydrateEmbeds(root, chain) {
+  const boxes = [...root.querySelectorAll(".embed[data-embed-path]")].filter(el => !el.dataset.done);
+  await Promise.all(boxes.map(el => fillEmbed(el, chain)));
+}
+async function fillEmbed(el, chain) {
+  el.dataset.done = "1";
+  const path = el.dataset.embedPath, heading = el.dataset.embedHeading || "";
+  const name = path.split("/").pop().replace(/\.md$/i, "");
+  const verdict = embedVerdict(chain, path);
+  if (verdict !== "ok") {
+    el.innerHTML = `<span class="wl missing" title="${esc(EMBED_NOTE[verdict])}">${esc(EMBED_NOTE[verdict])}: ${esc(name)}</span>`;
+    return;
+  }
+  const body = el.querySelector(".embed-body");
+  try {
+    const data = await api("note", path);
+    let md = stripFrontmatter(data.content);
+    if (heading) {
+      const sec = extractSection(md, heading);
+      if (sec === null) { body.innerHTML = `<span class="wl missing" title="Section not found">${esc(name)} › ${esc(heading)}</span>`; return; }
+      md = sec;
+    }
+    const prevPath = currentNotePath, prevOn = embedsOn;
+    currentNotePath = path; embedsOn = true;       // relative links and attachments resolve against the embedded note
+    try { body.innerHTML = marked.parse(md); } finally { currentNotePath = prevPath; embedsOn = prevOn; }
+    await hydrateEmbeds(body, chain.concat(path));
+  } catch (e) {
+    body.innerHTML = `<span class="wl missing">${esc(e && e.message || "embed failed")}</span>`;
+  }
 }
 
 // delegated click handler for wikilinks (content, backlinks, chat bubbles)
@@ -1708,7 +1793,8 @@ function showNote(data) {
   let html = "";
   if (typeof marked !== "undefined") {
     currentNotePath = data.path;
-    html = marked.parse(raw);
+    embedsOn = true;
+    try { html = marked.parse(raw); } finally { embedsOn = false; }
   } else {
     html = `<pre style="white-space:pre-wrap;font-family:inherit">${esc(raw)}</pre>`;
   }
@@ -1716,6 +1802,7 @@ function showNote(data) {
   document.getElementById("content").innerHTML =
     `<div class="note-body">${bc}${chips}<div class="md">${html}</div>${backlinksHtml(data.backlinks)}</div>`;
 
+  if (typeof marked !== "undefined") hydrateEmbeds(document.getElementById("content"), [data.path]);
   setChatContext(data.name, data.content);
 }
 

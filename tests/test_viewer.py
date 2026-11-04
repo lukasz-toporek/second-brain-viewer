@@ -633,6 +633,147 @@ class AttachmentExportCliTests(unittest.TestCase):
         self.assertNotRegex(html, r'<script[^>]+src=')
 
 
+FAKE_DOM = r"""
+class El {
+  constructor() { this.dataset = {}; this._html = ""; this.kids = []; this.body = null; }
+  set innerHTML(h) {
+    this._html = h; this.kids = [];
+    const re = /<span class="embed" data-embed-path="([^"]*)" data-embed-heading="([^"]*)">/g; let m;
+    while ((m = re.exec(h))) { const e = new El(); e.dataset.embedPath = m[1]; e.dataset.embedHeading = m[2]; e.body = new El(); this.kids.push(e); }
+  }
+  get innerHTML() { return this._html; }
+  querySelectorAll() { return this.kids; }
+  querySelector() { return this.body; }
+}
+"""
+
+
+@unittest.skipUnless(NODE, "node not available")
+class EmbedTests(unittest.TestCase):
+    NOTES = {
+        "A.md": "---\ntype: x\n---\n# A\n\nA body\n\n![[B]]\n\n![[A]]\n",
+        "B.md": "# B\n\nB body\n\n## Part\n\nB part text\n\n### Sub\n\nB sub text\n\n## Other\n\nB other\n\n![[A]]\n\n![[C]]\n",
+        "C.md": "# C\n\nC body ![[D]]\n",
+        "D.md": "# D\n\nD body\n",
+        "S.md": "# S\n\n![[S]]\n",
+        "sub/E.md": "---\ntitle: skip me\n---\n# E\n\n![](pic.png)\n",
+        "H.md": "![[B#Part]] and ![[B#nope]] and ![[Zzz]] and ![[sub/E|label]]\n",
+    }
+
+    def run_js(self, snippet):
+        notes = {p: {"path": p, "name": p.split("/")[-1][:-3], "content": c, "backlinks": []}
+                 for p, c in self.NOTES.items()}
+        vault = {"folders": [{"folder": "x", "notes": [{"path": p, "name": n["name"], "type": ""} for p, n in notes.items()]}],
+                 "stems": {n["name"].lower(): p for p, n in notes.items()},
+                 "files": {"pic.png": "sub/pic.png"}, "file_paths": ["sub/pic.png"]}
+        return run_page_js(f"vault = {json.dumps(vault)};\n{FAKE_DOM}\n{snippet}", export_data={"notes": notes, "attachments": {"sub/pic.png": "data:image/png;base64,AAAA"}})
+
+    def test_section_extraction(self):
+        r = self.run_js(r"""
+          const md = "intro\n# Top\n\ntext\n## A\na1\n### A.1\nsub\n## B\nb1\n```\n## not a heading\n```\n# Next\nn";
+          console.log(JSON.stringify([extractSection(md, "A"), extractSection(md, "a.1"), extractSection(md, "B"),
+            extractSection(md, "Top"), extractSection(md, "Missing"), extractSection(md, "**A**"),
+            extractSection("## X\r\nx\r\n## Y\r\ny", "X")]));""")
+        self.assertEqual(r[0], "## A\na1\n### A.1\nsub")          # up to the next heading of the same level
+        self.assertEqual(r[1], "### A.1\nsub")                      # up to a higher level
+        self.assertEqual(r[2], "## B\nb1\n```\n## not a heading\n```")   # fenced "heading" ignored
+        self.assertEqual(r[3], "# Top\n\ntext\n## A\na1\n### A.1\nsub\n## B\nb1\n```\n## not a heading\n```")
+        self.assertIsNone(r[4])
+        self.assertEqual(r[5], r[0])
+        self.assertEqual(r[6], "## X\nx")
+
+    def test_frontmatter_stripped(self):
+        r = self.run_js(r"""console.log(JSON.stringify([stripFrontmatter("---\na: 1\n---\nbody"),
+          stripFrontmatter("---\r\na: 1\r\n---\r\nbody"), stripFrontmatter("no fm\n---\nx"), stripFrontmatter("---\nunclosed")]));""")
+        self.assertEqual(r, ["body", "body", "no fm\n---\nx", "---\nunclosed"])
+
+    def test_verdicts(self):
+        r = self.run_js("""console.log(JSON.stringify([embedVerdict(["A"], "A"), embedVerdict(["A", "B"], "A"),
+          embedVerdict(["A"], "B"), embedVerdict(["A", "B"], "C"), embedVerdict(["A", "B", "C"], "D")]));""")
+        self.assertEqual(r, ["circular", "circular", "ok", "ok", "depth"])
+
+    def test_embed_flow_cycles_and_depth(self):
+        r = self.run_js(r"""
+          currentNotePath = "A.md"; embedsOn = true;
+          const root = new El(); root.innerHTML = marked.parse(stripFrontmatter(EXPORT.notes["A.md"].content)); embedsOn = false;
+          hydrateEmbeds(root, ["A.md"]).then(() => {
+            const [b, selfA] = root.kids, [bA, bC] = b.body.kids, [cD] = bC.body.kids;
+            console.log(JSON.stringify({ host: currentNotePath, on: embedsOn,
+              b: b.body.innerHTML.includes("B body"), selfA: selfA.innerHTML, bA: bA.innerHTML,
+              c: bC.body.innerHTML.includes("C body"), cD: cD.innerHTML }));
+          });""")
+        self.assertEqual(r["host"], "A.md")                           # outer state restored
+        self.assertFalse(r["on"])
+        self.assertTrue(r["b"])
+        self.assertIn("circular embed", r["selfA"])                   # A embeds itself
+        self.assertIn("circular embed", r["bA"])                      # A -> B -> A
+        self.assertTrue(r["c"])
+        self.assertIn("nesting limit", r["cD"])                       # A -> B -> C -> D is one level too deep
+
+    def test_self_embed_terminates(self):
+        r = self.run_js(r"""
+          currentNotePath = "S.md"; embedsOn = true;
+          const root = new El(); root.innerHTML = marked.parse(EXPORT.notes["S.md"].content); embedsOn = false;
+          hydrateEmbeds(root, ["S.md"]).then(() => console.log(JSON.stringify(root.kids[0].innerHTML)));""")
+        self.assertIn("circular embed", r)
+
+    def test_heading_missing_target_and_relative_context(self):
+        r = self.run_js(r"""
+          currentNotePath = "H.md"; embedsOn = true;
+          const root = new El(); root.innerHTML = marked.parse(EXPORT.notes["H.md"].content); embedsOn = false;
+          const html = root._html;
+          hydrateEmbeds(root, ["H.md"]).then(() => console.log(JSON.stringify({ html,
+            part: root.kids[0].body.innerHTML, nope: root.kids[1].body.innerHTML, e: root.kids[2].body.innerHTML, n: root.kids.length })));""")
+        self.assertEqual(r["n"], 3)                                   # ![[Zzz]] is not an embed box
+        self.assertIn("wl missing", r["html"])                        # ...it is the usual missing-note placeholder
+        self.assertIn("B part text", r["part"])
+        self.assertIn("B sub text", r["part"])                        # deeper heading stays in the section
+        self.assertNotIn("B other", r["part"])
+        self.assertNotIn("B body", r["part"])
+        self.assertIn("Section not found", r["nope"])
+        self.assertIn('src="data:image/png;base64,AAAA"', r["e"])    # resolved against sub/E.md, not H.md
+        self.assertNotIn("skip me", r["e"])                           # frontmatter left out
+        self.assertIn('>label</a>', r["html"])
+
+    def test_embed_markup_and_plain_link_fallback(self):
+        r = self.run_js(r"""
+          currentNotePath = "H.md";
+          const off = marked.parse("![[B#Part|x <b>y</b>]]"); embedsOn = true;
+          const on = marked.parse("![[B#Part|x <b>y</b>]]"); embedsOn = false;
+          console.log(JSON.stringify({ off, on }));""")
+        self.assertNotIn("embed", r["off"])                           # chat bubbles etc.: just a link
+        self.assertIn('class="embed" data-embed-path="B.md" data-embed-heading="Part"', r["on"])
+        self.assertIn('data-path="B.md">x &lt;b&gt;y&lt;/b&gt;</a>', r["on"])
+
+    def test_page_wires_hydration_after_render(self):
+        js = page_script("offline")
+        self.assertRegex(js, r'innerHTML =\s*\n\s*`<div class="note-body">[^\n]*\n\n\s*if \(typeof marked !== "undefined"\) hydrateEmbeds\(')
+        self.assertIn("embedsOn = false", js)
+
+
+@unittest.skipUnless(NODE, "node not available")
+class CalloutTests(unittest.TestCase):
+    def render(self, md):
+        return run_page_js(f"console.log(JSON.stringify(marked.parse({json.dumps(md)})));")
+
+    def test_foldable_callouts(self):
+        closed = self.render("> [!tip]- Hidden **bold**\n> secret body")
+        self.assertIn('<details class="callout c-tip"><summary class="callout-title">Hidden <strong>bold</strong></summary>', closed)
+        self.assertIn('<div class="callout-body"><p>secret body</p>', closed)
+        self.assertNotIn(" open", closed.split(">")[0] + closed.split(">")[1][:20])
+        opened = self.render("> [!warning]+ Shown\n> body")
+        self.assertTrue(opened.startswith('<details class="callout c-warning" open><summary class="callout-title">Shown</summary>'))
+        untitled = self.render("> [!note]-\n> x")
+        self.assertIn(">Note</summary>", untitled)
+
+    def test_plain_callouts_unchanged(self):
+        self.assertEqual(self.render("> [!note] A Note\n> body"),
+                         '<div class="callout c-note"><div class="callout-title">A Note</div>'
+                         '<div class="callout-body"><p>body</p>\n</div></div>\n')
+        self.assertNotIn("<details", self.render("> [!warning]\n> No title given."))
+        self.assertNotIn("callout", self.render("> Just a plain blockquote."))
+
+
 class GraphXssTests(unittest.TestCase):
     NAME = "<img src=x onerror=alert(1)>"
 
