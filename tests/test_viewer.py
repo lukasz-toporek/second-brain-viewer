@@ -158,7 +158,7 @@ class OnlineTests(unittest.TestCase):
     def test_backlinks(self):
         _, _, b = self.note("10-knowledge/Beta.md")
         names = {x["name"] for x in json.loads(b)["backlinks"]}
-        self.assertEqual(names, {"Alpha", "Gamma", "Home"})   # Gamma via path form too
+        self.assertEqual(names, {"Alpha", "Gamma", "Home", "Links"})   # Gamma via path form too; Links via a Markdown link
         _, _, b = self.note("20-projects/Tasks.md")
         names = {x["name"] for x in json.loads(b)["backlinks"]}
         self.assertEqual(names, {"Gamma", "Home"})            # Gamma: frontmatter-only link
@@ -1553,7 +1553,7 @@ class CliTests(unittest.TestCase):
         payload = json.loads(data.replace("<\\/", "</").replace("<\\u0021--", "<!--"))
         self.assertEqual(len(payload["notes"]), 9)
         self.assertEqual({b["name"] for b in payload["notes"]["10-knowledge/Beta.md"]["backlinks"]},
-                         {"Alpha", "Gamma", "Home"})
+                         {"Alpha", "Gamma", "Home", "Links"})        # Links: a Markdown link
         self.assertNotIn("SECRET", html)
 
     def test_offline_without_vendor_fails_clearly(self):
