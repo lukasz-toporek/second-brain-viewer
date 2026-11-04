@@ -129,11 +129,23 @@ Place a `viewer.json` in the vault root (or any parent directory — the viewer 
     "daily": "#5b9bd5",
     "meta":  "#888"
   },
+  "link_deprioritise": ["90-meta/Szablony", "_Archive"],
   "system_prompt": "You are a knowledge base assistant. Answer concisely."
 }
 ```
 
 A template config is included at `viewer.json` in this repo.
+
+### Name clashes: `link_deprioritise`
+
+When two notes share a name (say `Weekly.md` in a real folder and in `Templates/`), `[[Weekly]]` used to resolve to
+whichever sorts first. List vault-relative folder prefixes in the optional `"link_deprioritise"` key (default `[]`,
+which keeps that behaviour) and a note **outside** those folders wins over one inside them; otherwise the order is
+unchanged. Prefixes match whole folder names, case-insensitively (`"Templates"` also covers `Templates/Sub/X.md`).
+Path-style links (`[[Templates/Weekly]]`) still reach the deprioritised note.
+
+The server decides: `/api/vault` (and the export) carries the final `name → path` map as `"stems"`, and graph edges,
+backlinks and the page's link resolution all use it, so they always agree.
 
 ## Chat / AI backend
 

@@ -325,6 +325,95 @@ class SearchParityTests(unittest.TestCase):
             self.assertTrue(got, q)
 
 
+def make_clash_vault(root: Path, deprioritise=None) -> None:
+    """`Weekly` exists in Archive/ (sorts first) and Journal/; Linker.md links [[Weekly]] and [[archive/weekly]]."""
+    (root / "Archive").mkdir()
+    (root / "Journal").mkdir()
+    (root / "Archive" / "Weekly.md").write_text("# old\n", encoding="utf-8")
+    (root / "Journal" / "Weekly.md").write_text("# real\n", encoding="utf-8")
+    (root / "Linker.md").write_text("see [[Weekly]] and [[archive/weekly]]\n", encoding="utf-8")
+    if deprioritise is not None:
+        (root / ".viewer.json").write_text(json.dumps({"link_deprioritise": deprioritise}), encoding="utf-8")
+
+
+class LinkDeprioritiseTests(unittest.TestCase):
+    def snapshot(self, deprioritise):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            make_clash_vault(root, deprioritise)
+            s = Server(vault=root)
+            try:
+                vault = json.loads(s.req("GET", "/api/vault")[2])
+                graph = json.loads(s.req("GET", "/api/graph")[2])
+                back = {p: [b["path"] for b in json.loads(s.req("GET", "/api/note?path=" + p)[2])["backlinks"]]
+                        for p in ("Journal/Weekly.md", "Archive/Weekly.md")}
+            finally:
+                s.stop()
+        edges = sorted((e["source"], e["target"]) for e in graph["edges"])
+        return vault, edges, back
+
+    def test_default_keeps_current_order(self):
+        vault, edges, back = self.snapshot(None)
+        self.assertEqual(vault["stems"]["weekly"], "Archive/Weekly.md")        # first in vault order
+        self.assertEqual(edges, [("Linker.md", "Archive/Weekly.md")])         # [[Weekly]] and the explicit path
+        self.assertEqual(back, {"Journal/Weekly.md": [], "Archive/Weekly.md": ["Linker.md"]})
+
+    def test_empty_list_is_default(self):
+        self.assertEqual(self.snapshot([])[1:], self.snapshot(None)[1:])
+
+    def test_deprioritised_folder_loses_name_clash(self):
+        vault, edges, back = self.snapshot(["Archive"])
+        self.assertEqual(vault["stems"]["weekly"], "Journal/Weekly.md")
+        self.assertEqual(sorted(vault["stems"]), ["linker", "weekly"])
+        self.assertEqual(edges, [("Linker.md", "Archive/Weekly.md"), ("Linker.md", "Journal/Weekly.md")])
+        # the explicit path form still reaches the deprioritised note
+        self.assertEqual(back, {"Journal/Weekly.md": ["Linker.md"], "Archive/Weekly.md": ["Linker.md"]})
+
+    def test_prefix_matching(self):
+        for prefix in ("archive", "Archive/", "/Archive"):                  # case/slashes forgiven
+            self.assertEqual(self.snapshot([prefix])[0]["stems"]["weekly"], "Journal/Weekly.md", prefix)
+        self.assertEqual(self.snapshot(["Arch"])[0]["stems"]["weekly"], "Archive/Weekly.md")  # whole folder names only
+
+    def test_all_clashing_notes_deprioritised_keeps_order(self):
+        self.assertEqual(self.snapshot(["Archive", ""])[0]["stems"]["weekly"], "Journal/Weekly.md")
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for f in ("A", "B"):
+                (root / f).mkdir()
+                (root / f / "X.md").write_text("x", encoding="utf-8")
+            (root / ".viewer.json").write_text('{"link_deprioritise": ["A", "B"]}', encoding="utf-8")
+            viewer.init_config(root)
+            self.assertEqual(viewer.VaultIndex().by_stem["x"], "A/X.md")
+        viewer.init_config(VAULT)
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_frontend_uses_server_stems(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            make_clash_vault(root, ["Archive"])
+            viewer.init_config(root)
+            payload = json.dumps(viewer.vault_payload())
+        viewer.init_config(VAULT)
+        r = run_page_js(
+            f"vault = {payload};"
+            "const g = t => { const n = resolveNote(t); return n && n.path; };"
+            "console.log(JSON.stringify([g('Weekly'), g('weekly'), g('Archive/Weekly'), g('archive/weekly.md'),"
+            " g('toString'), g('__proto__'), g('constructor'), g('nope')]));")
+        self.assertEqual(r, ["Journal/Weekly.md", "Journal/Weekly.md", "Archive/Weekly.md", "Archive/Weekly.md",
+                             None, None, None, None])
+
+    def test_export_contains_stems(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "v"
+            root.mkdir()
+            make_clash_vault(root, ["Archive"])
+            out = Path(d) / "out.html"
+            subprocess.run([sys.executable, str(ROOT / "viewer.py"), "--vault", str(root), "--export", str(out)],
+                           check=True, capture_output=True)
+            data = re.search(r"window\.__EXPORT__ = (.*?);</script>", out.read_text(encoding="utf-8"), re.S).group(1)
+        self.assertEqual(json.loads(data.replace("<\\/", "</"))["vault"]["stems"]["weekly"], "Journal/Weekly.md")
+
+
 class GraphXssTests(unittest.TestCase):
     NAME = "<img src=x onerror=alert(1)>"
 

@@ -20,6 +20,7 @@
     "index":   "#888",
     "home":    "#e07050"
   },
+  "link_deprioritise": ["90-meta/Szablony", "_Archive"],
   "system_prompt": "You are a knowledge base assistant. Answer concisely.",
   "lint": {
     "valid_types": ["home", "index", "wiedza", "projekt", "daily", "kurs", "rozmowa", "meta"],

@@ -48,6 +48,7 @@ def load_config(vault_path: Path) -> dict:
         "skip_files": ["README.md", "_index.md"],
         "folder_order": [],
         "folders": {},
+        "link_deprioritise": [],
         "types": {"daily": "#5b9bd5", "meta": "#888", "index": "#888"},
         "system_prompt": "You are a knowledge base assistant. Answer concisely.",
     }
@@ -275,17 +276,29 @@ def extract_wikilinks(text: str) -> list[str]:
     return out
 
 
+def link_deprioritise_prefixes() -> list:
+    """Lower-cased vault-relative folder prefixes from the optional "link_deprioritise" config key."""
+    raw = CONFIG.get("link_deprioritise") or []
+    if not isinstance(raw, list):
+        return []
+    return [p.strip().strip("/").replace("\\", "/").lower() for p in raw if isinstance(p, str) and p.strip().strip("/")]
+
+
 class VaultIndex:
     """All notes plus link resolution shared by the graph, backlinks and the export.
 
     A link target resolves (case-insensitively) to a vault-relative path with or without
-    ``.md``, or to a bare note name. The browser's ``resolveNote()`` mirrors this logic.
+    ``.md``, or to a bare note name. For bare names the server is the single source of truth:
+    ``by_stem`` ("stems" in /api/vault and the export) is the final ``name -> path`` map and the
+    browser's ``resolveNote()`` only looks names up in it. When several notes share a name, the first
+    in vault order wins, except that a note outside the ``link_deprioritise`` folders beats one inside.
     """
 
     def __init__(self) -> None:
         self.notes: list[dict] = []          # {path, name, type, folder, text}
         self.by_path: dict[str, str] = {}
         self.by_stem: dict[str, str] = {}
+        self.deprioritised = link_deprioritise_prefixes()
         for path in sorted(VAULT.rglob("*.md")):
             if skip(path):
                 continue
@@ -299,7 +312,10 @@ class VaultIndex:
             low = rel.lower()
             self.by_path[low] = rel
             self.by_path[low[:-3]] = rel
-            self.by_stem.setdefault(path.stem.lower(), rel)
+            stem = path.stem.lower()
+            cur = self.by_stem.get(stem)
+            if cur is None or (self.is_deprioritised(cur) and not self.is_deprioritised(rel)):
+                self.by_stem[stem] = rel
         self.out_links: dict[str, set] = {}
         self.backlinks: dict[str, list] = {n["path"]: [] for n in self.notes}
         for n in self.notes:
@@ -311,6 +327,10 @@ class VaultIndex:
             self.out_links[n["path"]] = targets
             for t in targets:
                 self.backlinks[t].append(n)
+
+    def is_deprioritised(self, rel: str) -> bool:
+        low = rel.lower()
+        return any(low == p or low.startswith(p + "/") for p in self.deprioritised)
 
     def resolve(self, target: str):
         t = target.strip().replace("\\", "/").lstrip("/").lower()
@@ -333,6 +353,11 @@ def get_index() -> VaultIndex:
     if _INDEX_CACHE[0] != snap or _INDEX_CACHE[1] is None:
         _INDEX_CACHE = (snap, VaultIndex())
     return _INDEX_CACHE[1]
+
+
+def vault_payload() -> dict:
+    """scan_vault() plus the server-resolved bare-name map ("stems") used by the browser's resolveNote()."""
+    return {**scan_vault(), "stems": get_index().by_stem}
 
 
 def build_graph() -> dict:
@@ -1240,23 +1265,24 @@ async function api(kind, arg) {
 let vault = null, tabs = [], activeTab = null, expanded = new Set(), searchQ = "";
 
 // ── Note resolution (mirrors VaultIndex.resolve in viewer.py) ──
+// Bare names are NOT resolved here: the server decides which note a name means (name clashes,
+// "link_deprioritise") and ships the final map as vault.stems.
 let noteIdx = null;
 function resolveNote(target, pathOnly) {
   if (!vault) return null;
   if (!noteIdx) {
-    noteIdx = { byPath: new Map(), byStem: new Map() };
+    noteIdx = { byPath: new Map(), stems: new Map(Object.entries(vault.stems || {})) };
     vault.folders.forEach(s => s.notes.forEach(n => {
       const p = n.path.toLowerCase();
       noteIdx.byPath.set(p, n);
       noteIdx.byPath.set(p.replace(/\.md$/, ""), n);
-      const st = n.name.toLowerCase();
-      if (!noteIdx.byStem.has(st)) noteIdx.byStem.set(st, n);
     }));
   }
   const t = String(target || "").trim().replace(/\\/g, "/").replace(/^\/+/, "")
     .replace(/\.md$/i, "").toLowerCase();
   // pathOnly: relative .md links must name a real path; no fall-back to a same-named note elsewhere
-  return noteIdx.byPath.get(t) || (pathOnly ? null : noteIdx.byStem.get(t)) || null;
+  const stem = pathOnly ? null : noteIdx.stems.get(t);
+  return noteIdx.byPath.get(t) || (stem && noteIdx.byPath.get(stem.toLowerCase())) || null;
 }
 
 // ── Relative Markdown links to notes: [t](../dir/Other%20note.md#Heading) ──
@@ -2067,7 +2093,7 @@ class VaultHandler(BaseHTTPRequestHandler):
             self._respond(200, "application/javascript; charset=utf-8", (VENDOR_DIR / name).read_bytes())
 
         elif parsed.path == "/api/vault":
-            body = json.dumps(scan_vault(), ensure_ascii=False).encode("utf-8")
+            body = json.dumps(vault_payload(), ensure_ascii=False).encode("utf-8")
             self._respond(200, "application/json; charset=utf-8", body, cache=False)
 
         elif parsed.path == "/api/graph":
@@ -2359,7 +2385,7 @@ def export_html(out_path: Path) -> None:
             "type": fm.get("type", ""), "status": fm.get("status", ""),
             "backlinks": idx.backlinks_for(n["path"]),
         }
-    html = render_page("export", {"vault": scan_vault(), "graph": build_graph(), "notes": notes})
+    html = render_page("export", {"vault": vault_payload(), "graph": build_graph(), "notes": notes})
     out_path.write_text(html, encoding="utf-8")
     print(f"✓ Exported {len(notes)} notes → {out_path} ({out_path.stat().st_size // 1024} KiB)")
     print("⚠ WARNING: this file contains the full content of every note in the vault. "
