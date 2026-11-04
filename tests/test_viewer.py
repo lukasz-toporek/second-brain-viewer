@@ -127,7 +127,7 @@ class OnlineTests(unittest.TestCase):
     def test_graph_and_vendor_not_served_online(self):
         st, _, b = self.s.req("GET", "/api/graph")
         self.assertEqual(st, 200)
-        self.assertEqual(len(json.loads(b)["nodes"]), 7)
+        self.assertEqual(len(json.loads(b)["nodes"]), 9)
         st, _, _ = self.s.req("GET", "/vendor/marked.min.js")
         self.assertEqual(st, 404)
 
@@ -248,7 +248,7 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("</", data)
         self.assertIn("<\\/script>", data)                    # the XSS probe note's text, escaped
         payload = json.loads(data.replace("<\\/", "</").replace("<\\u0021--", "<!--"))
-        self.assertEqual(len(payload["notes"]), 7)
+        self.assertEqual(len(payload["notes"]), 9)
         self.assertEqual({b["name"] for b in payload["notes"]["10-knowledge/Beta.md"]["backlinks"]},
                          {"Alpha", "Gamma", "Home"})
         self.assertNotIn("SECRET", html)
@@ -284,6 +284,73 @@ class CliTests(unittest.TestCase):
             f.write_text(js, encoding="utf-8")
             r = subprocess.run([node, "--check", str(f)], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
+
+
+NODE = shutil.which("node")
+
+
+def page_script(mode="offline") -> str:
+    return re.findall(r"<script>(.*?)</script>", viewer.render_page(mode), re.S)[-1]
+
+
+def run_page_js(snippet: str, mode="offline"):
+    """Run the page's note-resolution + Markdown-extension code (real vendored marked) under node.
+
+    The slice of the page script from safeUrl() to the wikilink click handler touches no DOM except
+    document.addEventListener, which is stubbed. `snippet` runs after it and prints JSON.
+    """
+    js = page_script(mode)
+    a = js.index("// Only http(s), mailto")
+    b = js.index("// delegated click handler for wikilinks")
+    prelude = (
+        "global.window = {}; global.document = {addEventListener(){}};\n"
+        f"global.marked = require({json.dumps(str(ROOT / 'vendor' / 'marked.min.js'))}).marked;\n"
+        "const FLAGS = {};\n")
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "t.js"
+        f.write_text(prelude + js[a:b] + "\n" + snippet, encoding="utf-8")
+        r = subprocess.run([NODE, str(f)], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise AssertionError(r.stderr)
+    return json.loads(r.stdout)
+
+
+@unittest.skipUnless(NODE, "node not available")
+class RelativeLinkTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        viewer.init_config(VAULT)
+        cls.vault = json.dumps(viewer.scan_vault())
+
+    def render(self, base, md):
+        return run_page_js(f"vault = {self.vault}; currentNotePath = {json.dumps(base)};"
+                           f"console.log(JSON.stringify(marked.parse({json.dumps(md)})));")
+
+    def test_fixture_note_links(self):
+        text = (VAULT / "10-knowledge/deep/Links.md").read_text(encoding="utf-8")
+        html = self.render("10-knowledge/deep/Links.md", text)
+        spaced = 'data-path="10-knowledge/deep/Spaced Note.md"'
+        self.assertEqual(html.count(spaced), 3)                       # %20, #heading, ./nested/../
+        self.assertIn('class="wl" href="#" data-path="10-knowledge/Alpha.md">up</a>', html)
+        self.assertIn('data-path="01-daily/2025-01-01.md">daily</a>', html)
+        self.assertIn('data-path="10-knowledge/Beta.md">clamped</a>', html)     # never above the root
+        self.assertIn('<span class="wl missing" title="Note not found">gone</span>', html)
+        self.assertIn('href="pic.png"', html)                         # other relative links untouched
+        self.assertIn('href="https://example.com/page.md" target="_blank"', html)
+
+    def test_resolved_relative_to_rendered_note(self):
+        # same link text, different base folder -> different (or missing) target
+        self.assertIn('data-path="10-knowledge/Alpha.md"', self.render("10-knowledge/Beta.md", "[a](Alpha.md)"))
+        self.assertIn("wl missing", self.render("Home.md", "[a](Alpha.md)"))
+        self.assertIn('data-path="10-knowledge/Alpha.md"', self.render("Home.md", "[a](10-knowledge/Alpha.md#x)"))
+        self.assertIn('data-path="10-knowledge/Alpha.md"', self.render("20-projects/Tasks.md", "[a](/10-knowledge/Alpha.md)"))
+
+    def test_unsafe_and_non_note_links_unchanged(self):
+        html = self.render("Home.md", "[a](javascript:alert(1)) [b](//evil.example/x.md) [c](#top) [d](a.pdf)")
+        self.assertNotIn("javascript", html)
+        self.assertNotIn("data-path", html)
+        self.assertIn('data-anchor="top"', html)
+        self.assertIn('href="a.pdf"', html)
 
 
 class IndexTests(unittest.TestCase):

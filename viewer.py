@@ -1174,7 +1174,7 @@ let vault = null, tabs = [], activeTab = null, expanded = new Set(), searchQ = "
 
 // ── Note resolution (mirrors VaultIndex.resolve in viewer.py) ──
 let noteIdx = null;
-function resolveNote(target) {
+function resolveNote(target, pathOnly) {
   if (!vault) return null;
   if (!noteIdx) {
     noteIdx = { byPath: new Map(), byStem: new Map() };
@@ -1188,7 +1188,29 @@ function resolveNote(target) {
   }
   const t = String(target || "").trim().replace(/\\/g, "/").replace(/^\/+/, "")
     .replace(/\.md$/i, "").toLowerCase();
-  return noteIdx.byPath.get(t) || noteIdx.byStem.get(t) || null;
+  // pathOnly: relative .md links must name a real path; no fall-back to a same-named note elsewhere
+  return noteIdx.byPath.get(t) || (pathOnly ? null : noteIdx.byStem.get(t)) || null;
+}
+
+// ── Relative Markdown links to notes: [t](../dir/Other%20note.md#Heading) ──
+// Path of the note currently being rendered; showNote() sets it before marked.parse (chat bubbles
+// use the active note).
+let currentNotePath = "";
+// Vault-relative path (with .md) a scheme-less, non-# link points to, resolved against the folder of
+// `base` (. and .. normalised, never above the vault root); null if it is not such a .md link.
+function relLinkPath(base, href) {
+  const u = String(href ?? "").trim();
+  if (!u || u[0] === "#" || /^[a-z][a-z0-9+.-]*:/i.test(u) || /^[\\/]{2}/.test(u)) return null;
+  let p = u.split(/[#?]/)[0];
+  try { p = decodeURIComponent(p); } catch (_) { return null; }
+  p = p.replace(/\\/g, "/");
+  if (!/\.md$/i.test(p)) return null;
+  const parts = p.startsWith("/") ? [] : String(base || "").split("/").slice(0, -1);
+  for (const seg of p.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") parts.pop(); else parts.push(seg);
+  }
+  return parts.join("/");
 }
 
 // ── Markdown extensions: wikilinks + callouts ──
@@ -1216,6 +1238,12 @@ if (typeof marked !== "undefined") {
       // raw HTML in Markdown is shown as text, never injected
       html(html) { return esc(typeof html === "string" ? html : html.text); },
       link(href, title, text) {
+        const rel = relLinkPath(currentNotePath, href);
+        if (rel !== null) {          // a link to another note: render exactly like a wikilink
+          const n = resolveNote(rel, true);
+          return n ? `<a class="wl" href="#" data-path="${esc(n.path)}">${text}</a>`
+                   : `<span class="wl missing" title="Note not found">${text}</span>`;
+        }
         const u = safeUrl(href);
         if (u === null) return text;
         const t = title ? ` title="${esc(title)}"` : "";
@@ -1469,6 +1497,7 @@ function showNote(data) {
 
   let html = "";
   if (typeof marked !== "undefined") {
+    currentNotePath = data.path;
     html = marked.parse(raw);
   } else {
     html = `<pre style="white-space:pre-wrap;font-family:inherit">${esc(raw)}</pre>`;
@@ -1736,6 +1765,7 @@ async function chatSend() {
       chatHistory.push({ role: "assistant", content: fullText });
       if (typeof marked !== "undefined") {
         bubble.classList.add("md");
+        currentNotePath = activeTab || "";
         bubble.innerHTML = marked.parse(fullText);
       }
     } else if (!started) {
