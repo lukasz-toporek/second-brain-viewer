@@ -1599,6 +1599,93 @@ class MobileSidebarTests(unittest.TestCase):
                 self.assertRegex(js, r"function openNote\(note\) \{\s*closeSidebar\(\);")
 
 
+class SymlinkLeakTests(unittest.TestCase):
+    """Notes whose real path is outside the vault must not reach any index, API or export."""
+    MARKER = "ZXQ-LEAK-MARKER-7731"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.root = base / "vault"
+        outside = base / "outside"
+        (outside / "dir").mkdir(parents=True)
+        (outside / "Leak.md").write_text(f"---\ntype: wiedza\n---\n# Leak\n{self.MARKER} [[Inside]]\n", encoding="utf-8")
+        (outside / "dir" / "Deep.md").write_text(f"# Deep\n{self.MARKER}\n", encoding="utf-8")
+        self.root.mkdir()
+        (self.root / "Real.md").write_text("# Real\nreal body [[Inside]]\n", encoding="utf-8")
+        (self.root / "sub").mkdir()
+        (self.root / "sub" / "Loop.md").write_text("# Loop\n", encoding="utf-8")
+        try:
+            (self.root / "Leak.md").symlink_to(outside / "Leak.md")
+            (self.root / "Inside.md").symlink_to(self.root / "Real.md")
+            (self.root / "linkdir").symlink_to(outside / "dir", target_is_directory=True)
+            (self.root / "Broken.md").symlink_to(base / "nowhere.md")
+            (self.root / "Self.md").symlink_to(self.root / "Self.md")       # loop
+            (self.root / "innerdir").symlink_to(self.root / "sub", target_is_directory=True)
+        except OSError:
+            self.skipTest("symlinks not supported")
+        self.addCleanup(viewer.init_config, VAULT)
+
+    def test_nothing_leaks_through_the_api(self):
+        s = Server(vault=self.root)
+        self.addCleanup(s.stop)
+        for url in ("/api/vault", f"/api/search?q={self.MARKER}", "/api/graph"):
+            with self.subTest(url=url):
+                st, _, body = s.req("GET", url)
+                self.assertEqual(st, 200)
+                self.assertNotIn(self.MARKER, body.decode())
+                self.assertNotIn("Leak.md", body.decode())
+                self.assertNotIn("Deep.md", body.decode())
+        self.assertEqual(json.loads(s.req("GET", f"/api/search?q={self.MARKER}")[2]), [])
+        for rel in ("Leak.md", "linkdir/Deep.md"):
+            self.assertIn(s.req("GET", "/api/note?path=" + rel)[0], (403, 404))
+        st, _, body = s.req("GET", "/api/note?path=Real.md")
+        self.assertEqual(st, 200)
+        self.assertNotIn(self.MARKER, body.decode())                          # backlinks included
+
+    def test_symlinks_inside_the_vault_still_work(self):
+        s = Server(vault=self.root)
+        self.addCleanup(s.stop)
+        v = json.loads(s.req("GET", "/api/vault")[2])
+        self.assertIn("Inside.md", json.dumps(v["tree"] if "tree" in v else v))
+        self.assertEqual(s.req("GET", "/api/note?path=Inside.md")[0], 200)
+        self.assertEqual(s.req("GET", "/api/note?path=innerdir/Loop.md")[0], 200)
+        self.assertEqual(viewer.VaultIndex().resolve("Inside"), "Inside.md")
+        paths = [p.relative_to(viewer.VAULT).as_posix() for p in viewer.vault_files()]
+        self.assertNotIn("Broken.md", paths)
+        self.assertNotIn("Self.md", paths)
+
+    def test_export_has_no_marker(self):
+        out = Path(self._tmp.name) / "out.html"
+        r = subprocess.run([sys.executable, str(ROOT / "viewer.py"), "--vault", str(self.root), "--export", str(out)],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        html = out.read_text(encoding="utf-8")
+        self.assertNotIn(self.MARKER, html)
+        self.assertIn("Inside.md", html)
+
+    def test_only_vault_files_walks_the_vault(self):
+        src = (ROOT / "viewer.py").read_text(encoding="utf-8")
+        self.assertEqual(len(re.findall(r"VAULT\.rglob\(", src)), 1)
+        self.assertIn('for p in VAULT.rglob("*")', src.split("def vault_files")[1].split("\ndef ")[0])
+
+    def test_lint_ignores_outside_notes(self):
+        spec = importlib.util.spec_from_file_location("vault_lint", ROOT / "tools" / "vault-lint.py")
+        lint = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lint)
+        buf = io.StringIO()
+        old = sys.argv
+        sys.argv = ["vault-lint.py", "--vault", str(self.root)]
+        try:
+            with contextlib.redirect_stdout(buf):
+                lint.lint()
+        finally:
+            sys.argv = old
+        self.assertNotIn("Leak.md", buf.getvalue())
+        self.assertNotIn("Deep.md", buf.getvalue())
+
+
 class IndexTests(unittest.TestCase):
     def test_resolution_forms(self):
         viewer.init_config(VAULT)

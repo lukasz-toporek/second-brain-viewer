@@ -23,7 +23,7 @@ from pathlib import Path
 
 # One frontmatter parser for the viewer and the lint: viewer.py sits next to tools/
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from viewer import fm_str, frontmatter_block, parse_frontmatter as _parse_frontmatter  # noqa: E402
+from viewer import fm_str, frontmatter_block, parse_frontmatter as _parse_frontmatter, real_file_in  # noqa: E402
 
 VAULT = Path.cwd()
 
@@ -99,7 +99,7 @@ def _ci_index() -> dict:
     if _CI_INDEX is None:
         idx: dict[str, Path] = {}
         for f in sorted(VAULT.rglob("*")):
-            if not f.is_file() or any(part in EXCLUDED_DIRS for part in f.relative_to(VAULT).parts):
+            if not real_file_in(f, VAULT) or any(part in EXCLUDED_DIRS for part in f.relative_to(VAULT).parts):
                 continue
             rel = f.relative_to(VAULT).as_posix().lower()
             idx.setdefault(rel, f)
@@ -133,7 +133,8 @@ def lint() -> int:
         apply_config(VAULT)
     issues: list[tuple[str, str]] = []
 
-    md_files = [f for f in VAULT.rglob("*.md") if not excluded(f)]
+    # notes whose real path is outside the vault (symlinks) are ignored, as in the viewer
+    md_files = [f for f in VAULT.rglob("*.md") if not excluded(f) and real_file_in(f, VAULT)]
 
     for f in sorted(md_files):
         rel = f.relative_to(VAULT)

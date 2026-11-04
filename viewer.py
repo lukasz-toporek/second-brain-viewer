@@ -295,23 +295,31 @@ def attach_ext(path) -> str:
     return ext if ext in ATTACH_TYPES else ""
 
 
+def real_file_in(p: Path, root: Path) -> bool:
+    """True if `p` is a regular file whose *real* path (symlinks resolved) lies inside `root`.
+
+    Broken links, symlink loops and unreadable entries (OSError / RuntimeError) count as "no".
+    `root` must already be resolved. Shared with tools/vault-lint.py.
+    """
+    try:
+        return p.is_file() and p.resolve().is_relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def vault_files() -> list:
     """Sorted absolute paths of every tracked note (.md) and attachment, in one tree walk.
 
-    Attachments are only those with an allowed extension that are not skipped and really live
-    inside the vault (a symlink pointing out of it is left out).
+    This is the only place that decides what is part of the vault (the only ``rglob`` on it). A note or
+    attachment counts only if it is not skipped and its real path is a file inside the vault, so a
+    symlink pointing out of the vault (file or folder) is ignored. Symlinks that stay inside the vault
+    work; a note reachable by two paths (``Inside.md`` -> ``Real.md``) is listed under both, each by
+    the path it was found at.
     """
     out = []
     for p in VAULT.rglob("*"):
-        if p.suffix == ".md":
-            if not skip(p):
-                out.append(p)
-        elif attach_ext(p) and not skip(p):
-            try:
-                if p.is_file() and p.resolve().is_relative_to(VAULT):
-                    out.append(p)
-            except OSError:
-                pass
+        if (p.suffix == ".md" or attach_ext(p)) and not skip(p) and real_file_in(p, VAULT):
+            out.append(p)
     return sorted(out)
 
 
@@ -490,8 +498,8 @@ def folder_key(name: str) -> tuple:
 
 def scan_vault() -> dict:
     by_folder: dict[str, list[dict]] = {}
-    for path in sorted(VAULT.rglob("*.md")):
-        if skip(path):
+    for path in vault_files():
+        if path.suffix != ".md":
             continue
         rel = path.relative_to(VAULT)
         folder = rel.parts[0] if len(rel.parts) > 1 else "(vault root)"
