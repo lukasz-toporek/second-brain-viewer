@@ -182,6 +182,20 @@ light theme:
 "types_light": {"wiedza": "#086860"}
 ```
 
+### Keyboard and accessibility
+
+| Where | Keys |
+|---|---|
+| anywhere (not in a text box) | `/` focus search · `r` refresh · `Esc` close sidebar overlay / plug-in / graph / chat |
+| search box | `↓` steps into the tree (or the result list) |
+| file tree (`role="tree"`, one tab stop) | `↑` `↓` move between visible rows · `Home` `End` first/last · `→` open a folder, or step into it · `←` close a folder, or go to its parent · `Enter` / `Space` open a note or toggle a folder |
+| a focused tab | `Enter` / `Space` switch · `Delete` close (middle-click and the × also close) |
+
+Folders are `treeitem`s with `aria-expanded`, the active note has `aria-selected="true"`, and opening a note never moves focus.
+Graph, Chat and plug-in buttons have a `title`, an `aria-label` and `aria-pressed` while active; every SVG icon is
+`aria-hidden`. No icon or glyph (menu, ×, chevrons, send) is a font glyph: they are inline SVG, so the `--offline` page,
+which loads no web font, looks the same.
+
 ### Default folder badges and type colours
 
 Without a `"folders"` entry a folder gets a **generated badge**: its first letter or digit (Unicode-aware, upper-cased, after the
@@ -245,7 +259,15 @@ See `docs/plugins.md` for the design and what is still future work (Python data 
 ### Tests
 
 ```bash
-python3 -m unittest discover tests     # uses the fake vault in tests/fixtures/vault
+python3 -m unittest discover tests     # uses the fake vaults in tests/fixtures/
+```
+
+The viewer works with resolved paths, so tests compare resolved paths too. To check that nothing depends on the temp
+folder being a plain path (macOS reaches it through a symlink), run the suite with a symlinked `TMPDIR`:
+
+```bash
+B=$(mktemp -d); mkdir "$B/real"; ln -s "$B/real" "$B/link"
+TMPDIR="$B/link" python3 -m unittest discover tests
 ```
 
 ### Tools

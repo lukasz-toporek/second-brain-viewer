@@ -2404,6 +2404,56 @@ class FrontmatterLinkChipTests(unittest.TestCase):
         self.assertIn(".chip .wl.missing", css)
 
 
+class AccessibilityTests(unittest.TestCase):
+    """Static checks; keyboard behaviour needs a browser (see the report)."""
+
+    def tearDown(self):
+        viewer.init_config(VAULT)
+
+    def test_every_svg_icon_is_hidden_from_assistive_tech(self):
+        viewer.init_config(VAULT)
+        for mode in ("online", "offline", "export"):
+            html = viewer.render_page(mode, {"notes": {}})
+            svgs = re.findall(r"<svg\b[^>]*>", html.split("<script>")[0] + "".join(re.findall(r"<script>(.*?)</script>", html, re.S)[-1:]))
+            self.assertGreaterEqual(len(svgs), 10)
+            for tag in svgs:
+                with self.subTest(mode=mode, tag=tag[:50]):
+                    self.assertIn('aria-hidden="true"', tag)
+
+    def test_toolbar_buttons_have_names_and_pressed_state(self):
+        html = viewer.render_page("online")
+        for ident, name in (("graph-btn", "Graph"), ("chat-toggle-btn", "Chat")):
+            self.assertRegex(html, rf'<button class="toolbar-btn" id="{ident}" title="{name}" aria-label="{name}" aria-pressed="false">')
+        js = page_script("online")
+        for pressed in ('"graph-btn").setAttribute("aria-pressed", "true")', '"graph-btn").setAttribute("aria-pressed", "false")',
+                        '"chat-toggle-btn").setAttribute("aria-pressed", "true")', '"chat-toggle-btn").setAttribute("aria-pressed", "false")',
+                        'rec.btn.setAttribute("aria-pressed", "true")', 'rec.btn.setAttribute("aria-pressed", "false")'):
+            self.assertIn(pressed, js)
+        self.assertIn('btn.setAttribute("aria-label", rec.def.title)', js)       # plug-in buttons
+        self.assertIn("btn.title = rec.def.title", js)
+        for ident in ("chat-close", "plugin-close", "chat-send", "menu-btn", "srch"):
+            self.assertRegex(html, rf'id="{ident}"[^>]*aria-label="')
+
+    def test_tree_roles_and_keyboard_handlers_are_in_the_page(self):
+        js = page_script("offline")
+        self.assertIn('tree.setAttribute("role", "tree")', js)
+        self.assertIn('role="treeitem" aria-expanded=', js)
+        self.assertIn('aria-selected=', js)
+        self.assertIn('setAttribute("aria-selected", "true")', js)               # the active row follows highlight()
+        for key in ("ArrowDown", "ArrowUp", "ArrowRight", "ArrowLeft", "Enter", "Home", "End"):
+            self.assertIn(f'case "{key}"', js)
+
+    def test_no_icon_depends_on_a_web_font(self):
+        html = viewer.render_page("offline")
+        self.assertNotIn("fonts.googleapis.com", html)                           # offline loads no web font at all
+        for glyph in ("&#9776;", "☰", ">×<", "&times;"):
+            self.assertNotIn(glyph, html)                                        # ☰ and × are inline SVG now
+        css = html.split("<style>")[1].split("</style>")[0]
+        for decl in re.findall(r"font-family:\s*([^;]+);", css):
+            if decl.strip() != "inherit":
+                self.assertRegex(decl.strip(), r"(sans-serif|monospace)$", decl)  # every stack ends in a system family
+
+
 class IndexTests(unittest.TestCase):
     def test_resolution_forms(self):
         viewer.init_config(VAULT)

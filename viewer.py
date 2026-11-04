@@ -1586,7 +1586,7 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
     </span>
   </div>
   <div class="sb-srch">
-    <input class="srch" id="srch" placeholder="Search…" autocomplete="off" spellcheck="false">
+    <input class="srch" id="srch" placeholder="Search…" aria-label="Search notes" autocomplete="off" spellcheck="false">
   </div>
   <nav class="tree" id="tree">
     <div class="loading">Loading…</div>
@@ -1595,11 +1595,11 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
 
 <div class="main">
   <div class="tabrow">
-    <button class="menu-btn" id="menu-btn" aria-label="Open sidebar" aria-controls="sb" aria-expanded="false" title="Notes">&#9776;</button>
+    <button class="menu-btn" id="menu-btn" aria-label="Open sidebar" aria-controls="sb" aria-expanded="false" title="Notes"><svg aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2 4h12M2 8h12M2 12h12"/></svg></button>
     <div class="tabs" id="tabs"></div>
     <div class="toolbar-btns">
-      <button class="toolbar-btn" id="graph-btn">
-        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <button class="toolbar-btn" id="graph-btn" title="Graph" aria-label="Graph" aria-pressed="false">
+        <svg aria-hidden="true" focusable="false" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
           <circle cx="3" cy="8" r="2.2" fill="currentColor" stroke="none"/>
           <circle cx="13" cy="3.5" r="2.2" fill="currentColor" stroke="none"/>
           <circle cx="13" cy="12.5" r="2.2" fill="currentColor" stroke="none"/>
@@ -1608,8 +1608,8 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
         </svg>
         Graph
       </button>
-      <button class="toolbar-btn" id="chat-toggle-btn">
-        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <button class="toolbar-btn" id="chat-toggle-btn" title="Chat" aria-label="Chat" aria-pressed="false">
+        <svg aria-hidden="true" focusable="false" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <path d="M14 2H2a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h3l3 3 3-3h3a1 1 0 0 0 1-1V3a1 1 0 0 0-1-1z"/>
         </svg>
         Chat
@@ -1628,7 +1628,7 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
     <div class="graph-hint">scroll = zoom · drag = pan · click node to open note</div>
   </div>
   <div id="plugin-wrap" hidden>
-    <div class="plugin-head"><span id="plugin-title"></span><button class="chat-close" id="plugin-close" title="Close (Esc)">×</button></div>
+    <div class="plugin-head"><span id="plugin-title"></span><button class="chat-close" id="plugin-close" title="Close (Esc)" aria-label="Close">__XICON__</button></div>
     <div id="plugin-mount"></div>
   </div>
 </div>
@@ -1636,7 +1636,7 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
 <div class="chat-panel" id="chat-panel" hidden>
   <div class="chat-header">
     <span class="chat-header-title">Chat</span>
-    <button class="chat-close" id="chat-close" title="Close">×</button>
+    <button class="chat-close" id="chat-close" title="Close chat" aria-label="Close chat">__XICON__</button>
   </div>
   <div class="chat-ctx" id="chat-ctx">No note open</div>
   <div class="chat-messages" id="chat-messages">
@@ -1649,8 +1649,8 @@ a.dv-link:hover { text-decoration: none; border-color: var(--ac); }
     </div>
     <div class="chat-input-row">
       <textarea class="chat-input" id="chat-input" placeholder="Ask about this note…" rows="1"></textarea>
-      <button class="chat-send" id="chat-send" title="Send (Enter)">
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+      <button class="chat-send" id="chat-send" title="Send (Enter)" aria-label="Send">
+        <svg aria-hidden="true" focusable="false" width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
           <path d="M1 1l14 7-14 7V9.5l10-1.5-10-1.5z"/>
         </svg>
       </button>
@@ -2431,6 +2431,50 @@ treeEl().addEventListener("click", e => {
   if (n) openNote({ path: n.path, name: n.name, type: n.type, folder: n.path.split("/")[0] });
 });
 
+// Keyboard: Up/Down move between the visible rows, Home/End jump, Right/Left open/close a folder (or step into
+// / out to its parent), Enter and Space open a note or toggle a folder. One tab stop (roving tabindex).
+const visibleRows = () => [...treeEl().querySelectorAll(".fhd, .ni")].filter(r => !r.closest(".fnotes[hidden]"));
+function focusRow(row, rows) {
+  if (!row) return;
+  (rows || visibleRows()).forEach(r => { r.tabIndex = -1; });
+  row.tabIndex = 0;
+  row.focus();
+}
+treeEl().addEventListener("keydown", e => {
+  const row = e.target.closest(".fhd, .ni");
+  if (!row || e.altKey || e.ctrlKey || e.metaKey) return;
+  const rows = visibleRows(), i = rows.indexOf(row), isFolder = row.classList.contains("fhd");
+  const open = isFolder && row.classList.contains("open");
+  const parentRow = () => {
+    const group = (isFolder ? row.parentElement : row).closest(".fnotes");
+    return group && group.previousElementSibling;
+  };
+  switch (e.key) {
+    case "ArrowDown": focusRow(rows[i + 1], rows); break;
+    case "ArrowUp": focusRow(rows[i - 1], rows); break;
+    case "Home": focusRow(rows[0], rows); break;
+    case "End": focusRow(rows[rows.length - 1], rows); break;
+    case "ArrowRight":
+      if (!isFolder) return;
+      if (!open) setFolderOpen(row.dataset.fpath, true); else focusRow(rows[i + 1], rows);
+      break;
+    case "ArrowLeft":
+      if (open) setFolderOpen(row.dataset.fpath, false); else focusRow(parentRow(), rows);
+      break;
+    case "Enter": case " ":
+      if (isFolder) setFolderOpen(row.dataset.fpath, !open); else row.click();
+      break;
+    default: return;
+  }
+  e.preventDefault();
+});
+// Down arrow in the search box steps into the tree / the result list
+document.getElementById("srch").addEventListener("keydown", e => {
+  if (e.key !== "ArrowDown") return;
+  const first = visibleRows()[0];
+  if (first) { e.preventDefault(); focusRow(first); }
+});
+
 // ── Tabs ──────────────────────────────────────────────────────
 const CLOSE_ICON = `<svg aria-hidden="true" focusable="false" width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M3 3l10 10M13 3L3 13"/></svg>`;
 const tabLastUsed = new Map();
@@ -2675,7 +2719,7 @@ document.getElementById("srch").addEventListener("input", e => {
   searchTimer = setTimeout(runSearch, 150);     // debounce
 });
 
-// ── Mobile sidebar overlay (the ☰ button only exists below 580px) ──
+// ── Mobile sidebar overlay (the menu button only exists below 580px) ──
 const sidebarOpen = () => document.body.classList.contains("sb-open");
 function setSidebar(open) {
   document.body.classList.toggle("sb-open", open);
@@ -2709,6 +2753,7 @@ async function openGraph() {
   closePlugin();
   graphMode = true;
   document.getElementById("graph-btn").classList.add("active");
+  document.getElementById("graph-btn").setAttribute("aria-pressed", "true");
   const wrap = document.getElementById("graph-wrap");
   wrap.hidden = false;
   if (!graphData) {
@@ -2725,6 +2770,7 @@ async function openGraph() {
 function closeGraph() {
   graphMode = false;
   document.getElementById("graph-btn").classList.remove("active");
+  document.getElementById("graph-btn").setAttribute("aria-pressed", "false");
   document.getElementById("graph-wrap").hidden = true;
   fgInstance = null;
 }
@@ -2833,7 +2879,7 @@ function openPlugin(id) {
   closePlugin();
   if (graphMode) closeGraph();
   activePlugin = id;
-  if (rec.btn) rec.btn.classList.add("active");
+  if (rec.btn) { rec.btn.classList.add("active"); rec.btn.setAttribute("aria-pressed", "true"); }
   const wrap = document.getElementById("plugin-wrap"), mount = document.getElementById("plugin-mount");
   document.getElementById("plugin-title").textContent = rec.def.title;
   mount.innerHTML = "";
@@ -2851,7 +2897,7 @@ function closePlugin() {
   const rec = pluginRegistry.get(activePlugin);
   activePlugin = null;
   if (rec) {
-    if (rec.btn) rec.btn.classList.remove("active");
+    if (rec.btn) { rec.btn.classList.remove("active"); rec.btn.setAttribute("aria-pressed", "false"); }
     try { if (typeof rec.def.unmount === "function") rec.def.unmount(); }
     catch (e) { console.warn("[VaultViewer] plug-in unmount failed:", e); }
   }
@@ -2864,6 +2910,9 @@ pluginUi = {
     btn.className = "toolbar-btn";
     btn.dataset.plugin = rec.def.id;
     btn.textContent = rec.def.title;
+    btn.title = rec.def.title;
+    btn.setAttribute("aria-label", rec.def.title);
+    btn.setAttribute("aria-pressed", "false");
     btn.addEventListener("click", () => openPlugin(rec.def.id));
     const anchor = [...document.querySelectorAll(".toolbar-btn[data-plugin]")].pop() || document.getElementById("graph-btn");
     anchor.after(btn);                                  // right after Graph, in registration order
@@ -2885,6 +2934,7 @@ async function openChat() {
   chatOpen = true;
   document.getElementById("chat-panel").hidden = false;
   document.getElementById("chat-toggle-btn").classList.add("active");
+  document.getElementById("chat-toggle-btn").setAttribute("aria-pressed", "true");
   document.getElementById("chat-input").focus();
   if (!chatConfigLoaded) {
     chatConfigLoaded = true;
@@ -2902,6 +2952,7 @@ function closeChat() {
   chatOpen = false;
   document.getElementById("chat-panel").hidden = true;
   document.getElementById("chat-toggle-btn").classList.remove("active");
+  document.getElementById("chat-toggle-btn").setAttribute("aria-pressed", "false");
 }
 
 function setChatContext(noteTitle, noteContent) {
@@ -3056,6 +3107,10 @@ load();
 __PLUGINS__
 </body>
 </html>"""
+# icons are inline SVG (no glyph from a web font, so offline mode looks the same); one copy, used twice above
+VIEWER_HTML = VIEWER_HTML.replace(
+    "__XICON__", '<svg aria-hidden="true" focusable="false" width="12" height="12" viewBox="0 0 16 16" fill="none" '
+                 'stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 3l10 10M13 3L3 13"/></svg>')
 
 
 # ── HTTP server ──────────────────────────────────────────────────────────────
