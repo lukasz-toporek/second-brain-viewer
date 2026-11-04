@@ -28,7 +28,7 @@ from datetime import date
 from html import escape as html_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
@@ -563,6 +563,48 @@ def extract_wikilinks(text: str) -> list[str]:
     return out
 
 
+# [text](target "title"), also with one level of brackets inside the text (a linked image). A leading ! makes
+# it an image, which is never a note link. The target is <...>-wrapped or has no spaces.
+_MDLINK_RE = re.compile(
+    r'(?<!!)\[(?:[^\[\]\n]|\[[^\[\]\n]*\])*\]\(\s*(?:<([^<>\n]*)>|([^()\s]*(?:\([^()\s]*\)[^()\s]*)*))'
+    r'(?:\s+(?:"[^"\n]*"|\'[^\'\n]*\'))?\s*\)')
+
+
+def extract_md_links(text: str) -> list[str]:
+    """Raw targets of Markdown links ``[text](target)`` (images excluded)."""
+    return [m.group(1) if m.group(1) is not None else m.group(2)
+            for m in _MDLINK_RE.finditer(text) if not m.group(0).startswith("[[")]      # [[w]](x) is a wikilink, then text
+
+
+def rel_link_path(base: str, href: str, ext: str = ".md"):
+    """Vault-relative path a scheme-less, non-# link points to, resolved against the folder of `base`
+    (``.`` and ``..`` normalised, never above the vault root); None if it is not a link ending in `ext`.
+    Mirror of ``relLinkPath()`` in the page: keep the two visibly parallel."""
+    u = href.strip()
+    if not u or u[0] == "#" or re.match(r"[a-z][a-z0-9+.-]*:", u, re.I) or re.match(r"[\\/]{2}", u):
+        return None
+    p = re.split(r"[#?]", u)[0]
+    if re.search(r"%(?![0-9a-fA-F]{2})", p):           # decodeURIComponent would throw
+        return None
+    try:
+        p = unquote(p, errors="strict")
+    except UnicodeDecodeError:
+        return None
+    p = p.replace("\\", "/")
+    if not p.lower().endswith(ext):
+        return None
+    parts = [] if p.startswith("/") else base.split("/")[:-1]
+    for seg in p.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if parts:
+                parts.pop()
+        else:
+            parts.append(seg)
+    return "/".join(parts)
+
+
 def link_deprioritise_prefixes() -> list:
     """Lower-cased vault-relative folder prefixes from the optional "link_deprioritise" config key."""
     raw = CONFIG.get("link_deprioritise") or []
@@ -617,6 +659,11 @@ class VaultIndex:
                 t = self.resolve(link)
                 if t and t != n["path"]:
                     targets.add(t)
+            for href in extract_md_links(n["text"]):       # [text](Note.md): by path only, like the page
+                rel = rel_link_path(n["path"], href)
+                t = self.resolve_path(rel) if rel is not None else None
+                if t and t != n["path"]:
+                    targets.add(t)
             self.out_links[n["path"]] = targets
             for t in targets:
                 self.backlinks[t].append(n)
@@ -630,6 +677,13 @@ class VaultIndex:
         if t.endswith(".md"):
             t = t[:-3]
         return self.by_path.get(t) or self.by_stem.get(t)
+
+    def resolve_path(self, rel: str):
+        """Note at a vault-relative path (with or without .md), case-insensitively; no fall-back to a bare name."""
+        t = rel.strip().replace("\\", "/").lstrip("/").lower()
+        if t.endswith(".md"):
+            t = t[:-3]
+        return self.by_path.get(t)
 
     def backlinks_for(self, rel: str) -> list[dict]:
         return sorted(({"path": n["path"], "name": n["name"]} for n in self.backlinks.get(rel, [])),

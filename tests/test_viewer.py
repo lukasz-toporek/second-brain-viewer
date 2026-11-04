@@ -2454,6 +2454,116 @@ class AccessibilityTests(unittest.TestCase):
                 self.assertRegex(decl.strip(), r"(sans-serif|monospace)$", decl)  # every stack ends in a system family
 
 
+# ── Link resolution: Markdown links, aliases, code, Unicode, lint structure checks ──
+def write_notes(root: Path, notes: dict, config=None) -> Path:
+    """notes: {"rel/path.md": text}; a title-only config stops the config lookup from walking up to the repo."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ".viewer.json").write_text(json.dumps(config if config is not None else {"title": "L"}), encoding="utf-8")
+    for rel, text in notes.items():
+        f = root / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text, encoding="utf-8")
+    return root
+
+
+def edge_set(graph) -> set:
+    return {tuple(sorted((e["source"], e["target"]))) for e in graph["edges"]}
+
+
+class LinkVaultCase(unittest.TestCase):
+    """Base: a temp vault, the viewer pointed at it, helpers for graph / backlinks / stems / export / lint."""
+    NOTES: dict = {}
+    CONFIG = None
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = write_notes(Path(self._tmp.name) / "v", self.NOTES, self.CONFIG)
+        viewer.init_config(self.root)
+        self.addCleanup(viewer.init_config, VAULT)
+
+    def edges(self):
+        return edge_set(viewer.build_graph())
+
+    def backlinks(self, rel):
+        return [b["path"] for b in viewer.get_index().backlinks_for(rel)]
+
+    def exported(self):
+        out = Path(self._tmp.name) / "out.html"
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            viewer.export_html(out)
+        m = re.search(r"window\.__EXPORT__ = (.*?);</script>", out.read_text(encoding="utf-8"), re.S)
+        return json.loads(m.group(1).replace("<\\/", "</"))
+
+    def api(self, path):
+        srv = Server(vault=self.root)
+        try:
+            st, _, body = srv.req("GET", path)
+        finally:
+            srv.stop()
+        self.assertEqual(st, 200)
+        return json.loads(body)
+
+    def assert_export_matches_api(self):
+        self.assertEqual(edge_set(self.exported()["graph"]), edge_set(self.api("/api/graph")))
+
+
+class MarkdownLinkEdgeTests(LinkVaultCase):
+    NOTES = {
+        "Home.md": "# Home\n",
+        "sub/Alpha.md": ("# Alpha\n[same](Beta.md) [up](../Home.md) [enc](Space%20Note.md#Heading) [q](Beta.md?x=1)\n"
+                         "[above](../../../Home.md) [angle](<Space Note.md>) [img](pic.png) ![e](Beta.md)\n"
+                         "[web](https://example.com/Gamma.md) [frag](#top) [bare](Gamma) [nowhere](Gamma.md)\n"
+                         "[bad%](Beta.md%zz) [abs](/Home.md)\n"),
+        "sub/Beta.md": "# Beta\n",
+        "sub/Space Note.md": "# Space\n",
+        "Gamma.md": "# Gamma (elsewhere: a bare or missing sub/Gamma.md must not fall back to it)\n",
+        "sub/pic.png": "x",
+    }
+
+    def test_python_mirror_of_rel_link_path(self):
+        f = viewer.rel_link_path
+        self.assertEqual(f("a/b/N.md", "Other.md"), "a/b/Other.md")                       # same folder
+        self.assertEqual(f("a/b/N.md", "../c/Note%20x.md#H"), "a/c/Note x.md")              # ../, %20, #heading
+        self.assertEqual(f("N.md", "../../../Home.md"), "Home.md")                          # clamped at the vault root
+        self.assertEqual(f("a/N.md", "/top/A.md"), "top/A.md")
+        self.assertEqual(f("a/N.md", "./b/./C.MD?x=1"), "a/b/C.MD")
+        for none in ("http://x/y.md", "mailto:a@b.c", "#x", "pic.png", "%zz.md", "//host/a.md", "", "a.md.txt"):
+            self.assertIsNone(f("a/N.md", none), none)
+        self.assertEqual(viewer.extract_md_links("![i](x.md) [a](y.md) [![i](a.png)](z.md) [[w]](q.md)"), ["y.md", "z.md"])
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_js_rel_link_path_matches_the_python_mirror(self):
+        cases = [("a/b/N.md", "Other.md"), ("a/b/N.md", "../c/Note%20x.md#H"), ("N.md", "../../../Home.md"), ("a/N.md", "/top/A.md"),
+                 ("a/N.md", "./b/./C.MD?x=1"), ("a/N.md", "http://x/y.md"), ("a/N.md", "mailto:a@b.c"), ("a/N.md", "#x"),
+                 ("a/N.md", "pic.png"), ("a/N.md", "%zz.md"), ("a/N.md", "//host/a.md"), ("a/N.md", ""), ("a/N.md", "a.md.txt"),
+                 ("a/N.md", "..\\up\\X.md"), ("a/N.md", "sp ace/%C5%BCo%C5%82w.md"), ("a/N.md", "%E0%A4%A.md"), ("", "Top.md"),
+                 ("a/b/c/N.md", "../../../../x/Y.md"), ("a/N.md", "dir//double///S.md"), ("a/N.md", "  Padded.md  ")]
+        js = run_page_js(f"console.log(JSON.stringify({json.dumps(cases)}.map(([b, h]) => relLinkPath(b, h))));")
+        self.assertEqual(js, [viewer.rel_link_path(b, h) for b, h in cases])
+
+    def test_graph_edges_backlinks_and_by_path_only_resolution(self):
+        self.assertEqual(self.edges(), {("sub/Alpha.md", "sub/Beta.md"), ("Home.md", "sub/Alpha.md"),
+                                        ("sub/Alpha.md", "sub/Space Note.md")})
+        # positive: Beta, Home (../ and clamped and absolute), Space Note (%20 and <angle>); negative: pic, http, #frag,
+        # [bare](Gamma) (no .md), and [nowhere](Gamma.md) -> sub/Gamma.md does not exist, so no fall-back to Gamma.md
+        self.assertNotIn("Gamma.md", {x for e in self.edges() for x in e})
+        self.assertEqual(self.backlinks("sub/Beta.md"), ["sub/Alpha.md"])
+        self.assertEqual(self.backlinks("Home.md"), ["sub/Alpha.md"])
+        self.assertEqual(self.backlinks("Gamma.md"), [])
+        self.assertEqual(self.api("/api/note?path=sub/Beta.md")["backlinks"], [{"path": "sub/Alpha.md", "name": "Alpha"}])
+
+    def test_stems_are_unaffected_and_export_graph_matches_the_api(self):
+        self.assertEqual(self.api("/api/vault")["stems"]["beta"], "sub/Beta.md")
+        self.assert_export_matches_api()
+        self.assertEqual(len(self.exported()["graph"]["edges"]), 3)
+
+    def test_lint_resolves_with_the_shared_rules(self):
+        # a Markdown link adds no lint problem and the lint output for plain notes is unchanged
+        r = subprocess.run([sys.executable, str(ROOT / "tools" / "vault-lint.py"), "--vault", str(self.root)], capture_output=True, text=True)
+        self.assertNotIn("zepsuty", r.stdout)
+
+
 class IndexTests(unittest.TestCase):
     def test_resolution_forms(self):
         viewer.init_config(VAULT)
