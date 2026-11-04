@@ -17,6 +17,7 @@ import importlib.util
 import json
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1995,6 +1996,16 @@ def darken_to(hex_, bg_hex, minimum):
     return "#000000"
 
 
+PALETTE = ["#5b9bd5", "#4ecdc4", "#e07050", "#c8980a", "#9b8bdb", "#68b068", "#d4709a", "#7fa6c9"]
+
+
+def fnv1a(s):                                # mirror of hash32() on the page (UTF-16 code units)
+    h = 0x811c9dc5
+    for u in struct.unpack(f"<{len(s.encode('utf-16-le')) // 2}H", s.encode("utf-16-le")):
+        h = ((h ^ u) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
 def derived_light_badge(base):
     c = hex_rgb(base)
     bg = rgb_hex([v * 0.15 + w * 0.85 for v, w in zip(c, hex_rgb(LIGHT_SH))])
@@ -2091,8 +2102,11 @@ class LightColourTests(unittest.TestCase):
         bg, fg = derived_light_badge("#5b9bd5")
         self.assertEqual(r["lightPlain"], {"bg": bg, "fg": fg, "letter": "D"})
         self.assertNotEqual(r["lightPlain"]["bg"], "#102030")                                  # no dark square in light mode
-        self.assertEqual(r["darkMissing"], {"bg": "#1a1a1a", "fg": "#777", "letter": "?"})       # built-in fallback, as before
-        self.assertEqual(r["lightMissing"], {"bg": "var(--sh)", "fg": "var(--tx2)", "letter": "?"})
+        acc = PALETTE[fnv1a("zzz") % len(PALETTE)]                                                # generated for unconfigured folders
+        self.assertEqual(r["darkMissing"], {"bg": rgb_hex([v * 0.2 + w * 0.8 for v, w in zip(hex_rgb(acc), hex_rgb("#191919"))]),
+                                            "fg": acc, "letter": "Z"})
+        bg, fg = derived_light_badge(acc)
+        self.assertEqual(r["lightMissing"], {"bg": bg, "fg": fg, "letter": "Z"})
         self.assertEqual(r["tDark"], ["#4ecdc4", "#888", "#888"])
         self.assertEqual(r["tLight"][0], "#086860")                                              # types_light wins
         self.assertEqual(r["tLight"][1], darken_to("#888", LIGHT_BG, 3))                          # kept, darkened to >= 3:1
@@ -2202,6 +2216,68 @@ class NestedTreeTests(unittest.TestCase):
         js = page_script("offline")
         self.assertIn("sbv-tree:", js)                                           # state is kept per vault title in localStorage
         self.assertIn('"title": "Deep Fixture"', html)
+
+
+class DefaultBadgeTests(unittest.TestCase):
+    """Unconfigured folders and types get generated, stable badges and colours (instead of grey "?" / #888)."""
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_letter_is_unicode_aware_and_ignores_the_number_prefix(self):
+        names = ["10-knowledge", "01 daily", "żółw", "ćma", "2024", "10-", "Ünï", "(vault root)", "99-ñandú", "---"]
+        r = run_page_js(f"console.log(JSON.stringify({json.dumps(names)}.map(n => folderBadge(n, false, {{}}).letter)));")
+        self.assertEqual(r, ["K", "D", "Ż", "Ć", "2", "1", "Ü", "~", "Ñ", "?"])
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_vault_root_gets_its_tilde_and_colour_is_stable_per_path(self):
+        r = run_page_js("""
+          const a = folderBadge("10-knowledge", false, {}), b = folderBadge("10-knowledge", false, {});
+          const sub = folderBadge("10-knowledge/deep", false, {}), sub2 = folderBadge("10-knowledge/deep", false, {});
+          const paths = Array.from({length: 40}, (_, i) => "folder-" + i);
+          console.log(JSON.stringify({a, b, sub, sub2, root: folderBadge("(vault root)", true, {}),
+            fgs: paths.map(p => folderBadge(p, false, {}).fg)}));""")
+        self.assertEqual(r["a"], r["b"])
+        self.assertEqual(r["sub"], r["sub2"])
+        self.assertEqual(r["root"]["letter"], "~")
+        self.assertEqual(r["a"]["fg"], PALETTE[fnv1a("10-knowledge") % 8])          # same hash as the Python mirror
+        self.assertEqual(r["sub"]["fg"], PALETTE[fnv1a("10-knowledge/deep") % 8])
+        self.assertGreater(len(set(r["fgs"])), 4)                                   # the palette really varies
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_configured_folder_entries_still_win(self):
+        r = run_page_js("""
+          const fm = {"10-knowledge": {bg: "#0a2020", fg: "#4ecdc4", letter: "K"}};
+          console.log(JSON.stringify({d: folderBadge("10-knowledge", false, fm), partial: folderBadge("x", false, {x: {letter: "Q"}})}));""")
+        self.assertEqual(r["d"], {"bg": "#0a2020", "fg": "#4ecdc4", "letter": "K"})
+        self.assertEqual(r["partial"]["letter"], "Q")
+        self.assertEqual(r["partial"]["fg"], PALETTE[fnv1a("x") % 8])
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_unknown_types_are_coloured_stably_and_readable_in_light(self):
+        types = ["wiedza", "projekt", "person", "meeting", "weekly", "zażółć", "a", "b", "c", "d"]
+        r = run_page_js(f"""
+          const ts = {json.dumps(types)};
+          console.log(JSON.stringify({{dark: ts.map(t => tcol(t, false, {{}}, {{}})), again: ts.map(t => tcol(t, false, {{}}, {{}})),
+            light: ts.map(t => tcol(t, true, {{}}, {{}})), cfgd: tcol("meta", false, {{meta: "#888"}}, {{}}), empty: tcol("", false, {{}}, {{}}),
+            proto: tcol("constructor", false, {{}}, {{}})}}));""")
+        self.assertEqual(r["dark"], r["again"])
+        for t, col in zip(types, r["dark"]):
+            self.assertEqual(col, PALETTE[fnv1a(t) % 8], t)
+            c = hex_rgb(col)
+            self.assertFalse(c[0] == c[1] == c[2], f"{t} is grey")                 # not grey
+        self.assertGreater(len(set(r["dark"])), 3)
+        for col in r["light"]:
+            self.assertGreaterEqual(contrast_rgb(hex_rgb(col), hex_rgb(LIGHT_BG)), 3, col)
+        self.assertEqual(r["cfgd"], "#888")                                          # configured types win
+        self.assertEqual(r["empty"], "#888")                                         # an empty type stays grey
+        self.assertEqual(r["proto"], PALETTE[fnv1a("constructor") % 8])              # prototype keys are not config entries
+
+    def test_palette_light_variants_meet_the_threshold(self):
+        for col in PALETTE:
+            with self.subTest(col=col):
+                self.assertGreaterEqual(contrast_rgb(hex_rgb(darken_to(col, LIGHT_BG, 3)), hex_rgb(LIGHT_BG)), 3)
+                bg, fg = derived_light_badge(col)
+                self.assertGreaterEqual(contrast_rgb(hex_rgb(fg), hex_rgb(bg)), 4.5)
+        self.assertIn("const PALETTE = " + json.dumps(PALETTE), page_script("offline"))
 
 
 class IndexTests(unittest.TestCase):

@@ -171,6 +171,15 @@ light theme:
 "types_light": {"wiedza": "#086860"}
 ```
 
+### Default folder badges and type colours
+
+Without a `"folders"` entry a folder gets a **generated badge**: its first letter or digit (Unicode-aware, upper-cased, after the
+number prefix is dropped: `10-knowledge` → `K`, `żółw` → `Ż`, `(vault root)` → `~`) on a colour picked from a small palette by
+hashing the folder's vault-relative path, so a folder always has the same colour. It works at every tree level (sub-folders get
+a smaller badge) and in both themes (the light theme derives a readable badge as above). Configured `"folders"` entries still win.
+A note type that `"types"` does not list gets a stable colour from the same palette, hashed from the type name (an empty type
+stays grey; configured types win; the light theme darkens it to 3:1 like any other).
+
 ### Plug-ins (frontend, v1)
 
 A vault can add its own toolbar views without forking `viewer.py`. List the scripts in the vault's `viewer.json`:

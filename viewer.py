@@ -1695,10 +1695,15 @@ function hash32(s) {
   return h >>> 0;
 }
 const typeGrey = light => (light ? darkenTo("#888888", LIGHT_BG, TYPE_MIN) : "#888");
-// Colour of note type `t` in the dark or light theme (maps default to the page's config).
+// Generated colours for what the config does not list: a stable pick from this palette, hashed from the
+// folder path or the type name (the light theme darkens it like any configured colour).
+const PALETTE = ["#5b9bd5", "#4ecdc4", "#e07050", "#c8980a", "#9b8bdb", "#68b068", "#d4709a", "#7fa6c9"];
+const paletteColor = key => PALETTE[hash32(String(key)) % PALETTE.length];
+// Colour of note type `t` in the dark or light theme (maps default to the page's config). A configured
+// type wins; an empty type is grey; any other type gets a generated colour.
 function tcol(t, light = isLight(), tc = TC, tcl = TCL) {
   if (!t) return typeGrey(light);
-  const cfg = own(tc, t) && tc[t] ? tc[t] : "#888";
+  const cfg = own(tc, t) && tc[t] ? tc[t] : paletteColor(t);
   if (!light) return cfg;
   if (own(tcl, t) && tcl[t]) return tcl[t];
   return darkenTo(cfg, LIGHT_BG, TYPE_MIN);
@@ -1711,15 +1716,27 @@ function derivedLightBadge(base) {
   return { bg, fg: darkenTo(base, bg, BADGE_MIN) };
 }
 const folderLabel = name => String(name).replace(/^\d+[-\s]+/, "");
-// {bg, fg, letter} of a folder badge. `path` is the vault-relative folder path (a top-level folder: its name).
+// First letter or digit (Unicode-aware, upper-cased) of a folder name once its number prefix is dropped.
+function badgeLetter(name) {
+  const m = /[\p{L}\p{N}]/u.exec(folderLabel(name)) || /[\p{L}\p{N}]/u.exec(name);
+  return m ? [...m[0].toUpperCase()][0] : "?";
+}
+// {bg, fg, letter} of a folder badge. `path` is the vault-relative folder path (a top-level folder: its
+// name). A configured entry wins (dark: exactly as written; light: see above). Without one the badge is
+// generated: the folder's first letter on a colour hashed from its path, so it never changes.
 function folderBadge(path, light = isLight(), fm = FM) {
   const cfg = own(fm, path) && fm[path] && typeof fm[path] === "object" ? fm[path] : null;
-  const letter = (cfg && cfg.letter) || "?";
-  if (!cfg) return light ? { ...derivedLightBadge(null), letter } : { bg: "#1a1a1a", fg: "#777", letter };
-  if (!light) return { bg: cfg.bg, fg: cfg.fg, letter };
-  const d = derivedLightBadge(cfg.fg || cfg.bg);
-  const bg = cfg.bg_light || d.bg;
-  return { bg, fg: cfg.fg_light || (cfg.bg_light ? darkenTo(cfg.fg || cfg.bg, bg, BADGE_MIN) : d.fg), letter };
+  const name = path.split("/").pop();
+  const letter = (cfg && cfg.letter) || (path === "(vault root)" ? "~" : badgeLetter(name));
+  const gen = paletteColor(path);
+  if (!light) {
+    const bg = cfg && cfg.bg || rgbHex(mixRgb(hexRgb(cfg && cfg.fg && hexRgb(cfg.fg) ? cfg.fg : gen), hexRgb(DARK_SH), 0.2));
+    return { bg, fg: cfg && cfg.fg || gen, letter };
+  }
+  const d = derivedLightBadge(cfg && (cfg.fg || cfg.bg) || gen);
+  const bg = cfg && cfg.bg_light || d.bg;
+  const fg = cfg && cfg.fg_light || (cfg && cfg.bg_light ? darkenTo(cfg.fg || cfg.bg || gen, bg, BADGE_MIN) : d.fg);
+  return { bg, fg, letter };
 }
 // Colour of a frontmatter chip (type: coloured like the dots, status: green, the rest: grey)
 const chipColor = (key, v) => key === "type" ? tcol(v) : key === "status" ? "var(--k-green)" : "var(--k-grey)";
