@@ -673,6 +673,18 @@ def rel_link_path(base: str, href: str, ext: str = ".md"):
     return "/".join(parts)
 
 
+def note_aliases(fm: dict) -> list[str]:
+    """Names a note answers to, from the frontmatter keys ``aliases`` (a list or a single value) and ``alias``."""
+    out: list[str] = []
+    for key in ("aliases", "alias"):
+        v = fm.get(key)
+        for item in v if isinstance(v, list) else [v] if isinstance(v, str) else []:
+            item = item.strip()
+            if item and item not in out:
+                out.append(item)
+    return out
+
+
 def link_deprioritise_prefixes() -> list:
     """Lower-cased vault-relative folder prefixes from the optional "link_deprioritise" config key."""
     raw = CONFIG.get("link_deprioritise") or []
@@ -711,6 +723,7 @@ class VaultIndex:
             self.notes.append({
                 "path": rel, "name": path.stem, "type": fm_str(fm, "type"),
                 "folder": rel.split("/")[0] if "/" in rel else "(vault root)", "text": text,
+                "aliases": note_aliases(fm),
             })
             low = rel.lower()
             self.by_path[low] = rel
@@ -719,6 +732,8 @@ class VaultIndex:
             cur = self.by_stem.get(stem)
             if cur is None or (self.is_deprioritised(cur) and not self.is_deprioritised(rel)):
                 self.by_stem[stem] = rel
+        self.alias_issues: list[tuple] = []   # (kind, alias, kept note, ignored note): reported by the lint
+        self._add_aliases()
         self.out_links: dict[str, set] = {}
         self.backlinks: dict[str, list] = {n["path"]: [] for n in self.notes}
         for n in self.notes:
@@ -736,22 +751,47 @@ class VaultIndex:
             for t in targets:
                 self.backlinks[t].append(n)
 
+    def _add_aliases(self) -> None:
+        """Frontmatter aliases join ``by_stem`` (so /api/vault ships them in "stems" and the page needs no logic
+        of its own), but only for names no note's file name already uses: a real name always wins. Two notes with
+        the same alias: the first in vault order wins, a note outside ``link_deprioritise`` beats one inside."""
+        names = set(self.by_stem)                      # file names, before any alias is added
+        owner: dict[str, str] = {}
+        for n in self.notes:
+            for alias in n["aliases"]:
+                key = self.link_key(alias)
+                if key in names:
+                    if self.by_stem[key] != n["path"]:
+                        self.alias_issues.append(("name", alias, self.by_stem[key], n["path"]))
+                    continue
+                cur = owner.get(key)
+                if cur is None:
+                    owner[key] = n["path"]
+                elif cur != n["path"]:
+                    if self.is_deprioritised(cur) and not self.is_deprioritised(n["path"]):
+                        self.alias_issues.append(("alias", alias, n["path"], cur))
+                        owner[key] = n["path"]
+                    else:
+                        self.alias_issues.append(("alias", alias, cur, n["path"]))
+        self.by_stem.update(owner)
+
+    @staticmethod
+    def link_key(name: str) -> str:
+        """Lookup key of a link target or alias: ``/`` separators, no leading ``/``, no ``.md``, lower-cased."""
+        t = name.strip().replace("\\", "/").lstrip("/").lower()
+        return t[:-3] if t.endswith(".md") else t
+
     def is_deprioritised(self, rel: str) -> bool:
         low = rel.lower()
         return any(low == p or low.startswith(p + "/") for p in self.deprioritised)
 
     def resolve(self, target: str):
-        t = target.strip().replace("\\", "/").lstrip("/").lower()
-        if t.endswith(".md"):
-            t = t[:-3]
+        t = self.link_key(target)
         return self.by_path.get(t) or self.by_stem.get(t)
 
     def resolve_path(self, rel: str):
         """Note at a vault-relative path (with or without .md), case-insensitively; no fall-back to a bare name."""
-        t = rel.strip().replace("\\", "/").lstrip("/").lower()
-        if t.endswith(".md"):
-            t = t[:-3]
-        return self.by_path.get(t)
+        return self.by_path.get(self.link_key(rel))
 
     def backlinks_for(self, rel: str) -> list[dict]:
         return sorted(({"path": n["path"], "name": n["name"]} for n in self.backlinks.get(rel, [])),

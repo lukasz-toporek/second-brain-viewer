@@ -23,6 +23,7 @@ from pathlib import Path
 
 # One frontmatter parser for the viewer and the lint: viewer.py sits next to tools/
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import viewer  # noqa: E402
 from viewer import (extract_wikilinks, fm_str, frontmatter_block,  # noqa: E402
                     parse_frontmatter as _parse_frontmatter, real_file_in)
 
@@ -55,9 +56,10 @@ def load_lint_config(vault: Path) -> dict:
 
 
 def apply_config(vault: Path) -> None:
-    global VAULT, VALID_TYPES, REQUIRED_FIELDS, EXCLUDED, EXCLUDED_DIRS, _CI_INDEX
+    global VAULT, VALID_TYPES, REQUIRED_FIELDS, EXCLUDED, EXCLUDED_DIRS, _CI_INDEX, _SHARED
     VAULT = vault.resolve()
     _CI_INDEX = None
+    _SHARED = None
     cfg = load_lint_config(VAULT)
     if "valid_types" in cfg:
         VALID_TYPES = set(cfg["valid_types"])
@@ -91,6 +93,17 @@ def _present(value) -> bool:
 # extract_wikilinks() is the viewer's: the same link forms (and no links inside code) for graph, backlinks and lint
 
 _CI_INDEX: dict | None = None
+_SHARED = None
+
+
+def shared_index():
+    """The viewer's VaultIndex for this vault: the one place that decides what a link means (graph, backlinks,
+    the page and this lint agree: aliases, Markdown links, Unicode names, no links in code)."""
+    global _SHARED
+    if _SHARED is None:
+        viewer.init_config(VAULT, no_plugins=True)
+        _SHARED = viewer.get_index()
+    return _SHARED
 
 
 def _ci_index() -> dict:
@@ -113,7 +126,10 @@ def _ci_index() -> dict:
 
 
 def resolve_wikilink(link: str, source_file: Path) -> Path | None:
-    """Resolve like Obsidian: case-insensitive, by vault path or bare note name."""
+    """Resolve like Obsidian: case-insensitive, by vault path, bare note name or alias."""
+    hit = shared_index().resolve(link)
+    if hit:
+        return VAULT / hit
     target = link.strip().replace("\\", "/").lstrip("/")
     # exact matches first (also finds files in excluded dirs, as before)
     for base in (VAULT, source_file.parent):
@@ -162,6 +178,13 @@ def lint() -> int:
         for link in extract_wikilinks(text):
             if resolve_wikilink(link, f) is None:
                 issues.append((str(rel), f"zepsuty wikilink: [[{link}]]"))
+
+    shown = {str(f.relative_to(VAULT)) for f in md_files}
+    for kind, alias, kept, ignored in shared_index().alias_issues:
+        if ignored in shown:
+            issues.append((ignored, f"alias '{alias}' ignorowany: nazwa pliku {kept} ma pierwszeństwo" if kind == "name"
+                           else f"alias '{alias}' jest też w {kept} (tam wygrywa; ten jest ignorowany)"))
+    issues.sort(key=lambda x: x[0])
 
     if not issues:
         print(f"✓ Vault OK — sprawdzono {len(md_files)} plików, brak problemów.")

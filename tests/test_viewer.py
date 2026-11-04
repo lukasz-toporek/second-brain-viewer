@@ -2605,6 +2605,74 @@ class CodeBlankingTests(LinkVaultCase):
         self.assertNotIn("Nope", r.stdout)
 
 
+class AliasTests(LinkVaultCase):
+    CONFIG = {"title": "A", "link_deprioritise": ["Archive"], "lint": {"valid_types": ["wiedza"]}}
+    NOTES = {
+        "People/Robert.md": '---\ntype: wiedza\naliases: [Bob, "Robert Smith"]\n---\n# Robert\n',
+        "Bob.md": "---\ntype: wiedza\n---\n# Bob (a real file named like Robert's alias)\n",
+        "Zeta.md": "---\ntype: wiedza\n---\n# Zeta\n[[Robert Smith]] and [[robert smith]]\n",
+        "Yankee.md": "---\ntype: wiedza\n---\n# Yankee\n[[Bob]]\n",
+        "Dup1.md": "---\ntype: wiedza\naliases:\n  - Twin\n  - Solo\n---\n# Dup1\n",
+        "Dup2.md": "---\ntype: wiedza\naliases: [Twin]\n---\n# Dup2\n",
+        "Archive/Old.md": "---\ntype: wiedza\nalias: Shared\n---\n# Old\n",
+        "Live.md": "---\ntype: wiedza\naliases: Shared\n---\n# Live\n",
+        "Reader.md": "---\ntype: wiedza\n---\n# Reader\n[[Twin]] [[Solo]] [[Shared]] [[Unknown Alias]] [[Dup1]]\n",
+        "Body.md": "---\ntype: wiedza\n---\n# Body\naliases: [Ghost]\n[[Ghost]]\n",
+    }
+
+    def test_alias_resolves_and_stems_carry_it(self):
+        idx = viewer.get_index()
+        self.assertEqual(idx.resolve("Robert Smith"), "People/Robert.md")
+        self.assertEqual(idx.resolve("robert smith"), "People/Robert.md")
+        self.assertIsNone(idx.resolve("Unknown Alias"))
+        self.assertIsNone(idx.resolve("Ghost"))                                    # only frontmatter aliases count
+        stems = self.api("/api/vault")["stems"]
+        self.assertEqual(stems["robert smith"], "People/Robert.md")
+        self.assertEqual(stems["solo"], "Dup1.md")                                 # block list
+        self.assertEqual(stems["shared"], "Live.md")                               # singular "alias:" and a scalar "aliases:"
+
+    def test_real_file_name_wins_over_an_alias(self):
+        self.assertEqual(viewer.get_index().resolve("Bob"), "Bob.md")
+        self.assertEqual(self.api("/api/vault")["stems"]["bob"], "Bob.md")
+        self.assertIn(("name", "Bob", "Bob.md", "People/Robert.md"), viewer.get_index().alias_issues)
+        self.assertIn(("Bob.md", "Yankee.md"), self.edges())
+        self.assertNotIn(("People/Robert.md", "Yankee.md"), self.edges())
+
+    def test_two_notes_with_the_same_alias_use_the_usual_tie_breaking(self):
+        idx = viewer.get_index()
+        self.assertEqual(idx.resolve("Twin"), "Dup1.md")                           # vault order
+        self.assertEqual(idx.resolve("Shared"), "Live.md")                         # outside link_deprioritise beats Archive/ (first in order)
+        self.assertIn(("alias", "Twin", "Dup1.md", "Dup2.md"), idx.alias_issues)
+        self.assertIn(("alias", "Shared", "Live.md", "Archive/Old.md"), idx.alias_issues)
+
+    def test_graph_backlinks_and_export(self):
+        e = self.edges()
+        self.assertIn(("People/Robert.md", "Zeta.md"), e)
+        self.assertTrue({("Dup1.md", "Reader.md"), ("Live.md", "Reader.md")} <= e)
+        self.assertFalse(any("Unknown" in x or "Ghost" in x for pair in e for x in pair))
+        self.assertEqual(self.backlinks("People/Robert.md"), ["Zeta.md"])
+        self.assertEqual(self.backlinks("Dup2.md"), [])
+        self.assert_export_matches_api()
+        self.assertEqual(self.exported()["vault"]["stems"]["robert smith"], "People/Robert.md")
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_the_page_resolves_aliases_from_the_servers_stems_map(self):
+        payload = self.api("/api/vault")
+        r = run_page_js(f"""vault = {json.dumps(payload)};
+          const p = t => { '{' }const n = resolveNote(t); return n && n.path; {'}'};
+          console.log(JSON.stringify(["Robert Smith", "Bob", "Twin", "Shared", "Ghost"].map(p)));""")
+        self.assertEqual(r, ["People/Robert.md", "Bob.md", "Dup1.md", "Live.md", None])
+
+    def test_lint_accepts_aliases_and_warns_about_clashes(self):
+        r = subprocess.run([sys.executable, str(ROOT / "tools" / "vault-lint.py"), "--vault", str(self.root)], capture_output=True, text=True)
+        self.assertNotIn("[[Robert Smith]]", r.stdout)                              # an alias is not a broken link
+        self.assertNotIn("[[Twin]]", r.stdout)
+        self.assertIn("[[Unknown Alias]]", r.stdout)
+        self.assertIn("alias 'Bob' ignorowany: nazwa pliku Bob.md", r.stdout)       # alias vs real name
+        self.assertIn("alias 'Twin' jest też w Dup1.md", r.stdout)                  # two notes, one alias
+        self.assertEqual(r.returncode, 1)
+
+
 class IndexTests(unittest.TestCase):
     def test_resolution_forms(self):
         viewer.init_config(VAULT)
