@@ -524,6 +524,44 @@ def folder_key(name: str) -> tuple:
         return (len(FOLDER_ORDER), name)
 
 
+HOME_NAME_RE = re.compile(r"(?:\d+[\s._-]*)?(?:home|dashboard|start)", re.IGNORECASE)
+_HOME_WARNED: set = set()                # bad "home" values already reported (scan_vault runs on every reload)
+
+
+def _home_warning(msg: str) -> None:
+    if msg not in _HOME_WARNED:
+        _HOME_WARNED.add(msg)
+        print(f"warning: viewer config: {msg}", file=sys.stderr)
+
+
+def pick_home(folders: list) -> str:
+    """The note the page opens when it has no hash ("" = the empty start screen). Order: the "home" config
+    key; a root note with frontmatter type "home"; a root note named Home / Dashboard / Start (optional
+    number prefix). Sub-folder notes are never picked automatically."""
+    cfg = CONFIG.get("home")
+    if cfg is False or cfg == "":
+        return ""
+    notes = [n for f in folders for n in f["notes"]]
+    if cfg is not None:
+        if isinstance(cfg, str):
+            want = unicodedata.normalize("NFC", cfg.strip().lstrip("/"))
+            want = want if want.endswith(".md") else want + ".md"
+            hit = next((n["path"] for n in notes if unicodedata.normalize("NFC", n["path"]) == want), None)
+            if hit:
+                return hit
+            _home_warning(f"\"home\" {cfg!r} matches no note; picking one automatically")
+        else:
+            _home_warning(f"\"home\" must be a note path or false (got {cfg!r}); picking one automatically")
+    root = [n for f in folders if f["folder"] == "(vault root)" for n in f["notes"]]
+    for n in root:
+        if n["type"].lower() == "home":
+            return n["path"]
+    for n in root:
+        if HOME_NAME_RE.fullmatch(unicodedata.normalize("NFC", n["name"]).strip()):
+            return n["path"]
+    return ""
+
+
 def scan_vault() -> dict:
     by_folder: dict[str, list[dict]] = {}
     for path in vault_files():
@@ -546,7 +584,7 @@ def scan_vault() -> dict:
         for f in sorted(by_folder, key=folder_key)
     ]
     total = sum(len(f["notes"]) for f in folders)
-    return {"generated": str(date.today()), "notes": total, "folders": folders}
+    return {"generated": str(date.today()), "notes": total, "folders": folders, "home": pick_home(folders)}
 
 
 # ── Wikilink graph ──────────────────────────────────────────────────────────
@@ -2802,10 +2840,20 @@ function showWelcome() {
   setChatContext("", "");
   if (location.hash) history.replaceState(null, "", location.pathname + location.search);
 }
-function routeFromHash() {
+// initial === true only for the first route after the first load() (the hashchange listener passes an Event).
+// Then an empty hash opens vault.home, with the hash written in place (replaceState): no extra history entry,
+// so Back leaves the viewer instead of landing on the empty start screen. Later empty hashes show the welcome screen.
+function routeFromHash(initial) {
   if (!vault) return;                         // initial route happens after the first load()
   let p = "";
   try { p = decodeURIComponent(location.hash.replace(/^#/, "")); } catch (_) { return; }
+  if (!p && initial === true && vault.home) {
+    const h = findNote(vault.home);
+    if (h) {
+      history.replaceState(null, "", location.pathname + location.search + hashFor(h.path));
+      p = h.path;
+    }
+  }
   if (!p) {                                   // back to the empty hash → welcome screen
     if (activeTab === null) return;
     showWelcome();
@@ -2898,7 +2946,7 @@ async function load() {
       if (expanded.size !== n) saveExpanded();
     }
     if (searchQ) runSearch(); else renderTree();
-    if (first) routeFromHash(); else fireVaultChange();       // plug-ins: onVaultChange
+    if (first) routeFromHash(true); else fireVaultChange();       // plug-ins: onVaultChange
   } catch(e) {
     document.getElementById("tree").innerHTML = `<div class="err">${esc(e.message)}</div>`;
   } finally {

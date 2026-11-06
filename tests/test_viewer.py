@@ -64,6 +64,44 @@ def run_page_js(snippet: str, mode="offline", export_data=None):
     return json.loads(r.stdout)
 
 
+def run_route_js(vault: dict, snippet: str):
+    """Run the page's routing code (findNote .. hashchange listener) under node on a browser-history simulator.
+
+    location.hash = x pushes an entry (and fires hashchange with an Event), replaceState rewrites the current one;
+    back()/fwd() move through entries and fire hashchange. loadContent records the notes shown in `shown`.
+    `snippet` runs afterwards and prints JSON.
+    """
+    js = page_script("online")
+    a = js.index("let noteByPath = null")
+    end = 'window.addEventListener("hashchange", routeFromHash);'
+    b = js.index(end) + len(end)
+    prelude = """
+const entries = [{h: ""}]; let idx = 0; const LISTENERS = [];
+const fire = () => LISTENERS.forEach(f => f({type: "hashchange"}));
+global.history = {get length() { return entries.length; },
+  replaceState(_s, _t, url) { const i = url.indexOf("#"); entries[idx].h = i < 0 ? "" : url.slice(i); }};
+global.location = {pathname: "/", search: "", get hash() { return entries[idx].h; },
+  set hash(v) { v = v[0] === "#" ? v : "#" + v; if (v === entries[idx].h) return;
+                entries.splice(idx + 1); entries.push({h: v}); idx++; fire(); }};
+global.window = {addEventListener(t, f) { LISTENERS.push(f); }};
+global.document = {getElementById: () => ({innerHTML: ""})};
+const back = () => { if (idx > 0) { idx--; fire(); } }, fwd = () => { if (idx < entries.length - 1) { idx++; fire(); } };
+const shown = [], setChatContext = () => {}, renderTabs = () => {}, highlight = () => {}, revealNote = () => {};
+const closeSidebar = () => {}, closeGraph = () => {}, closePlugin = () => {}, loadContent = n => shown.push(n.path);
+const tabToEvict = () => null, tabLastUsed = new Map(), TAB_LIMIT = 8;
+let tabs = [], activeTab = null, graphMode = false, tabClock = 0;
+let vault = %s;
+const st = () => ({len: history.length, hash: decodeURIComponent(location.hash.slice(1)), active: activeTab, shown: shown.length});
+""" % json.dumps(vault)
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "t.js"
+        f.write_text(prelude + js[a:b] + "\n" + snippet, encoding="utf-8")
+        r = subprocess.run([NODE, str(f)], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise AssertionError(r.stderr)
+    return json.loads(r.stdout)
+
+
 class Server:
     def __init__(self, offline=False, vault=VAULT):
         viewer.init_config(vault)
@@ -2146,7 +2184,7 @@ class NestedTreeTests(unittest.TestCase):
         self.assertEqual(sorted(paths), on_disk)
         self.assertEqual(len(paths), len(set(paths)))
         self.assertTrue(any(p.count("/") >= 3 for p in paths))                 # at least 3 folder levels
-        self.assertEqual(set(data), {"generated", "notes", "folders", "stems", "files", "file_paths"})   # API unchanged
+        self.assertEqual(set(data), {"generated", "notes", "folders", "home", "stems", "files", "file_paths"})   # API unchanged
 
     @unittest.skipUnless(NODE, "node not available")
     def test_build_tree_nesting_order_counts_and_labels(self):
@@ -3009,6 +3047,91 @@ class ReadmeIsNormalNoteTests(LinkVaultCase):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(viewer.load_config(Path(d))["skip_files"], ["_index.md"])
             self.assertNotIn("README.md", viewer.generate_viewer_config(Path(d))["skip_files"])
+
+
+def _vault_json(*paths, home=""):
+    return {"folders": [{"folder": "(vault root)", "notes": [{"path": p, "name": p[:-3], "type": ""} for p in paths]}],
+            "home": home}
+
+
+class HomeNoteTests(LinkVaultCase):
+    NOTES = {"Notes.md": "# Notes\n", "00 Dashboard.md": "# D\n", "sub/Home.md": "---\ntype: home\n---\n# H\n"}
+
+    def setUp(self):
+        viewer._HOME_WARNED.clear()
+        super().setUp()
+
+    def home(self, config=None, stderr=None):
+        viewer.CONFIG = dict(viewer.CONFIG, **(config or {}))
+        with contextlib.redirect_stderr(stderr or io.StringIO()):
+            return viewer.scan_vault()["home"]
+
+    def test_name_rule_ignores_subfolder_type_home(self):
+        self.assertEqual(self.home(), "00 Dashboard.md")
+
+    def test_type_home_in_root_beats_the_name_rule(self):
+        (self.root / "Start page.md").write_text("---\ntype: Home\n---\n", encoding="utf-8")
+        self.assertEqual(self.home(), "Start page.md")
+
+    def test_name_rule_is_a_full_match(self):
+        (self.root / "00 Dashboard.md").rename(self.root / "Dashboard ideas.md")
+        self.assertEqual(self.home(), "")
+        (self.root / "Dashboard ideas.md").rename(self.root / "1-start.md")
+        self.assertEqual(self.home(), "1-start.md")
+
+    def test_config_paths(self):
+        self.assertEqual(self.home({"home": "Notes"}), "Notes.md")
+        self.assertEqual(self.home({"home": "/sub/Home.md"}), "sub/Home.md")
+
+    def test_config_matches_in_either_unicode_form(self):
+        nfd = unicodedata.normalize("NFD", "Zażółć") + ".md"
+        (self.root / nfd).write_text("# z\n", encoding="utf-8")
+        self.assertEqual(self.home({"home": unicodedata.normalize("NFC", "Zażółć")}), nfd)
+
+    def test_false_and_empty_string_mean_no_home_and_no_warning(self):
+        for v in (False, ""):
+            err = io.StringIO()
+            self.assertEqual(self.home({"home": v}, err), "")
+            self.assertEqual(err.getvalue(), "")
+
+    def test_bad_value_warns_once_and_falls_back(self):
+        err = io.StringIO()
+        self.assertEqual(self.home({"home": "Missing"}, err), "00 Dashboard.md")
+        self.assertEqual(err.getvalue().count("matches no note"), 1)
+        before = err.getvalue()
+        self.assertEqual(self.home({"home": "Missing"}, err), "00 Dashboard.md")
+        self.assertEqual(err.getvalue(), before)
+        viewer._HOME_WARNED.clear()
+        err = io.StringIO()
+        self.assertEqual(self.home({"home": 3}, err), "00 Dashboard.md")
+        self.assertIn("must be a note path or false (got 3)", err.getvalue())
+
+    def test_api_and_export_carry_home(self):
+        self.assertEqual(self.api("/api/vault")["home"], "00 Dashboard.md")
+        self.assertEqual(self.exported()["vault"]["home"], "00 Dashboard.md")
+
+    def test_page_script_wires_the_initial_route(self):
+        js = page_script("online")
+        self.assertIn("routeFromHash(true)", js)
+        self.assertIn('window.addEventListener("hashchange", routeFromHash);', js)
+        self.assertIn("initial === true", js)
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_empty_hash_opens_home_without_a_history_entry(self):
+        r = run_route_js(_vault_json("00 Dashboard.md", "Notes.md", home="00 Dashboard.md"),
+                         "routeFromHash(true); console.log(JSON.stringify({a: st(), shown}));")
+        self.assertEqual(r["a"]["len"], 1)
+        self.assertEqual((r["a"]["hash"], r["a"]["active"]), ("00 Dashboard.md", "00 Dashboard.md"))
+        self.assertEqual(r["shown"], ["00 Dashboard.md"])
+
+    @unittest.skipUnless(NODE, "node not available")
+    def test_later_empty_hash_still_shows_the_welcome_screen(self):
+        r = run_route_js(_vault_json("A.md", "B.md", home="A.md"), """
+          location.hash = "#B.md";                        // active note B, then the hash is emptied (not initial)
+          history.replaceState(null, "", "/"); routeFromHash();
+          console.log(JSON.stringify(st()));""")
+        self.assertEqual(r["active"], None)
+        self.assertEqual(r["hash"], "")
 
 
 if __name__ == "__main__":
