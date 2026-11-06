@@ -2997,5 +2997,19 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(viewer.extract_wikilinks(r"[[A\|x]] [[B#H|y]] ![[C]]"), ["A", "B", "C"])
 
 
+class ReadmeIsNormalNoteTests(LinkVaultCase):
+    NOTES = {"00 Dashboard.md": "See [[README]].\n", "README.md": "# How this vault works\n"}
+
+    def test_readme_resolves_and_has_a_graph_edge(self):
+        self.assertEqual(viewer.get_index().by_stem["readme"], "README.md")
+        self.assertIn(tuple(sorted(("00 Dashboard.md", "README.md"))), self.edges())
+
+    def test_builtin_defaults_skip_only_the_generated_index(self):
+        self.assertNotIn("README.md", viewer.SKIP_NAMES)
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(viewer.load_config(Path(d))["skip_files"], ["_index.md"])
+            self.assertNotIn("README.md", viewer.generate_viewer_config(Path(d))["skip_files"])
+
+
 if __name__ == "__main__":
     unittest.main()

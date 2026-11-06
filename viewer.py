@@ -36,7 +36,7 @@ from urllib.error import URLError
 # Populated by init_config() at startup
 VAULT: Path = Path.cwd()
 OUTPUT: Path = VAULT / "_index.md"
-SKIP_NAMES: set = {"README.md", "_index.md"}
+SKIP_NAMES: set = {"_index.md"}                # only the file the viewer writes itself; a vault's README.md is a normal note
 SKIP_DIRS: set = {".obsidian"}
 FOLDER_ORDER: list = []
 CONFIG: dict = {}
@@ -56,7 +56,7 @@ def load_config(vault_path: Path) -> dict:
     defaults: dict = {
         "title": vault_path.name,
         "skip_dirs": [".obsidian", ".git"],
-        "skip_files": ["README.md", "_index.md"],
+        "skip_files": ["_index.md"],
         "folder_order": [],
         "folders": {},
         "link_deprioritise": [],
@@ -82,7 +82,7 @@ def init_config(vault_path: Path, no_plugins: bool = False) -> None:
     VAULT = vault_path.resolve()
     CONFIG = load_config(VAULT)
     OUTPUT = VAULT / "_index.md"
-    SKIP_NAMES = set(CONFIG.get("skip_files", ["README.md", "_index.md"]))
+    SKIP_NAMES = set(CONFIG.get("skip_files", ["_index.md"]))
     SKIP_DIRS = set(CONFIG.get("skip_dirs", [".obsidian"]))
     FOLDER_ORDER = CONFIG.get("folder_order", [])
     REMOTE_IMAGES = CONFIG.get("remote_images", "allow")
@@ -273,7 +273,7 @@ def generate_viewer_config(vault_path: Path) -> dict:
     return {
         "title": vault.name,
         "skip_dirs": [".obsidian", ".git"],
-        "skip_files": ["README.md", "_index.md"],
+        "skip_files": ["_index.md"],
         "folder_order": folders,
         "folders": folder_cfg,
         "types": type_cfg,

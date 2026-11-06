@@ -41,7 +41,7 @@ The graph, the backlinks, the page's link rendering, `--export` and `tools/vault
 | `[[My%20Note]]` | URL-encoding isn't decoded in wikilinks (it is in Markdown links) | `[[My Note]]` |
 | `#tag` | Tags aren't links | A hub note (section 2) |
 | `[[folder]]` | Folder names aren't notes | Link to the folder's hub note |
-| `[[README]]`, `[[_index]]` | Files in `skip_files` (and folders in `skip_dirs`) aren't in the graph | Give the content a normal note name |
+| `[[_index]]`, or a file you listed in `skip_files` | Files in `skip_files` (and folders in `skip_dirs`) aren't in the graph. The default is only the generated `_index.md`; `README.md` is a normal note | Give the content a normal note name |
 | A link to a note that doesn't exist yet | Shown as a missing link, with no line | Create the note, even as a stub |
 | A link inside code | Ignored: `` `[[Note]]` ``, fenced blocks (```` ``` ```` and `~~~`, also an unclosed one up to the end of the note) | Write the link outside the code |
 | `[text](Note)` without `.md`, `[text](http://…/Note.md)` | Not a note link | `[text](Note.md)` or `[[Note\|text]]` |

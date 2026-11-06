@@ -300,7 +300,7 @@ Place a `viewer.json` in the vault root (or any parent directory — the viewer 
 {
   "title": "My Second Brain",
   "skip_dirs": [".obsidian", ".git"],
-  "skip_files": ["README.md", "_index.md"],
+  "skip_files": ["_index.md"],
   "folder_order": ["00-inbox", "01-daily", "10-knowledge", "20-projects", "30-learning", "90-meta"],
   "folders": {
     "00-inbox":     {"bg": "#1e1e1e", "fg": "#777",    "letter": "I", "bg_light": "#e4e4e0", "fg_light": "#555555"},
@@ -325,6 +325,10 @@ Place a `viewer.json` in the vault root (or any parent directory — the viewer 
 ```
 
 A template config is included at `viewer.json` in this repo.
+
+`skip_files` defaults to `["_index.md"]`, the file the viewer writes itself. A vault's `README.md` is a normal
+note, so it shows in the tree and `[[README]]` resolves. A vault that is also a code repository can add
+`"README.md"` to the list (this repo's own `viewer.json` does).
 
 ### Name clashes: `link_deprioritise`
 
