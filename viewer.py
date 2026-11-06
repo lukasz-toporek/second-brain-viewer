@@ -677,10 +677,20 @@ _MDLINK_RE = re.compile(
     r'(?:\s+(?:"[^"\n]*"|\'[^\'\n]*\'))?\s*\)')
 
 
-def extract_md_links(text: str) -> list[str]:
-    """Raw targets of Markdown links ``[text](target)`` (images and code excluded)."""
-    return [m.group(1) if m.group(1) is not None else m.group(2)
-            for m in _MDLINK_RE.finditer(blank_code(text)) if not m.group(0).startswith("[[")]      # [[w]](x) is a wikilink, then text
+def extract_md_links(text: str, with_text: bool = False) -> list:
+    """Raw targets of Markdown links ``[text](target)`` (images and code excluded). With ``with_text`` it returns
+    ``(link text, target)`` pairs instead; the graph, backlinks and rendering use the plain targets."""
+    out = []
+    for m in _MDLINK_RE.finditer(blank_code(text)):
+        if m.group(0).startswith("[["):                # [[w]](x) is a wikilink, then text
+            continue
+        grp = 1 if m.group(1) is not None else 2
+        if not with_text:
+            out.append(m.group(grp))
+            continue
+        full = m.group(0)
+        out.append((full[1:full.rfind("](", 0, m.start(grp) - m.start())], m.group(grp)))
+    return out
 
 
 def _walk_link(base: str, href: str, ext: str):

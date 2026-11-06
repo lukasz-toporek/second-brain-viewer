@@ -2574,6 +2574,8 @@ class MarkdownLinkEdgeTests(LinkVaultCase):
         self.assertEqual(f("a/N.md", "./b/./C.MD?x=1"), "a/b/C.MD")
         for none in ("http://x/y.md", "mailto:a@b.c", "#x", "pic.png", "%zz.md", "//host/a.md", "", "a.md.txt"):
             self.assertIsNone(f("a/N.md", none), none)
+        self.assertEqual(viewer.extract_md_links("[a *b*](y.md) [![i](a.png)](<z z.md>)", with_text=True),
+                         [("a *b*", "y.md"), ("![i](a.png)", "z z.md")])
         self.assertEqual(viewer.extract_md_links("![i](x.md) [a](y.md) [![i](a.png)](z.md) [[w]](q.md)"), ["y.md", "z.md"])
 
     @unittest.skipUnless(NODE, "node not available")
@@ -2924,7 +2926,7 @@ class LintPolishTests(LinkVaultCase):
 
     def test_markdown_note_links(self):
         body = "\n".join([
-            "[ok](../People.md)", "[ok2](./../People.md#h)", "[sp](My%20Note.md)", "[missing](Missing.md)", "[up](../../x.md)",
+            "[ok](../People.md)", "[ok2](./../People.md#h)", "[sp](My%20Note.md)", "[bad](Missing.md)", "[esc](../../x.md)", "[" + "L" * 50 + "](Long.md)",
             "[web](http://example.com/a.md)", "[mail](mailto:a@b.c)", "[frag](#h)", "[att](Attach.pdf)", "![img](pic.png)",
             "`[code](Inline.md)`", "```", "[fenced](Fenced.md)", "```",
         ])
@@ -2932,9 +2934,10 @@ class LintPolishTests(LinkVaultCase):
                       require_up=False)
         out = r.stdout
         self.assertEqual(r.returncode, 1)
-        self.assertIn("zepsuty link: […](Missing.md) — brak notatki Sub/Missing.md", out)
-        self.assertIn("zepsuty link: […](../../x.md) — wychodzi poza katalog vaulta", out)
-        self.assertEqual(out.count("zepsuty link"), 2, out)
+        self.assertIn("zepsuty link: [bad](Missing.md) — brak notatki Sub/Missing.md", out)
+        self.assertIn("zepsuty link: [esc](../../x.md) — wychodzi poza katalog vaulta", out)
+        self.assertIn("zepsuty link: [" + "L" * 39 + "…](Long.md) — brak notatki Sub/Long.md", out)
+        self.assertEqual(out.count("zepsuty link"), 3, out)
 
     def test_md_link_check_matches_the_graph(self):
         self.lint({"Sub/L.md": self.fm('up: "[[People]]"') + "[a](../People.md) [b](Gone.md)\n"})

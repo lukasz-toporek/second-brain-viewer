@@ -250,14 +250,17 @@ def lint() -> int:
 
         # Markdown note links [x](Note.md): by path, exactly as the graph reads them
         relp = rel.as_posix()
-        for href in viewer.extract_md_links(text):
+        for label, href in viewer.extract_md_links(text, with_text=True):
             target = viewer.rel_link_path(relp, href)
             if target is None:
                 continue                                    # not a note link (image, URL, #fragment, attachment)
+            shown_label = label.strip().replace("\n", " ")
+            if len(shown_label) > 40:
+                shown_label = shown_label[:39] + "…"
             if viewer.link_escapes_root(relp, href):
-                issues.append((str(rel), f"zepsuty link: […]({href}) — wychodzi poza katalog vaulta"))
+                issues.append((str(rel), f"zepsuty link: [{shown_label}]({href}) — wychodzi poza katalog vaulta"))
             elif shared_index().resolve_path(target) is None:
-                issues.append((str(rel), f"zepsuty link: […]({href}) — brak notatki {target}"))
+                issues.append((str(rel), f"zepsuty link: [{shown_label}]({href}) — brak notatki {target}"))
 
     shown = {str(f.relative_to(VAULT)) for f in md_files}
     for kind, alias, kept, ignored in shared_index().alias_issues:
