@@ -33,6 +33,7 @@ A lightweight local viewer for Markdown knowledge bases. Zero dependencies — P
   start screen) and updates the URL hash. At 8 tabs the **least recently used** tab that is not active is dropped. A tab's tooltip is the
   note's full vault path; when the tabs don't fit the bar scrolls sideways (also with the mouse wheel) and keeps the active tab in view.
 - **Deep links** — `#<note path>` in the URL; Back/Forward work
+- **Home note** — opening the page without a hash shows the vault's home note instead of the empty start screen (see [Home note](#home-note-home))
 - **Offline mode** and **single-file export** (see below)
 
 ## Usage
@@ -300,7 +301,8 @@ Place a `viewer.json` in the vault root (or any parent directory — the viewer 
 {
   "title": "My Second Brain",
   "skip_dirs": [".obsidian", ".git"],
-  "skip_files": ["README.md", "_index.md"],
+  "skip_files": ["_index.md"],
+  "home": "00 Dashboard.md",
   "folder_order": ["00-inbox", "01-daily", "10-knowledge", "20-projects", "30-learning", "90-meta"],
   "folders": {
     "00-inbox":     {"bg": "#1e1e1e", "fg": "#777",    "letter": "I", "bg_light": "#e4e4e0", "fg_light": "#555555"},
@@ -325,6 +327,25 @@ Place a `viewer.json` in the vault root (or any parent directory — the viewer 
 ```
 
 A template config is included at `viewer.json` in this repo.
+
+`skip_files` defaults to `["_index.md"]`, the file the viewer writes itself. A vault's `README.md` is a normal
+note, so it shows in the tree and `[[README]]` resolves. A vault that is also a code repository can add
+`"README.md"` to the list (this repo's own `viewer.json` does).
+
+### Home note: `home`
+
+Opening the page without a `#hash` shows the vault's home note. It is picked in this order (first match wins, ties go
+to vault order):
+
+1. The `"home"` config key: a vault-relative note path (`.md` optional, a leading `/` ignored, either Unicode form).
+   `false` or `""` turns the feature off: the empty start screen is shown. A value that matches no note (or isn't a
+   string or `false`) prints one warning to stderr and falls through to the next rule.
+2. A note in the vault root whose frontmatter `type` is `home` (case-insensitive).
+3. A note in the vault root named `Home`, `Dashboard` or `Start`, optionally with a number prefix
+   (`00 Dashboard`, `1-start`); not `Dashboard ideas`.
+
+Notes in sub-folders are never picked automatically. The hash is set in place, without a history entry, so Back
+leaves the viewer instead of showing the empty screen. The export opens on the home note too.
 
 ### Name clashes: `link_deprioritise`
 

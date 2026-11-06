@@ -36,7 +36,7 @@ from urllib.error import URLError
 # Populated by init_config() at startup
 VAULT: Path = Path.cwd()
 OUTPUT: Path = VAULT / "_index.md"
-SKIP_NAMES: set = {"README.md", "_index.md"}
+SKIP_NAMES: set = {"_index.md"}                # only the file the viewer writes itself; a vault's README.md is a normal note
 SKIP_DIRS: set = {".obsidian"}
 FOLDER_ORDER: list = []
 CONFIG: dict = {}
@@ -56,7 +56,7 @@ def load_config(vault_path: Path) -> dict:
     defaults: dict = {
         "title": vault_path.name,
         "skip_dirs": [".obsidian", ".git"],
-        "skip_files": ["README.md", "_index.md"],
+        "skip_files": ["_index.md"],
         "folder_order": [],
         "folders": {},
         "link_deprioritise": [],
@@ -82,7 +82,7 @@ def init_config(vault_path: Path, no_plugins: bool = False) -> None:
     VAULT = vault_path.resolve()
     CONFIG = load_config(VAULT)
     OUTPUT = VAULT / "_index.md"
-    SKIP_NAMES = set(CONFIG.get("skip_files", ["README.md", "_index.md"]))
+    SKIP_NAMES = set(CONFIG.get("skip_files", ["_index.md"]))
     SKIP_DIRS = set(CONFIG.get("skip_dirs", [".obsidian"]))
     FOLDER_ORDER = CONFIG.get("folder_order", [])
     REMOTE_IMAGES = CONFIG.get("remote_images", "allow")
@@ -273,7 +273,7 @@ def generate_viewer_config(vault_path: Path) -> dict:
     return {
         "title": vault.name,
         "skip_dirs": [".obsidian", ".git"],
-        "skip_files": ["README.md", "_index.md"],
+        "skip_files": ["_index.md"],
         "folder_order": folders,
         "folders": folder_cfg,
         "types": type_cfg,
@@ -524,6 +524,44 @@ def folder_key(name: str) -> tuple:
         return (len(FOLDER_ORDER), name)
 
 
+HOME_NAME_RE = re.compile(r"(?:\d+[\s._-]*)?(?:home|dashboard|start)", re.IGNORECASE)
+_HOME_WARNED: set = set()                # bad "home" values already reported (scan_vault runs on every reload)
+
+
+def _home_warning(msg: str) -> None:
+    if msg not in _HOME_WARNED:
+        _HOME_WARNED.add(msg)
+        print(f"warning: viewer config: {msg}", file=sys.stderr)
+
+
+def pick_home(folders: list) -> str:
+    """The note the page opens when it has no hash ("" = the empty start screen). Order: the "home" config
+    key; a root note with frontmatter type "home"; a root note named Home / Dashboard / Start (optional
+    number prefix). Sub-folder notes are never picked automatically."""
+    cfg = CONFIG.get("home")
+    if cfg is False or cfg == "":
+        return ""
+    notes = [n for f in folders for n in f["notes"]]
+    if cfg is not None:
+        if isinstance(cfg, str):
+            want = unicodedata.normalize("NFC", cfg.strip().lstrip("/"))
+            want = want if want.endswith(".md") else want + ".md"
+            hit = next((n["path"] for n in notes if unicodedata.normalize("NFC", n["path"]) == want), None)
+            if hit:
+                return hit
+            _home_warning(f"\"home\" {cfg!r} matches no note; picking one automatically")
+        else:
+            _home_warning(f"\"home\" must be a note path or false (got {cfg!r}); picking one automatically")
+    root = [n for f in folders if f["folder"] == "(vault root)" for n in f["notes"]]
+    for n in root:
+        if n["type"].lower() == "home":
+            return n["path"]
+    for n in root:
+        if HOME_NAME_RE.fullmatch(unicodedata.normalize("NFC", n["name"]).strip()):
+            return n["path"]
+    return ""
+
+
 def scan_vault() -> dict:
     by_folder: dict[str, list[dict]] = {}
     for path in vault_files():
@@ -546,7 +584,7 @@ def scan_vault() -> dict:
         for f in sorted(by_folder, key=folder_key)
     ]
     total = sum(len(f["notes"]) for f in folders)
-    return {"generated": str(date.today()), "notes": total, "folders": folders}
+    return {"generated": str(date.today()), "notes": total, "folders": folders, "home": pick_home(folders)}
 
 
 # ── Wikilink graph ──────────────────────────────────────────────────────────
@@ -639,10 +677,20 @@ _MDLINK_RE = re.compile(
     r'(?:\s+(?:"[^"\n]*"|\'[^\'\n]*\'))?\s*\)')
 
 
-def extract_md_links(text: str) -> list[str]:
-    """Raw targets of Markdown links ``[text](target)`` (images and code excluded)."""
-    return [m.group(1) if m.group(1) is not None else m.group(2)
-            for m in _MDLINK_RE.finditer(blank_code(text)) if not m.group(0).startswith("[[")]      # [[w]](x) is a wikilink, then text
+def extract_md_links(text: str, with_text: bool = False) -> list:
+    """Raw targets of Markdown links ``[text](target)`` (images and code excluded). With ``with_text`` it returns
+    ``(link text, target)`` pairs instead; the graph, backlinks and rendering use the plain targets."""
+    out = []
+    for m in _MDLINK_RE.finditer(blank_code(text)):
+        if m.group(0).startswith("[["):                # [[w]](x) is a wikilink, then text
+            continue
+        grp = 1 if m.group(1) is not None else 2
+        if not with_text:
+            out.append(m.group(grp))
+            continue
+        full = m.group(0)
+        out.append((full[1:full.rfind("](", 0, m.start(grp) - m.start())], m.group(grp)))
+    return out
 
 
 def _walk_link(base: str, href: str, ext: str):
@@ -2790,7 +2838,14 @@ function openNote(note) {
   loadContent(note);
   highlight();
   revealNote(note.path);
-  if (location.hash !== hashFor(note.path)) location.hash = hashFor(note.path);
+  const want = hashFor(note.path);
+  if (location.hash !== want) {
+    // The hash already names this note in another Unicode form (NFC vs the on-disk NFD): rewrite it in place,
+    // so the note costs one history entry, not two. Every other case pushes an entry as before.
+    let cur; try { cur = decodeURIComponent(location.hash.replace(/^#/, "")); } catch (_) { cur = null; }
+    if (cur && findNote(cur) === findNote(note.path)) history.replaceState(null, "", location.pathname + location.search + want);
+    else location.hash = want;
+  }
 }
 
 const welcomeHTML = document.getElementById("content").innerHTML;
@@ -2802,10 +2857,20 @@ function showWelcome() {
   setChatContext("", "");
   if (location.hash) history.replaceState(null, "", location.pathname + location.search);
 }
-function routeFromHash() {
+// initial === true only for the first route after the first load() (the hashchange listener passes an Event).
+// Then an empty hash opens vault.home, with the hash written in place (replaceState): no extra history entry,
+// so Back leaves the viewer instead of landing on the empty start screen. Later empty hashes show the welcome screen.
+function routeFromHash(initial) {
   if (!vault) return;                         // initial route happens after the first load()
   let p = "";
   try { p = decodeURIComponent(location.hash.replace(/^#/, "")); } catch (_) { return; }
+  if (!p && initial === true && vault.home) {
+    const h = findNote(vault.home);
+    if (h) {
+      history.replaceState(null, "", location.pathname + location.search + hashFor(h.path));
+      p = h.path;
+    }
+  }
   if (!p) {                                   // back to the empty hash → welcome screen
     if (activeTab === null) return;
     showWelcome();
@@ -2813,6 +2878,8 @@ function routeFromHash() {
   }
   if (p === activeTab) return;
   const n = findNote(p);
+  // Back/Forward onto an entry that names the open note in another Unicode form: already active, nothing to reopen.
+  if (n && activeTab !== null && p.normalize("NFC") === activeTab.normalize("NFC") && n.path === activeTab) return;
   if (n) openNote({ path: n.path, name: n.name, type: n.type, folder: n.path.split("/")[0] });
 }
 window.addEventListener("hashchange", routeFromHash);
@@ -2898,7 +2965,7 @@ async function load() {
       if (expanded.size !== n) saveExpanded();
     }
     if (searchQ) runSearch(); else renderTree();
-    if (first) routeFromHash(); else fireVaultChange();       // plug-ins: onVaultChange
+    if (first) routeFromHash(true); else fireVaultChange();       // plug-ins: onVaultChange
   } catch(e) {
     document.getElementById("tree").innerHTML = `<div class="err">${esc(e.message)}</div>`;
   } finally {
