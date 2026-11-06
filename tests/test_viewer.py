@@ -3134,5 +3134,66 @@ class HomeNoteTests(LinkVaultCase):
         self.assertEqual(r["hash"], "")
 
 
+NFD_Z = unicodedata.normalize("NFD", "Zażółć") + ".md"
+NFC_Z = unicodedata.normalize("NFC", "Zażółć") + ".md"
+
+
+@unittest.skipUnless(NODE, "node not available")
+class UnicodeFormHistoryTests(unittest.TestCase):
+    VAULT = _vault_json("Home.md", NFD_Z)
+
+    def run_js(self, body, vault=None):
+        pre = f"const NFC = {json.dumps(NFC_Z)}, NFD = {json.dumps(NFD_Z)}; const H = p => '#' + encodeURIComponent(p);\n"
+        return run_route_js(vault or self.VAULT, pre + body)
+
+    def test_nfc_hash_adds_one_entry_and_back_forward_walk_it(self):
+        r = self.run_js("""
+          const t = [];
+          routeFromHash(true); location.hash = H("Home.md"); t.push(st());
+          location.hash = H(NFC); t.push(st());
+          back(); t.push(st()); back(); t.push(st()); fwd(); t.push(st()); fwd(); t.push(st());
+          console.log(JSON.stringify({t, shown}));""")
+        t = r["t"]
+        self.assertEqual([x["len"] for x in t], [2, 3, 3, 3, 3, 3])      # exactly one entry for the NFC hash
+        self.assertEqual(t[1]["hash"], NFD_Z)                            # rewritten to the on-disk form
+        self.assertEqual([x["active"] for x in t], ["Home.md", NFD_Z, "Home.md", None, "Home.md", NFD_Z])   # None: the empty first entry
+
+    def test_back_onto_an_nfc_entry_of_the_open_note_does_nothing(self):
+        r = self.run_js("""
+          location.hash = H("Home.md"); location.hash = H(NFC); location.hash = H("Home.md");
+          const n = shown.length; history.replaceState(null, "", H(NFC));   // pretend the middle entry is still NFC
+          back(); console.log(JSON.stringify({a: st(), n, after: shown.length}));""")
+        self.assertEqual(r["a"]["active"], NFD_Z)                        # opened by the Back; no loop/trap
+
+    def test_initial_route_at_the_nfc_url_leaves_one_entry_with_the_on_disk_hash(self):
+        r = self.run_js("""
+          history.replaceState(null, "", H(NFC)); routeFromHash(true);
+          console.log(JSON.stringify({a: st()}));""")
+        self.assertEqual((r["a"]["len"], r["a"]["hash"], r["a"]["active"]), (1, NFD_Z, NFD_Z))
+
+    def test_exact_match_wins_for_notes_differing_only_in_unicode_form(self):
+        v = _vault_json(NFD_Z, NFC_Z)
+        r = self.run_js("""
+          location.hash = H(NFC); const a = st(); location.hash = H(NFD); const b = st();
+          console.log(JSON.stringify({a, b, shown}));""", v)
+        self.assertEqual((r["a"]["active"], r["b"]["active"]), (NFC_Z, NFD_Z))
+        self.assertEqual(r["b"]["len"], 3)
+        self.assertEqual(r["shown"], [NFC_Z, NFD_Z])
+
+    def test_normal_navigation_adds_one_entry_per_note(self):
+        v = _vault_json("A.md", "B.md", "C.md")
+        r = self.run_js("""
+          location.hash = H("A.md"); location.hash = H("B.md"); location.hash = H("C.md");
+          const t = [st()]; back(); t.push(st()); back(); t.push(st());
+          console.log(JSON.stringify({t}));""", v)
+        self.assertEqual([x["len"] for x in r["t"]], [4, 4, 4])
+        self.assertEqual([x["active"] for x in r["t"]], ["C.md", "B.md", "A.md"])
+
+    def test_page_script_rewrites_in_place_and_compares_nfc(self):
+        js = page_script("online")
+        self.assertIn("history.replaceState(null, \"\", location.pathname + location.search + want)", js)
+        self.assertIn('p.normalize("NFC") === activeTab.normalize("NFC")', js)
+
+
 if __name__ == "__main__":
     unittest.main()

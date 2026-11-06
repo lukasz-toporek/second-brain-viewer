@@ -2828,7 +2828,14 @@ function openNote(note) {
   loadContent(note);
   highlight();
   revealNote(note.path);
-  if (location.hash !== hashFor(note.path)) location.hash = hashFor(note.path);
+  const want = hashFor(note.path);
+  if (location.hash !== want) {
+    // The hash already names this note in another Unicode form (NFC vs the on-disk NFD): rewrite it in place,
+    // so the note costs one history entry, not two. Every other case pushes an entry as before.
+    let cur; try { cur = decodeURIComponent(location.hash.replace(/^#/, "")); } catch (_) { cur = null; }
+    if (cur && findNote(cur) === findNote(note.path)) history.replaceState(null, "", location.pathname + location.search + want);
+    else location.hash = want;
+  }
 }
 
 const welcomeHTML = document.getElementById("content").innerHTML;
@@ -2861,6 +2868,8 @@ function routeFromHash(initial) {
   }
   if (p === activeTab) return;
   const n = findNote(p);
+  // Back/Forward onto an entry that names the open note in another Unicode form: already active, nothing to reopen.
+  if (n && activeTab !== null && p.normalize("NFC") === activeTab.normalize("NFC") && n.path === activeTab) return;
   if (n) openNote({ path: n.path, name: n.name, type: n.type, folder: n.path.split("/")[0] });
 }
 window.addEventListener("hashchange", routeFromHash);
